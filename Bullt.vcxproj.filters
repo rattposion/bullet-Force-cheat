@@ -102,6 +102,27 @@
     <ClInclude Include="dupe.h">
       <Filter>core\features.h</Filter>
     </ClInclude>
+    <ClInclude Include="types.h">
+      <Filter>core</Filter>
+    </ClInclude>
+    <ClInclude Include="deps.h">
+      <Filter>core</Filter>
+    </ClInclude>
+    <ClInclude Include="globals.h">
+      <Filter>core</Filter>
+    </ClInclude>
+    <ClInclude Include="mem.h">
+      <Filter>core</Filter>
+    </ClInclude>
+    <ClInclude Include="scan.h">
+      <Filter>core</Filter>
+    </ClInclude>
+    <ClInclude Include="sdk_types.h">
+      <Filter>core</Filter>
+    </ClInclude>
+    <ClInclude Include="sdk_state.h">
+      <Filter>core</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="imgui\imgui.cpp">

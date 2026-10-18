@@ -1,123 +1,37 @@
 #pragma once
+// ============================================================================
+//  sdk.h — UMBRELLA. Mantem compatibilidade total.
+//
+//  A responsabilidade esta' separada em:
+//      sdk_types.h  -> Target, MAX_TARGETS
+//      sdk_state.h  -> todo o estado mutavel + regra de concorrencia
+//      sdk.h        -> funcoes + o bloco 'using' global
+//
+//  Se um arquivo so' precisa de 'Target', inclua sdk_types.h.
+//  Se so' precisa do estado, inclua sdk_state.h.
+//  O bloco 'using' no fim e' o motivo de quase tudo incluir este header —
+//  ele joga ~60 nomes no escopo global.
+// ============================================================================
 
 #include "common.h"
 #include "il2cpp.h"
 #include "il2cpp_api.h"
 #include "memory.h"
 #include "config.h"
+#include "hooks.h"          // dono de Hooks::g_viewW/g_viewH (nao redeclare aqui)
+#include "sdk_types.h"
+#include "sdk_state.h"
 
 #include <vector>
 #include <string>
-#include <unordered_map>
-#include <mutex>
-#include <atomic>
-#include <windows.h>
-
-// il2cpp_method_get_return_type — declarado aqui (extern "C" identico ao padrao
-// do il2cpp_api.h) para o hooks.cpp poder escolher a ABI do hook de recoil.
-// Se tambem adicionar em il2cpp_api.h, mantenha o MESMO tipo.
-extern "C" {
-    extern Il2CppType* (*il2cpp_method_get_return_type)(const MethodInfo*);
-}
-
-namespace Hooks { extern int g_viewW; extern int g_viewH; }
+#include <initializer_list>
 
 extern const char* g_phase;
 #ifndef PHASE
 #define PHASE(x) (g_phase = (x))
 #endif
 
-extern Config g_cfg;
-
-#define MAX_TARGETS 128
-
-struct Target {
-    Il2CppObject* obj = nullptr;
-    Il2CppObject* player = nullptr;
-
-    Il2CppObject* headBone = nullptr;
-    Il2CppObject* footBone = nullptr;
-
-    Vec3   pos{ 0.f, 0.f, 0.f };
-    Vec3   feet{ 0.f, 0.f, 0.f };
-    Vec3   head{ 0.f, 0.f, 0.f };
-    Vec2   scrHead{ 0.f, 0.f };
-    Vec2   scrFeet{ 0.f, 0.f };
-
-    bool   onScreen = false;
-    bool   alive = false;
-    bool   enemy = true;
-    bool   npc = false;
-    bool   visible = false;
-
-    int    team = 0;
-    int    weapon = 0;
-    float  health = 100.f;
-    float  hp = 100.f;
-    float  dist = 0.f;
-
-    uint32_t slot = 0;      // slot estavel (nao muda enquanto o player existir)
-    uint64_t lastSeen = 0;
-
-    char   name[40]{};
-};
-
 namespace SDK {
-
-    extern std::unordered_map<std::string, Il2CppClass*> g_classes;
-    extern std::mutex g_classesMx;
-
-    extern uint32_t O_health, O_alive, O_team, O_isLocal, O_name, O_weapon;
-    extern uint32_t O_vel, O_speed, O_rot, O_rotation, O_cam, O_camTf;
-    extern uint32_t O_mCamera, O_humanMeshAnimator, O_humanMeshReferences;
-    extern uint32_t O_stats, O_gunView, O_gunStats, O_gunStatsOnView;
-    extern uint32_t O_curAmmo, O_maxAmmo, O_reloading, O_spread, O_fireRate, O_dmg;
-    extern bool     O_rotationIsQuat;
-
-    extern Il2CppClass* kEntity;
-    extern Il2CppClass* kPlayerScript;
-    extern Il2CppClass* kPlayer;
-    extern Il2CppClass* kNPC;
-    extern Il2CppClass* kTransform;
-    extern Il2CppClass* kCamera;
-    extern Il2CppClass* kGunStats;
-    extern Il2CppClass* kVector3;
-    extern Il2CppClass* kQuaternion;
-    extern Il2CppClass* kAntiHack;
-
-    extern MethodInfo* M_shoot;
-    extern MethodInfo* M_recoil;
-    extern MethodInfo* M_fireBullet;
-    extern MethodInfo* M_FireBullet;
-    extern MethodInfo* M_getTransform;
-    extern MethodInfo* M_w2s;
-    extern MethodInfo* M_lookRot;
-    extern MethodInfo* M_set_position;
-    extern MethodInfo* M_set_forward;
-    extern MethodInfo* M_get_fov;
-    extern MethodInfo* M_set_fov;
-
-    extern Il2CppObject* g_camera;
-    extern Il2CppObject* g_local;
-    extern Il2CppObject* g_aimTarget;
-    extern Il2CppObject* g_localPlayer;
-    extern int   g_localTeam;
-    extern Vec3  g_localPos;
-    extern Target g_targets[MAX_TARGETS];
-    extern int   g_targetCount;
-    extern CRITICAL_SECTION g_targetCs;
-    extern int   dbg_drawn;
-    extern uint64_t g_frameId;
-
-    extern bool  g_viewProjOk;
-    extern float g_viewProj[16];
-
-    // slot do parametro que e a DIRECAO no FireBullet (0 = a3, 1 = a4)
-    extern std::atomic<int>  g_fireDirSlot;
-    // hook de recoil ativo (se true, noRecoil nao usa fallback de rotacao)
-    extern std::atomic<bool> g_recoilHookActive;
-    // o campo de cadencia resolvido e RPM (e nao um delay em segundos)
-    extern bool g_rateIsRpm;
 
     int           ScreenW();
     int           ScreenH();
@@ -133,7 +47,7 @@ namespace SDK {
     void UpdateView();
     void RefreshTargets();
     void UpdateTargets();
-    std::vector<Target> Snapshot();
+    std::vector<Target> Snapshot();     // copia sob lock; seguro fora do lock
 
     Il2CppObject* GetLocalPlayer();
     Il2CppObject* GetCamera();
@@ -147,15 +61,15 @@ namespace SDK {
 
     Il2CppObject* FindBoneContains(Il2CppObject* root, const char* sub, int budget = 8192);
     Vec3  GetBonePos(void* bone);
-    void  GetNameBuf(Il2CppObject* o, char* out, int n);
+    void  GetNameBuf(Il2CppObject* o, char* out, int n);   // respeita 'n' e termina
     std::string GetName(Il2CppObject* o);
 
     bool  WorldToScreen(Vec3 w, Vec2& s);
     bool  VisibleLine(Vec3 a, Vec3 b);
     Vec3  TargetAimPos(Il2CppObject* p, int boneMode);
 
-    // >>> NOVO: mapeamento de osso compartilhado (aimbot.cpp e TargetAimPos usam
-    //     o MESMO). 0=auto 1=cabeca 2=peito 3=estomago 4=perna 5=aleatorio.
+    // mapeamento de osso compartilhado (aimbot.cpp e TargetAimPos usam o MESMO).
+    // 0=auto 1=cabeca 2=peito 3=estomago 4=perna 5=aleatorio.
     Vec3  BonePoint(Vec3 head, Vec3 feet, int boneMode);
 
     Il2CppObject* CamTfObj();
@@ -215,6 +129,11 @@ namespace SDK {
     void DumpFieldsWithValues(Il2CppObject* o);
 }
 
+// ---------------------------------------------------------------------------
+//  BLOCO 'using' — joga os nomes do SDK no escopo global. Mantido por
+//  compatibilidade. Se um dia quiser reduzir o acoplamento, e' aqui que se
+//  corta: cada arquivo passaria a qualificar com SDK:: o que usa.
+// ---------------------------------------------------------------------------
 using SDK::g_targets;
 using SDK::g_targetCount;
 using SDK::g_targetCs;

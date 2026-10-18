@@ -8,9 +8,16 @@
 //   - aba Misc: checkbox "Profiler (ms por passo)" -> C.showFpsGraph
 //
 //  >>> FIX (LNK2005): Menu::Render() NAO e definido aqui. Ele vive em
-//      features.cpp (hooks.cpp chama Render -> features.cpp -> ApplyStyle -> Draw).
+//      features.cpp (hooks.cpp chama Render -> features.cpp -> Draw).
 //  >>> FIX C6011: ComboIdx checava 'list' na linha do 'cur' mas nao dentro do
 //      loop do combo; com lista nula, list[i] estourava.
+//  >>> FIX (v17): VkName() usava UM buffer estatico. Tres chamadas na mesma
+//      expressao (rodape) devolviam o mesmo ponteiro e imprimiam o ultimo
+//      valor. Agora usa buffer rotativo.
+//  >>> FIX (v17): Menu::g_open agora e' REFERENCIA para C.menuOpen. Antes era
+//      um bool proprio -> duas verdades sobre "menu aberto".
+//  >>> FIX (v17): estilo aplicado 2x (aqui e em features.cpp). Dono unico agora
+//      e' este arquivo; features.cpp::Render so chama Draw().
 // ============================================================
 #include "common.h"
 #include "config.h"
@@ -24,13 +31,72 @@
 
 namespace Menu {
 
-    bool g_open = true;
-    static bool g_styled = false;
+    // Mesma celula de memoria que C.menuOpen. Nao existe estado duplicado.
+    bool& g_open = g_cfg.menuOpen;
+
+    // ---------- estilo (dono unico) ----------
+    static ImGuiContext* g_styledCtx = nullptr;
+
+    static void ApplyStyleOnce()
+    {
+        // Reaplica quando o contexto do ImGui for (re)criado. So marca depois
+        // de aplicar de fato.
+        ImGuiContext* ctx = ImGui::GetCurrentContext();
+        if (!ctx || g_styledCtx == ctx) return;
+        g_styledCtx = ctx;
+
+        // ORDEM IMPORTA: StyleColorsDark() ZERA os campos de rounding antes de
+        // escrever as cores. Se vier depois, os overrides abaixo sao apagados.
+        ImGui::StyleColorsDark();
+
+        ImGuiStyle& s = ImGui::GetStyle();
+
+        s.WindowRounding = 6.f;
+        s.ChildRounding = 6.f;
+        s.FrameRounding = 4.f;
+        s.PopupRounding = 4.f;
+        s.GrabRounding = 4.f;
+        s.ScrollbarRounding = 4.f;
+        s.TabRounding = 4.f;
+
+        s.WindowBorderSize = 1.f;
+        s.FrameBorderSize = 0.f;
+        s.WindowPadding = ImVec2(10, 10);
+        s.FramePadding = ImVec2(8, 4);
+        s.ItemSpacing = ImVec2(8, 6);
+        s.ItemInnerSpacing = ImVec2(6, 4);
+        s.ScrollbarSize = 12.f;
+        s.WindowTitleAlign = ImVec2(0.5f, 0.5f);
+
+        ImVec4* c = s.Colors;
+        c[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.07f, 0.09f, 0.94f);
+        c[ImGuiCol_TitleBg] = ImVec4(0.10f, 0.10f, 0.13f, 1.f);
+        c[ImGuiCol_TitleBgActive] = ImVec4(0.13f, 0.13f, 0.17f, 1.f);
+        c[ImGuiCol_Button] = ImVec4(0.17f, 0.17f, 0.22f, 1.f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(0.24f, 0.24f, 0.31f, 1.f);
+        c[ImGuiCol_ButtonActive] = ImVec4(0.30f, 0.30f, 0.38f, 1.f);
+        c[ImGuiCol_Header] = ImVec4(0.17f, 0.17f, 0.22f, 1.f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.24f, 0.24f, 0.31f, 1.f);
+        c[ImGuiCol_HeaderActive] = ImVec4(0.30f, 0.30f, 0.38f, 1.f);
+        c[ImGuiCol_CheckMark] = ImVec4(0.35f, 0.80f, 0.45f, 1.f);
+        c[ImGuiCol_SliderGrab] = ImVec4(0.35f, 0.80f, 0.45f, 1.f);
+        c[ImGuiCol_SliderGrabActive] = ImVec4(0.45f, 0.90f, 0.55f, 1.f);
+        c[ImGuiCol_Tab] = ImVec4(0.12f, 0.12f, 0.15f, 1.f);
+        c[ImGuiCol_TabHovered] = ImVec4(0.24f, 0.24f, 0.31f, 1.f);
+        c[ImGuiCol_TabActive] = ImVec4(0.20f, 0.20f, 0.26f, 1.f);
+        c[ImGuiCol_Separator] = ImVec4(0.24f, 0.24f, 0.30f, 1.f);
+    }
 
     // ---------- keybind ----------
+    // Buffer ROTATIVO: VkName() e' chamada varias vezes na MESMA expressao
+    // (ex.: rodape com menu/panic/salvar). Com um buffer unico, os tres "%s"
+    // recebiam o mesmo ponteiro e imprimiam o ultimo valor calculado.
     static const char* VkName(int vk)
     {
-        static char b[32];
+        static char     s_buf[8][32];
+        static unsigned s_next = 0;
+        char* b = s_buf[s_next++ & 7u];
+
         switch (vk) {
         case 0:            return "Nenhuma";
         case VK_LBUTTON:   return "Mouse Esq";
@@ -56,20 +122,32 @@ namespace Menu {
         }
         if (vk >= '0' && vk <= '9') { b[0] = (char)vk; b[1] = 0; return b; }
         if (vk >= 'A' && vk <= 'Z') { b[0] = (char)vk; b[1] = 0; return b; }
-        sprintf_s(b, "0x%02X", vk);
+        sprintf_s(b, 32, "0x%02X", vk);
         return b;
     }
 
     static int* g_waitKey = nullptr;
+    static bool  g_waitArm = false;   // pula o frame do clique (LBUTTON ainda pode estar down)
+
     static void Keybind(const char* label, int* key)
     {
         char buf[96];
         sprintf_s(buf, "%s: %s", label, (g_waitKey == key) ? "..." : VkName(*key));
-        if (ImGui::Button(buf, ImVec2(170, 0))) g_waitKey = key;
 
-        if (g_waitKey == key) {
-            for (int vk = 1; vk < 256; vk++) {
-                if (GetAsyncKeyState(vk) & 0x8000) { *key = vk; g_waitKey = nullptr; break; }
+        if (ImGui::Button(buf, ImVec2(170, 0))) {
+            g_waitKey = key;
+            g_waitArm = false;
+        }
+
+        if (g_waitKey != key) return;
+
+        if (!g_waitArm) { g_waitArm = true; return; }   // arma no frame seguinte
+
+        for (int vk = 1; vk < 256; vk++) {
+            if (GetAsyncKeyState(vk) & 0x8000) {
+                *key = vk;
+                g_waitKey = nullptr;
+                break;
             }
         }
     }
@@ -83,42 +161,11 @@ namespace Menu {
     static void TabUnlock();
     static void TabMisc();
 
-    static void ApplyStyleOnce()
-    {
-        if (g_styled) return;
-        g_styled = true;
-
-        ImGuiStyle& s = ImGui::GetStyle();
-        s.WindowRounding = 6.f;
-        s.FrameRounding = 4.f;
-        s.GrabRounding = 4.f;
-        s.ScrollbarRounding = 4.f;
-        s.WindowBorderSize = 1.f;
-        s.FrameBorderSize = 0.f;
-        s.ItemSpacing = ImVec2(8, 6);
-        s.WindowPadding = ImVec2(10, 10);
-
-        ImVec4* c = s.Colors;
-        c[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.07f, 0.09f, 0.94f);
-        c[ImGuiCol_TitleBg] = ImVec4(0.10f, 0.10f, 0.13f, 1.f);
-        c[ImGuiCol_TitleBgActive] = ImVec4(0.13f, 0.13f, 0.17f, 1.f);
-        c[ImGuiCol_Button] = ImVec4(0.17f, 0.17f, 0.22f, 1.f);
-        c[ImGuiCol_ButtonHovered] = ImVec4(0.24f, 0.24f, 0.31f, 1.f);
-        c[ImGuiCol_ButtonActive] = ImVec4(0.30f, 0.30f, 0.38f, 1.f);
-        c[ImGuiCol_Header] = ImVec4(0.17f, 0.17f, 0.22f, 1.f);
-        c[ImGuiCol_HeaderHovered] = ImVec4(0.24f, 0.24f, 0.31f, 1.f);
-        c[ImGuiCol_HeaderActive] = ImVec4(0.30f, 0.30f, 0.38f, 1.f);
-        c[ImGuiCol_CheckMark] = ImVec4(0.35f, 0.80f, 0.45f, 1.f);
-        c[ImGuiCol_SliderGrab] = ImVec4(0.35f, 0.80f, 0.45f, 1.f);
-        c[ImGuiCol_SliderGrabActive] = ImVec4(0.45f, 0.90f, 0.55f, 1.f);
-        c[ImGuiCol_Tab] = ImVec4(0.12f, 0.12f, 0.15f, 1.f);
-        c[ImGuiCol_TabHovered] = ImVec4(0.24f, 0.24f, 0.31f, 1.f);
-        c[ImGuiCol_TabActive] = ImVec4(0.20f, 0.20f, 0.26f, 1.f);
-        c[ImGuiCol_Separator] = ImVec4(0.24f, 0.24f, 0.30f, 1.f);
-    }
-
     void Draw()
     {
+        ImGuiContext* ctx = ImGui::GetCurrentContext();
+        if (!ctx) return;
+
         ApplyStyleOnce();
         if (!C.menuOpen) return;
 
@@ -283,12 +330,20 @@ namespace Menu {
     }
 
     // ------------------------------------------------------------
+    // Item seguro: devolve 'fallback' quando indice fora da faixa OU string nula.
+    static const char* ItemOr(const char* const* list, int idx, int count,
+        const char* fallback)
+    {
+        if (!list || idx < 0 || idx >= count) return fallback;
+        return list[idx] ? list[idx] : fallback;
+    }
+
     static bool ComboIdx(const char* label, int* sel, int count, const char* const* list,
         const char* vazio)
     {
         if (count > 0 && !list) return false;
 
-        const char* cur = (*sel >= 0 && *sel < count && list) ? list[*sel] : vazio;
+        const char* cur = ItemOr(list, *sel, count, vazio);
         bool mudou = false;
         if (ImGui::BeginCombo(label, cur)) {
             for (int i = 0; i < count; i++) {
@@ -381,7 +436,9 @@ namespace Menu {
             if (cn > 0 && cl) {
                 if (ComboIdx("Skin / Camo", &C.selCamo, cn, cl, "(nenhuma)")) {
                     C.skinIndex = C.selCamo;
-                    strncpy_s(C.skinName, sizeof(C.skinName), cl[C.selCamo], _TRUNCATE);
+                    // cl[i] pode ser nulo -> strncpy_s com src nulo e' UB.
+                    strncpy_s(C.skinName, sizeof(C.skinName),
+                        ItemOr(cl, C.selCamo, cn, ""), _TRUNCATE);
                 }
             }
             else {
@@ -398,7 +455,8 @@ namespace Menu {
             const char* const* pl = Unlock::CharList();
             if (pn > 0 && pl) {
                 if (ComboIdx("Personagem", &C.selChar, pn, pl, "(nenhum)"))
-                    strncpy_s(C.charName, sizeof(C.charName), pl[C.selChar], _TRUNCATE);
+                    strncpy_s(C.charName, sizeof(C.charName),
+                        ItemOr(pl, C.selChar, pn, ""), _TRUNCATE);
             }
             else {
                 ImGui::TextDisabled("Personagem: catalogo vazio");

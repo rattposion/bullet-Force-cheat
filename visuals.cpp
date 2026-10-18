@@ -1,114 +1,328 @@
-// ============================================================================
-//  visuals.cpp
-//  >>> FIX: o circulo do FOV usava formula propria; agora usa SDK::FovRadiusPx.
-//  >>> FIX: em modo ANGULO (C.aimMode == 1) o circulo em px mente -> nao desenha.
-//  >>> NOVO: profiler por passo (C.showFpsGraph).
-// ============================================================================
+
 #include "features.h"
 #include "sdk.h"
 #include "hooks.h"
 #include "common.h"
 
+#include <windows.h>
 #include <imgui.h>
 #include <cmath>
 #include <cstdio>
-
-static inline ImU32 C4(const float c[4], float aMul = 1.f) {
-    return IM_COL32((int)(c[0] * 255.f), (int)(c[1] * 255.f),
-        (int)(c[2] * 255.f), (int)(c[3] * 255.f * aMul));
-}
-
-static void DrawWatermark(ImDrawList* dl) {
-    char buf[128];
-    sprintf_s(buf, sizeof(buf), "bfi  |  alvos %d  |  desenhados %d",
-        SDK::g_targetCount, SDK::dbg_drawn);
-    dl->AddText(ImVec2(12.f, 10.f), IM_COL32(255, 255, 255, 230), buf);
-}
-
-static void DrawFps(ImDrawList* dl) {
-    static ULONGLONG last = 0;
-    static float fps = 0.f;
-    ULONGLONG now = GetTickCount64();
-    if (last) {
-        ULONGLONG dt = now - last;
-        if (dt > 0) fps = fps * 0.9f + (1000.f / (float)dt) * 0.1f;
-    }
-    last = now;
-    char buf[32];
-    sprintf_s(buf, sizeof(buf), "%.0f fps", (double)fps);
-    dl->AddText(ImVec2(12.f, 30.f), IM_COL32(180, 220, 180, 220), buf);
-}
-
-// ---------------------------------------------------------------------------
-//  >>> NOVO: profiler. Mostra o ms de cada passo do Combat::Tick (media).
-// ---------------------------------------------------------------------------
-static void DrawProfiler(ImDrawList* dl) {
-    if (!C.showFpsGraph) return;
-
-    char buf[80];
-    float y = 54.f;
-
-    sprintf_s(buf, "tick %.2f ms", (double)Combat::g_tickMs);
-    dl->AddText(ImVec2(12.f, y), IM_COL32(255, 210, 120, 235), buf);
-    y += 16.f;
-
-    for (int i = 0; i < Combat::g_statsN; ++i) {
-        sprintf_s(buf, "%-14s %6.2f ms", Combat::g_stats[i].name,
-            (double)Combat::g_stats[i].ms);
-        dl->AddText(ImVec2(12.f, y), IM_COL32(200, 220, 200, 225), buf);
-        y += 14.f;
-    }
-}
-
-static void DrawCrosshair(ImDrawList* dl, float cx, float cy) {
-    float s = C.crosshairSize;
-    float g = 2.f;
-    ImU32 c = C4(C.crosshairColor);
-    dl->AddLine(ImVec2(cx - s - g, cy), ImVec2(cx - g, cy), c, 1.5f);
-    dl->AddLine(ImVec2(cx + g, cy), ImVec2(cx + s + g, cy), c, 1.5f);
-    dl->AddLine(ImVec2(cx, cy - s - g), ImVec2(cx, cy - g), c, 1.5f);
-    dl->AddLine(ImVec2(cx, cy + g), ImVec2(cx, cy + s + g), c, 1.5f);
-}
-
-static void DrawFovCircle(ImDrawList* dl, float cx, float cy, float H) {
-    if (!C.showFovCircle) return;
-    if (!SDK::g_viewProjOk) return;
-    if (C.aimMode == 1) return;                  // >>> FIX: modo angulo
-    if (!C.aimbot) return;
-
-    float r = SDK::FovRadiusPx(C.aimFov);        // mesma formula do aim
-    if (r < 3.f || r > H) return;
-    dl->AddCircle(ImVec2(cx, cy), r, C4(C.aimColor, 0.8f), 64, 1.5f);
-}
-
-static void DrawHitmarker(ImDrawList* dl, float cx, float cy) {
-    if (!C.hitmarker) return;
-    float now = (float)(GetTickCount64() / 1000.0);
-    float dt = now - C.lastHitTime;
-    if (dt < 0.f || dt > 0.25f) return;
-    float a = 1.f - dt / 0.25f;
-    float s = 8.f + dt * 20.f;
-    ImU32 c = IM_COL32(255, 255, 255, (int)(255.f * a));
-    dl->AddLine(ImVec2(cx - s, cy - s), ImVec2(cx - s * 0.4f, cy - s * 0.4f), c, 2.f);
-    dl->AddLine(ImVec2(cx + s, cy - s), ImVec2(cx + s * 0.4f, cy - s * 0.4f), c, 2.f);
-    dl->AddLine(ImVec2(cx - s, cy + s), ImVec2(cx - s * 0.4f, cy + s * 0.4f), c, 2.f);
-    dl->AddLine(ImVec2(cx + s, cy + s), ImVec2(cx + s * 0.4f, cy + s * 0.4f), c, 2.f);
-}
+#include <algorithm>
 
 namespace Misc {
+    namespace {
 
-    void Draw() {
-        ImDrawList* dl = ImGui::GetBackgroundDrawList();
-        float W = (float)SDK::ScreenW();
-        float H = (float)SDK::ScreenH();
-        float cx = W * 0.5f;
-        float cy = H * 0.5f;
+        constexpr float kMargin = 12.0f;
+        constexpr float kFpsAlpha = 0.10f;
+        constexpr float kHitmarkerDuration = 0.25f;
 
-        if (C.watermark) { DrawWatermark(dl); if (C.fps) DrawFps(dl); }
-        DrawProfiler(dl);
-        if (C.crosshair) DrawCrosshair(dl, cx, cy);
-        DrawFovCircle(dl, cx, cy, H);
-        DrawHitmarker(dl, cx, cy);
+        static ImU32 ColorU32(const float color[4], float alphaMultiplier = 1.0f)
+        {
+            if (!color)
+                return IM_COL32(255, 255, 255, 255);
+
+            auto channel = [](float v) -> int {
+                if (!std::isfinite(v))
+                    return 0;
+
+                return static_cast<int>(
+                    std::clamp(v, 0.0f, 1.0f) * 255.0f
+                    );
+                };
+
+            return IM_COL32(
+                channel(color[0]),
+                channel(color[1]),
+                channel(color[2]),
+                channel(color[3] * std::clamp(alphaMultiplier, 0.0f, 1.0f))
+            );
+        }
+
+        static bool ValidViewport(float width, float height)
+        {
+            return std::isfinite(width) &&
+                std::isfinite(height) &&
+                width > 0.0f &&
+                height > 0.0f &&
+                width <= 32768.0f &&
+                height <= 32768.0f;
+        }
+
+        static void DrawWatermark(ImDrawList* drawList)
+        {
+            if (!drawList)
+                return;
+
+            char buffer[128]{};
+
+            std::snprintf(
+                buffer,
+                sizeof(buffer),
+                "bfi | alvos %d | desenhados %d",
+                SDK::g_targetCount,
+                SDK::dbg_drawn
+            );
+
+            drawList->AddText(
+                ImVec2(kMargin, 10.0f),
+                IM_COL32(255, 255, 255, 230),
+                buffer
+            );
+        }
+
+        static void DrawFps(ImDrawList* drawList)
+        {
+            if (!drawList)
+                return;
+
+            static ULONGLONG previousTime = 0;
+            static float smoothedFps = 0.0f;
+
+            const ULONGLONG now = GetTickCount64();
+
+            if (previousTime != 0 && now > previousTime)
+            {
+                const ULONGLONG elapsed = now - previousTime;
+
+                // Ignora intervalos anormais para evitar picos no indicador.
+                if (elapsed > 0 && elapsed <= 10000)
+                {
+                    const float instantFps =
+                        1000.0f / static_cast<float>(elapsed);
+
+                    if (std::isfinite(instantFps))
+                    {
+                        if (smoothedFps <= 0.0f)
+                            smoothedFps = instantFps;
+                        else
+                            smoothedFps =
+                            smoothedFps * (1.0f - kFpsAlpha) +
+                            instantFps * kFpsAlpha;
+                    }
+                }
+            }
+
+            previousTime = now;
+
+            char buffer[32]{};
+            std::snprintf(
+                buffer,
+                sizeof(buffer),
+                "%.0f FPS",
+                static_cast<double>(std::max(0.0f, smoothedFps))
+            );
+
+            drawList->AddText(
+                ImVec2(kMargin, 30.0f),
+                IM_COL32(180, 220, 180, 220),
+                buffer
+            );
+        }
+
+        static void DrawProfiler(ImDrawList* drawList)
+        {
+            if (!drawList || !C.showFpsGraph)
+                return;
+
+            char buffer[96]{};
+            float y = 54.0f;
+
+            std::snprintf(
+                buffer,
+                sizeof(buffer),
+                "tick %.2f ms",
+                static_cast<double>(Combat::g_tickMs)
+            );
+
+            drawList->AddText(
+                ImVec2(kMargin, y),
+                IM_COL32(255, 210, 120, 235),
+                buffer
+            );
+
+            y += 16.0f;
+
+            // Limita a quantidade de linhas exibidas.
+            const int count = std::clamp(
+                Combat::g_statsN,
+                0,
+                Combat::kMaxSteps
+            );
+
+            for (int i = 0; i < count; ++i)
+            {
+                const auto& stat = Combat::g_stats[i];
+
+                char name[24]{};
+                std::memcpy(name, stat.name, sizeof(name) - 1);
+                name[sizeof(name) - 1] = '\0';
+
+                const float ms =
+                    std::isfinite(stat.ms) ? std::max(0.0f, stat.ms) : 0.0f;
+
+                std::snprintf(
+                    buffer,
+                    sizeof(buffer),
+                    "%-14s %6.2f ms",
+                    name,
+                    static_cast<double>(ms)
+                );
+
+                drawList->AddText(
+                    ImVec2(kMargin, y),
+                    IM_COL32(200, 220, 200, 225),
+                    buffer
+                );
+
+                y += 14.0f;
+
+                // Evita que o profiler desenhe indefinidamente fora da tela.
+                if (y > 2000.0f)
+                    break;
+            }
+        }
+
+        static void DrawCrosshair(
+            ImDrawList* drawList,
+            float centerX,
+            float centerY)
+        {
+            if (!drawList ||
+                !std::isfinite(centerX) ||
+                !std::isfinite(centerY))
+                return;
+
+            const float size = std::clamp(C.crosshairSize, 1.0f, 200.0f);
+            constexpr float gap = 2.0f;
+
+            const ImU32 color = ColorU32(C.crosshairColor);
+
+            drawList->AddLine(
+                ImVec2(centerX - size - gap, centerY),
+                ImVec2(centerX - gap, centerY),
+                color,
+                1.5f
+            );
+
+            drawList->AddLine(
+                ImVec2(centerX + gap, centerY),
+                ImVec2(centerX + size + gap, centerY),
+                color,
+                1.5f
+            );
+
+            drawList->AddLine(
+                ImVec2(centerX, centerY - size - gap),
+                ImVec2(centerX, centerY - gap),
+                color,
+                1.5f
+            );
+
+            drawList->AddLine(
+                ImVec2(centerX, centerY + gap),
+                ImVec2(centerX, centerY + size + gap),
+                color,
+                1.5f
+            );
+        }
+
+        static void DrawHitmarker(
+            ImDrawList* drawList,
+            float centerX,
+            float centerY)
+        {
+            if (!drawList || !C.hitmarker)
+                return;
+
+            const float now =
+                static_cast<float>(GetTickCount64()) / 1000.0f;
+
+            const float elapsed = now - C.lastHitTime;
+
+            if (!std::isfinite(elapsed) ||
+                elapsed < 0.0f ||
+                elapsed > kHitmarkerDuration)
+                return;
+
+            const float fade =
+                std::clamp(1.0f - elapsed / kHitmarkerDuration, 0.0f, 1.0f);
+
+            const float size = 8.0f + elapsed * 20.0f;
+
+            const ImU32 color = IM_COL32(
+                255, 255, 255,
+                static_cast<int>(255.0f * fade)
+            );
+
+            constexpr float innerFactor = 0.4f;
+
+            drawList->AddLine(
+                ImVec2(centerX - size, centerY - size),
+                ImVec2(centerX - size * innerFactor,
+                    centerY - size * innerFactor),
+                color,
+                2.0f
+            );
+
+            drawList->AddLine(
+                ImVec2(centerX + size, centerY - size),
+                ImVec2(centerX + size * innerFactor,
+                    centerY - size * innerFactor),
+                color,
+                2.0f
+            );
+
+            drawList->AddLine(
+                ImVec2(centerX - size, centerY + size),
+                ImVec2(centerX - size * innerFactor,
+                    centerY + size * innerFactor),
+                color,
+                2.0f
+            );
+
+            drawList->AddLine(
+                ImVec2(centerX + size, centerY + size),
+                ImVec2(centerX + size * innerFactor,
+                    centerY + size * innerFactor),
+                color,
+                2.0f
+            );
+        }
+
+    } // namespace
+
+    void Draw()
+    {
+        // Deve ser chamado durante um frame válido do ImGui.
+        ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+
+        if (!drawList)
+            return;
+
+        const float width = static_cast<float>(SDK::ScreenW());
+        const float height = static_cast<float>(SDK::ScreenH());
+
+        if (!ValidViewport(width, height))
+            return;
+
+        const float centerX = width * 0.5f;
+        const float centerY = height * 0.5f;
+
+        if (C.watermark)
+        {
+            DrawWatermark(drawList);
+
+            if (C.fps)
+                DrawFps(drawList);
+        }
+
+        DrawProfiler(drawList);
+
+        if (C.crosshair)
+            DrawCrosshair(drawList, centerX, centerY);
+
+        DrawHitmarker(drawList, centerX, centerY);
     }
 
 } // namespace Misc

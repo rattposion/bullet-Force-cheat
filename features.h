@@ -1,52 +1,47 @@
 #pragma once
+// ============================================================================
+//  features.h — declaracoes publicas compartilhadas.
+//
+//  ESTE ARQUIVO NAO DEFINE NADA. Cada simbolo tem um dono:
+//      memoria (mem.h / scan.h) -> #include "memory.h"
+//      Hooks                    -> #include "hooks.h"
+//      Unlock                   -> #include "unlock.h"
+//      SDK (estado + tipos)     -> #include "sdk.h" / "sdk_state.h"
+//      g_phase / PHASE          -> sdk.h
+//
+//  Se qualquer um desses blocos aparecer definido aqui, apague: e' duplicata
+//  e gera C2084 / C2995 / C2556.
+// ============================================================================
 
 #include <atomic>
 #include <cstdint>
+
+#include "il2cpp.h"
+#include "il2cpp_api.h"
 #include "common.h"
 #include "memory.h"
+#include "hooks.h"
 #include "sdk.h"
 #include "config.h"
+#include "unlock.h"
 
-// ---- leitura / escrita crua ----
-template<typename T> inline T    ReadAt(void* addr) { return addr ? *(T*)addr : (T)0; }
-template<typename T> inline T    ReadAt(uintptr_t addr) { return *(T*)addr; }
-template<typename T> inline T    ReadAt(void* base, uint32_t off) { return base ? *(T*)((uint8_t*)base + off) : (T)0; }
-template<typename T> inline T    ReadAt(uintptr_t base, uint32_t off) { return *(T*)(base + off); }
-
-template<typename T> inline void WriteAt(void* addr, T v) { if (addr) *(T*)addr = v; }
-template<typename T> inline void WriteAt(uintptr_t addr, T v) { *(T*)addr = v; }
-template<typename T> inline void WriteAt(void* base, uint32_t off, T v) { if (base) *(T*)((uint8_t*)base + off) = v; }
-template<typename T> inline void WriteAt(uintptr_t base, uint32_t off, T v) { *(T*)(base + off) = v; }
-
-// ---- estado global compartilhado ----
-extern const char* g_phase;              // setado pelo PHASE()
+// ---------------------------------------------------------------------------
+//  Estado global que NAO pertence a nenhum dos donos acima.
+// ---------------------------------------------------------------------------
+//  g_phase fica no sdk.h, junto do macro PHASE que o escreve.
+//  Aqui so' o flag de saida do processo.
 extern std::atomic<bool> g_unload;
 
-namespace Hooks {
-    extern std::atomic<bool> g_imguiReady;
-    extern std::atomic<bool> g_hooksLive;
-    extern std::atomic<bool> g_sdkReady;
-    extern int g_viewW;
-    extern int g_viewH;
-    bool Init();
-    void Shutdown();
-    void ApplyFeatures();
-    void HandleKeys();
-    bool InstallSwap();
-    bool InstallMainThread();
-    bool InstallCursor();
-    bool InstallCombat();
-}
-
-namespace SDK { bool Init(); }
-
-// Menu_WantsMouse: definida em features.cpp, usada pelo hook de input.
+// Menu_WantsMouse: definida em features.cpp, consultada pelo hook de cursor.
 bool Menu_WantsMouse();
 
 namespace Menu {
-    extern bool g_open;
-    void Draw();            // menu.cpp
-    void Render();          // features.cpp — aplica o estilo 1x e chama Draw()
+    // ALIAS de C.menuOpen — mesma celula de memoria, nao um bool proprio.
+    // Requer, no menu.cpp:   bool& Menu::g_open = g_cfg.menuOpen;
+    extern bool& g_open;
+
+    void Draw();            // definida em menu.cpp
+    void Render();          // definida em features.cpp (dono unico)
 }
 
 namespace ESP { void Draw(); }
@@ -54,8 +49,8 @@ namespace Misc { void Panic(); void Draw(); void Tick(); }
 
 // ============================================================================
 //  COMBAT + PROFILER POR PASSO
-//  Cada passo do Tick e' cronometrado (QPC) e exposto pro overlay, pra voce
-//  achar o gargalo real em vez de chutar.
+//  Cada passo do Tick e' cronometrado (QPC) e exposto pro overlay, pra achar
+//  o gargalo real em vez de chutar.
 // ============================================================================
 namespace Combat {
     const int kMaxSteps = 16;
@@ -72,8 +67,8 @@ namespace Movement { void Tick(); }
 // ============================================================================
 //  AIMBOT
 //  NAO declare 'struct Quat' aqui dentro: cria Aimbot::Quat, um tipo distinto
-//  do ::Quat do common.h, e toda chamada de SDK que recebe Quat& quebra
-//  (E0312/E0349/E0434) alem de gerar LookRot sobrecarregado (E0308/C2668).
+//  do ::Quat, e toda chamada de SDK que recebe Quat& quebra (E0312/E0349/E0434)
+//  alem de gerar LookRot sobrecarregado (E0308/C2668).
 //  Regra: '::Quat' explicito aqui e no aimbot.cpp.
 // ============================================================================
 namespace Aimbot {
@@ -94,23 +89,5 @@ namespace Aimbot {
 }
 
 namespace Recoil { void Install(); void Tick(); }
-
-// ============================================================================
-//  UNLOCK — API usada pelo menu (ver tambem unlock.h)
-// ============================================================================
-namespace Unlock {
-    bool Install();
-    void Tick();
-    void Dump();
-
-    // listas pro menu (ponteiros estaveis, montadas 1x)
-    int WeaponCount();             const char* const* WeaponList();
-    int AttachSlotCount();         const char* AttachSlotName(int slot);
-    int AttachCount(int slot);     const char* const* AttachList(int slot);
-    int AttachValue(int slot, int idx);
-    int CamoCount();               const char* const* CamoList();
-    int CharCount();               const char* const* CharList();
-}
-
 namespace Triggerbot { bool Install(); void Tick(); }
 namespace AntiCheat { bool Install(); void Tick(); }

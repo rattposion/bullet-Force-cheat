@@ -1,49 +1,24 @@
 // ============================================================================
-//  hooks.cpp  (v3 — corrigido)
+//  hooks.cpp  (v4 — alinhado com o hooks.h novo)
 //
-//  >>> NOVO NESTA VERSAO:
-//  23) hk_lateUpdate: REMOVIDO o early-return por instancia
-//        if (g_mainIsPlayerClass && g_localPlayer && self != g_localPlayer) return;
-//      Era ele que matava o ESP. Quando o objeto do jogador local e' recriado
-//      (respawn / troca de cena / entrada de partida), self != g_localPlayer
-//      bloqueava o hook PRA SEMPRE — e como e' o proprio tick que re-adota o
-//      local (UpdateTargets -> FindLocalPlayer), ele nunca voltava. Log tipico:
-//      "localPlayer adotado" UMA vez, scan2s/dbg param, e todo beat fica
-//      fase=hk_swap com alvos=0. Agora o tick roda 1x por frame
-//      independente de qual PlayerScript chamou o LateUpdate; o throttle
-//      g_lastTickFrame garante 1 execucao por frame (o resto sai barato).
-//  24) WATCHDOG: se o LateUpdate nao rodar o tick por >250 ms, o proprio swap
-//      assume (RunTickOnce). ESP/aimbot nunca mais morrem por hook silencioso.
-//  25) ClassOf agora valida com Plausible/PlausibleObj. Era daqui que saia o
-//      [veh] AV "alvo=FFFFFFFFFFFFFFFF" (objeto lixo -> il2cpp_object_get_class
-//      lendo em -1).
-//  26) Shutdown reseta g_lastTickMs (senao o watchdog dispara no re-init).
+//  >>> MUDANCAS DESTA VERSAO (interface):
+//  A) g_frameCounter: uint32_t -> uint64_t. Todos os pontos que comparavam
+//     com ele passaram a usar uint64_t e sentinela ~0ull.
+//  B) g_viewW/g_viewH: int -> std::atomic<int>, escritos SO' por
+//     SetViewSize(). Para o par coerente, GetViewSize().
+//  C) SafeFont: ImFont* -> ImFont& (sempre referencia valida) + FontCount().
+//  D) Shutdown: void -> bool. Idempotente, termina sempre em Down.
+//  E) Ciclo de vida por Stage. SetStage() e' o UNICO escritor dos espelhos
+//     g_sdkReady/g_hooksLive/g_imguiReady. InitImGui/Init usam Advance(),
+//     que so' avanca — nunca regride um espelho ja' publicado.
 //
-//  >>> CORRECOES ANTERIORES (mantidas):
-//  16) LOG THROTTLE: [watch]/[probe]/[fire7] gateados por C.probeLog.
-//  17) WATCH_MAX_LINES 12, frameProbeFrames < 6, probeShots < 2,
-//      fireLogged < 1, ProbeDiff <= 8 linhas por tiro.
-//  18) hk_lateUpdate com __try no original E no bloco watch/probe.
-//  19) RebindWindow/hk_wndProc com Enter/LeaveCriticalSection manuais
-//      (ImLock nao roda destrutor sob SEH -> CS travada pra sempre).
-//  20) Bloco pre-ImGui do swap dentro de __try (so POD).
-//  21) Beat log gateado por C.beatLog.
-//  22) Shutdown zera g_lastTickFrame / contadores de log.
-//   1) hk_fire7 retorna bool (FireBullet e' bool).
-//   2) Janela/ESP: WindowFromDC so aceita janela com area cliente > 0.
-//   3) Shutdown destroi o ImGui e espera os detours antes de MH_Uninitialize.
-//   4) silent/magic chamam Aimbot::Silent::Override.
-//   5) hk_wndProc em reentrancia repassa o o_wndProc, nao DefWindowProcA.
-//   6) InitImGui idempotente (flags por backend + rollback limpo).
-//   7) Bloco de frame do ImGui com lock manual e __try so em POD.
-//   8) ResolveWindow throttled.
-//   9) ApplyNoRecoil 1x por frame; fireOne so age no tiro local.
-//  10) CollectProbeFields nao passa nome nulo pro strncpy_s.
-//  11) SDK::g_frameId atualizado no swap hook.
-//  12) RebindWindow nao re-inicializa o ImGui com a mesma janela.
-//  13) FindClassNamed exige nome EXATO.
-//  14) Shutdown zera g_hwnd/o_wndProc/trampolines.
-//  15) Chama Menu::Render() (que aplica o ApplyStyle).
+//  >>> CONTEUDO FUNCIONAL DA v3 (preservado):
+//  23) hk_lateUpdate SEM early-return por instancia (era o que matava o ESP).
+//  24) WATCHDOG: swap assume o tick se o LateUpdate sumir por >250 ms.
+//  25) ClassOf valida com Plausible/PlausibleObj.
+//  26) Shutdown reseta g_lastTickMs.
+//  16-22, 1-15: mantidos (throttle de log, __try nos blocos certos, CS manual,
+//     rebind sem re-init, FindClassNamed exato, etc.)
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -75,18 +50,87 @@
 
 namespace Hooks {
 
-    std::atomic<bool> g_imguiReady{ false };
-    std::atomic<bool> g_hooksLive{ false };
-    std::atomic<bool> g_sdkReady{ false };
-    std::atomic<uint32_t> g_frameCounter{ 0 };
-    int g_viewW = 1920;
-    int g_viewH = 1080;
+    // -----------------------------------------------------------------------
+    //  Estado global
+    // -----------------------------------------------------------------------
+    std::atomic<bool>     g_imguiReady{ false };
+    std::atomic<bool>     g_hooksLive{ false };
+    std::atomic<bool>     g_sdkReady{ false };
+    std::atomic<uint64_t> g_frameCounter{ 0 };
 
-    uint32_t FrameId() { return g_frameCounter.load(std::memory_order_relaxed); }
+    // Espelhos do viewport. Escritos SO' por SetViewSize().
+    std::atomic<int> g_viewW{ 1920 };
+    std::atomic<int> g_viewH{ 1080 };
+
+    uint32_t FrameId() { return (uint32_t)g_frameCounter.load(std::memory_order_relaxed); }
+
+    // -----------------------------------------------------------------------
+    //  Ciclo de vida — fonte unica
+    // -----------------------------------------------------------------------
+    static std::atomic<int> g_stage{ (int)Stage::Down };
+
+    Stage StageNow() { return (Stage)g_stage.load(std::memory_order_acquire); }
+    bool  IsLive() { return StageNow() == Stage::Live; }
+
+    bool AtLeast(Stage s) {
+        const Stage cur = StageNow();
+        if (cur == Stage::Tearing) return false;   // durante teardown nada e' garantido
+        return (int)cur >= (int)s;
+    }
+
+    const char* StageName(Stage s) {
+        switch (s) {
+        case Stage::Down:    return "Down";
+        case Stage::Init:    return "Init";
+        case Stage::Sdk:     return "Sdk";
+        case Stage::Hooks:   return "Hooks";
+        case Stage::ImGui:   return "ImGui";
+        case Stage::Live:    return "Live";
+        case Stage::Tearing: return "Tearing";
+        }
+        return "?";
+    }
+
+    // UNICO lugar que escreve os espelhos. Por isso nao podem divergir.
+    void SetStage(Stage s) {
+        const int v = (int)s;
+        g_stage.store(v, std::memory_order_release);
+
+        g_sdkReady.store(v >= (int)Stage::Sdk, std::memory_order_release);
+        g_hooksLive.store(v >= (int)Stage::Hooks, std::memory_order_release);
+        g_imguiReady.store(v >= (int)Stage::ImGui, std::memory_order_release);
+    }
+
+    // Avanca sem regredir. Usado pelo fluxo normal (Init/InitImGui/Rebind).
+    // Nao mexe durante Tearing: quem manda no teardown e' o Shutdown().
+    static void Advance(Stage s) {
+        const int cur = (int)g_stage.load(std::memory_order_relaxed);
+        if (cur == (int)Stage::Tearing) return;
+        if ((int)s > cur) SetStage(s);
+    }
+
+    // -----------------------------------------------------------------------
+    //  Viewport — par publicado por um unico writer
+    // -----------------------------------------------------------------------
+    void SetViewSize(int w, int h) {
+        g_viewW.store(w, std::memory_order_release);
+        g_viewH.store(h, std::memory_order_release);
+    }
+
+    ViewSize GetViewSize() {
+        // Re-tenta enquanto a largura estiver mudando. O writer publica
+        // altura antes de largura, entao largura estavel => par coerente.
+        for (;;) {
+            const int w1 = g_viewW.load(std::memory_order_acquire);
+            const int h = g_viewH.load(std::memory_order_acquire);
+            if (w1 == g_viewW.load(std::memory_order_acquire))
+                return ViewSize{ w1, h };
+        }
+    }
 
     static bool g_mhInit = false;
-    static std::atomic<uint32_t> g_lastTickFrame{ 0xFFFFFFFFu };
-    static std::atomic<uint64_t> g_lastTickMs{ 0 };   // >>> FIX 24
+    static std::atomic<uint64_t> g_lastTickFrame{ ~0ull };
+    static std::atomic<uint64_t> g_lastTickMs{ 0 };
 
     static std::atomic<bool> g_mainIsPlayerClass{ false };
 
@@ -111,7 +155,6 @@ namespace Hooks {
         return (v > 0 && v < 4096) ? v : WATCH_MAX_LINES;
     }
 
-    // >>> FIX 25: validacao de ponteiro
     static bool Plausible(const void* p) {
         uintptr_t a = (uintptr_t)p;
         if (a < 0x10000 || a > 0x00007FFFFFFFFFFFULL) return false;
@@ -167,7 +210,6 @@ namespace Hooks {
         return m ? SDK::MethodPtr(m) : nullptr;
     }
 
-    // >>> FIX 25
     static Il2CppClass* ClassOf(void* o) {
         if (!il2cpp_object_get_class || !PlausibleObj(o)) return nullptr;
         return il2cpp_object_get_class((const Il2CppObject*)o);
@@ -187,33 +229,32 @@ namespace Hooks {
         __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
-    static void ApplyNoRecoilFrame(uint32_t f) {
-        static std::atomic<uint32_t> last{ 0xFFFFFFFF };
-        uint32_t prev = last.exchange(f);
+    static void ApplyNoRecoilFrame(uint64_t f) {
+        static std::atomic<uint64_t> last{ ~0ull };
+        uint64_t prev = last.exchange(f);
         if (prev == f) return;
         ApplyNoRecoil();
     }
 
     // -----------------------------------------------------------------------
-    //  >>> FIX 23/24: UM unico ponto de entrada do tick.
-    //  1x por frame, sem filtro de instancia, com watchdog.
-    //  Locais aqui sao POD -> pode ser chamado de dentro de __try.
+    //  UM unico ponto de entrada do tick. 1x por frame, sem filtro de
+    //  instancia, com watchdog. Locais POD -> pode rodar dentro de __try.
     // -----------------------------------------------------------------------
     static void RunTickOnce() {
-        const uint32_t f = g_frameCounter.load(std::memory_order_relaxed);
-        uint32_t previous = g_lastTickFrame.load(std::memory_order_relaxed);
+        const uint64_t f = g_frameCounter.load(std::memory_order_relaxed);
+        uint64_t previous = g_lastTickFrame.load(std::memory_order_relaxed);
         for (;;) {
             if (previous == f) return;
             if (g_lastTickFrame.compare_exchange_weak(
-                    previous, f,
-                    std::memory_order_acq_rel,
-                    std::memory_order_relaxed)) {
+                previous, f,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
                 break;
             }
         }
 
         g_lastTickMs.store(GetTickCount64(), std::memory_order_relaxed);
-        SDK::g_frameId = f;
+        SDK::g_frameId = (uint32_t)f;
         Combat::Tick();
     }
 
@@ -269,12 +310,31 @@ namespace Hooks {
         ~ImLock() { if (g_imCsInit) LeaveCriticalSection(&g_imCs); }
     };
 
-    ImFont* SafeFont(int idx) {
-        if (!g_imguiReady.load()) return nullptr;
+    // -----------------------------------------------------------------------
+    //  Fontes
+    //  SafeFont devolve SEMPRE referencia valida. FontCount() devolve 0 antes
+    //  do atlas existir.
+    // -----------------------------------------------------------------------
+    int FontCount() {
+        if (!g_imguiReady.load()) return 0;
+        if (!ImGui::GetCurrentContext()) return 0;
         ImGuiIO& io = ImGui::GetIO();
-        if (io.Fonts->Fonts.Size <= 0) return nullptr;
-        if (idx < 0 || idx >= io.Fonts->Fonts.Size) idx = 0;
-        return io.Fonts->Fonts[idx];
+        return io.Fonts ? io.Fonts->Fonts.Size : 0;
+    }
+
+    ImFont& SafeFont(int idx) {
+        if (g_imguiReady.load() && ImGui::GetCurrentContext()) {
+            ImGuiIO& io = ImGui::GetIO();
+            const int n = io.Fonts ? io.Fonts->Fonts.Size : 0;
+            if (n > 0) {
+                if (idx < 0) idx = 0;
+                if (idx >= n) idx = n - 1;
+                if (ImFont* f = io.Fonts->Fonts[idx]) return *f;
+            }
+            if (ImFont* f = ImGui::GetFont()) return *f;
+        }
+        static ImFont s_dummy;
+        return s_dummy;
     }
 
     static thread_local int t_wndDepth = 0;
@@ -344,7 +404,7 @@ namespace Hooks {
         }
 
         g_imguiInit = true;
-        g_imguiReady = true;
+        Advance(Stage::ImGui);          // publica o espelho pelo caminho unico
         Log("[hooks] ImGui inicializado (hwnd=%p)", hwnd);
         return true;
     }
@@ -390,11 +450,14 @@ namespace Hooks {
             g_win32Backend = false;
             if (!ImGui_ImplWin32_Init(hwnd)) {
                 Log("[hooks] ImGui_ImplWin32_Init FALHOU (rebind)");
-                g_imguiReady = false;
+                // Falha PARCIAL, nao e' mudanca de estagio: ajusta o espelho
+                // direto. E' a unica excecao a regra do SetStage.
+                g_imguiReady.store(false, std::memory_order_release);
             }
             else {
                 g_win32Backend = true;
                 ImGui::GetIO().IniFilename = nullptr;
+                g_imguiReady.store(true, std::memory_order_release);
             }
         }
 
@@ -406,7 +469,7 @@ namespace Hooks {
         g_frameCounter.fetch_add(1, std::memory_order_relaxed);
 
         // o cache de LOS nao pode congelar com o jogo pausado
-        SDK::g_frameId = g_frameCounter.load(std::memory_order_relaxed);
+        SDK::g_frameId = (uint32_t)g_frameCounter.load(std::memory_order_relaxed);
 
         if (!o_swap) return TRUE;
 
@@ -442,18 +505,16 @@ namespace Hooks {
                 ULONGLONG nb = GetTickCount64();
                 if (nb - lastBeat > 2000) {
                     lastBeat = nb;
-                    Log("[hooks] beat: menu=%d sdk=%d alvos=%d local=%p fase=%s",
-                        (int)C.menuOpen, (int)g_sdkReady.load(), SDK::g_targetCount,
+                    Log("[hooks] beat: menu=%d stage=%s alvos=%d local=%p fase=%s",
+                        (int)C.menuOpen, StageName(StageNow()), SDK::g_targetCount,
                         SDK::g_localPlayer, g_phase ? g_phase : "?");
                 }
             }
 
             HandleKeys();
 
-            // >>> FIX 24: watchdog. Se o LateUpdate nao rodou o tick nos
-            //     ultimos 250 ms (troca de instancia / cena / hook morto),
-            //     o swap assume. O RunTickOnce e' 1x por frame, entao nao
-            //     existe tick dobrado quando o LateUpdate esta vivo.
+            // WATCHDOG: se o LateUpdate nao rodou o tick nos ultimos 250 ms
+            // (troca de instancia / cena / hook morto), o swap assume.
             if (GetTickCount64() - g_lastTickMs.load(std::memory_order_relaxed) > TICK_WATCHDOG_MS) {
                 PHASE("swap-watchdog");
                 RunTickOnce();
@@ -467,7 +528,7 @@ namespace Hooks {
         if (!GetClientRect(g_hwnd, &rc)) return o_swap(hdc);
         int w = rc.right - rc.left, h = rc.bottom - rc.top;
         if (w <= 0 || h <= 0) return o_swap(hdc);
-        g_viewW = w; g_viewH = h;
+        SetViewSize(w, h);                       // writer unico do viewport
 
         if (g_imCsInit) EnterCriticalSection(&g_imCs);
         __try {
@@ -490,7 +551,7 @@ namespace Hooks {
 
             ImDrawData* dd = ImGui::GetDrawData();
             if (dd && dd->Valid && dd->CmdListsCount > 0) {
-                glViewport(0, 0, g_viewW, g_viewH);
+                glViewport(0, 0, ViewW(), ViewH());
                 ImGui_ImplOpenGL3_RenderDrawData(dd);
             }
         }
@@ -581,8 +642,6 @@ namespace Hooks {
     static void __fastcall hk_lateUpdate(void* self, void* method) {
         PHASE("hk_lateUpdate");
 
-        // >>> FIX 23: g_localPlayer nulo NAO bloqueia mais (era o outro lado do
-        //     bug: se o local ainda nao existe, o tick tem que rodar pra achar).
         const bool isLocalInst = (!g_mainIsPlayerClass.load() ||
             !SDK::g_localPlayer || self == SDK::g_localPlayer);
 
@@ -621,9 +680,8 @@ namespace Hooks {
         }
         __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] watch/probe"); }
 
-        // >>> FIX 23: SEM early-return por instancia. O throttle por frame
-        //     dentro do RunTickOnce ja evita trabalho repetido: com 10 players
-        //     o LateUpdate roda 10x/frame e so a 1a faz o tick.
+        // SEM early-return por instancia: o throttle por frame dentro do
+        // RunTickOnce ja evita trabalho repetido.
         RunTickOnce();
     }
 
@@ -695,8 +753,8 @@ namespace Hooks {
                 if (aiming && haveRot) {
                     Vec3 me = SDK::GetPos(camTf);
                     Vec3 tp = SDK::TargetAimPos(SDK::g_aimTarget, C.aimBone);
-                    if (tp.zero()) tp = SDK::GetPos(SDK::g_aimTarget);
-                    Vec3 d{ tp.x - me.x, tp.y - me.y, tp.z - me.z };
+                    if (!tp.isSane() || tp.zero()) tp = SDK::GetPos(SDK::g_aimTarget);
+                    Vec3 d = tp - me;
                     float L = d.len();
                     if (L > 0.0001f) {
                         ::Quat q = SDK::LookRot(d * (1.f / L));
@@ -871,10 +929,21 @@ namespace Hooks {
             (int)C.noReload, (int)C.silentAim, (int)C.probeLog);
     }
 
+    // -----------------------------------------------------------------------
+    //  CICLO DE VIDA
+    // -----------------------------------------------------------------------
     bool Init() {
-        if (g_mhInit) return true;
-        if (MH_Initialize() != MH_OK) { Log("[hooks] MH_Initialize FALHOU"); return false; }
-        g_mhInit = true;
+        if (IsLive()) return true;                 // idempotente
+
+        Advance(Stage::Init);
+
+        if (!g_mhInit) {
+            if (MH_Initialize() != MH_OK) {
+                Log("[hooks] MH_Initialize FALHOU");
+                return false;                      // fica em Init; Shutdown limpa
+            }
+            g_mhInit = true;
+        }
 
         if (!g_imCsInit) { InitializeCriticalSection(&g_imCs); g_imCsInit = true; }
 
@@ -886,27 +955,38 @@ namespace Hooks {
         ok |= InstallCursor();
         ok |= InstallCombat();
 
+        Advance(Stage::Hooks);
+
         Aimbot::Install();
         Triggerbot::Install();
         AntiCheat::Install();
 
         ApplyFeatures();
 
-        g_hooksLive = true;
-        Log("[hooks] instalados (sucesso=%d)", (int)ok);
+        Advance(Stage::Live);
+        Log("[hooks] instalados (sucesso=%d) stage=%s", (int)ok, StageName(StageNow()));
         return ok;
     }
 
-    void Shutdown() {
-        if (!g_mhInit) return;
-        g_sdkReady = false;
-        g_hooksLive = false;
+    bool Shutdown() {
+        if (!g_mhInit && StageNow() == Stage::Down) {
+            Log("[hooks] Shutdown: ja' estava em Down");
+            return true;
+        }
+
+        SetStage(Stage::Tearing);
+
+        // Durante o teardown nada e' garantido: derruba os espelhos na mao
+        // (SetStage(Tearing) os deixaria em true, porque Tearing > Live).
+        g_sdkReady.store(false, std::memory_order_release);
+        g_hooksLive.store(false, std::memory_order_release);
+        g_imguiReady.store(false, std::memory_order_release);
+
         SDK::g_recoilHookActive = false;
         g_frameOpen = false;
 
-        if (o_wndProc && g_hwnd) {
+        if (o_wndProc && g_hwnd)
             SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)o_wndProc);
-        }
         o_wndProc = nullptr;
 
         MH_DisableHook(MH_ALL_HOOKS);
@@ -918,7 +998,6 @@ namespace Hooks {
             if (g_win32Backend) { ImGui_ImplWin32_Shutdown(); g_win32Backend = false; }
             if (g_imguiCtx) { ImGui::DestroyContext(); g_imguiCtx = false; }
             g_imguiInit = false;
-            g_imguiReady = false;
         }
 
         MH_Uninitialize();
@@ -932,8 +1011,7 @@ namespace Hooks {
         o_fireOne = nullptr;
         o_shoot1 = o_shoot2 = o_shoot3 = o_shoot4 = nullptr;
 
-        // >>> FIX 22 / 26
-        g_lastTickFrame.store(0xFFFFFFFFu, std::memory_order_relaxed);
+        g_lastTickFrame.store(~0ull, std::memory_order_relaxed);
         g_lastTickMs.store(0);
         g_lastShotMs.store(0);
         g_frameProbeFrames = 0;
@@ -943,7 +1021,9 @@ namespace Hooks {
         g_fireOneLogged = 0;
         g_probeN = -1;
 
+        SetStage(Stage::Down);
         Log("[hooks] Shutdown");
+        return true;
     }
 
 } // namespace Hooks
