@@ -85,7 +85,7 @@ namespace Hooks {
     uint32_t FrameId() { return g_frameCounter.load(std::memory_order_relaxed); }
 
     static bool g_mhInit = false;
-    static uint32_t g_lastTickFrame = 0xFFFFFFFF;
+    static std::atomic<uint32_t> g_lastTickFrame{ 0xFFFFFFFFu };
     static std::atomic<uint64_t> g_lastTickMs{ 0 };   // >>> FIX 24
 
     static std::atomic<bool> g_mainIsPlayerClass{ false };
@@ -200,9 +200,18 @@ namespace Hooks {
     //  Locais aqui sao POD -> pode ser chamado de dentro de __try.
     // -----------------------------------------------------------------------
     static void RunTickOnce() {
-        uint32_t f = g_frameCounter.load(std::memory_order_relaxed);
-        if (f == g_lastTickFrame) return;
-        g_lastTickFrame = f;
+        const uint32_t f = g_frameCounter.load(std::memory_order_relaxed);
+        uint32_t previous = g_lastTickFrame.load(std::memory_order_relaxed);
+        for (;;) {
+            if (previous == f) return;
+            if (g_lastTickFrame.compare_exchange_weak(
+                    previous, f,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        }
+
         g_lastTickMs.store(GetTickCount64(), std::memory_order_relaxed);
         SDK::g_frameId = f;
         Combat::Tick();
@@ -924,7 +933,7 @@ namespace Hooks {
         o_shoot1 = o_shoot2 = o_shoot3 = o_shoot4 = nullptr;
 
         // >>> FIX 22 / 26
-        g_lastTickFrame = 0xFFFFFFFF;
+        g_lastTickFrame.store(0xFFFFFFFFu, std::memory_order_relaxed);
         g_lastTickMs.store(0);
         g_lastShotMs.store(0);
         g_frameProbeFrames = 0;

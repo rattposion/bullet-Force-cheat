@@ -296,13 +296,16 @@ static void* se_object_unbox(Il2CppObject* o) {
 static thread_local bool t_il2cppAttached = false;
 static void EnsureThreadAttached() {
     if (t_il2cppAttached) return;
-    t_il2cppAttached = true;
     if (!il2cpp_thread_attach || !il2cpp_domain_get) return;
 
     Il2CppDomain* d = nullptr;
     SE_BEGIN{ d = il2cpp_domain_get(); } SE_END{ d = nullptr; }
     if (!d) return;
-    SE_BEGIN{ il2cpp_thread_attach(d); } SE_END{}
+
+    // Mark this thread as attached only after the runtime confirms success.
+    Il2CppDomain* attached = nullptr;
+    SE_BEGIN{ attached = il2cpp_thread_attach(d); } SE_END{ attached = nullptr; }
+    t_il2cppAttached = (attached != nullptr);
 }
 
 static Il2CppObject* se_runtime_invoke(const MethodInfo* m, void* o, void** args) {
@@ -391,11 +394,22 @@ static MethodInfo* MethodCached(Il2CppClass* k, const char* name, int argc) {
 static const char* TypeNameCached(const Il2CppType* t) {
     if (!t || !il2cpp_type_get_name) return "?";
     struct Ent { const Il2CppType* t; const char* n; };
-    static Ent c[512]; static int n = 0;
-    for (int i = 0; i < n; ++i) if (c[i].t == t) return c[i].n;
+    static Ent c[512]{};
+    static size_t n = 0;
+    static std::mutex cacheMx;
+    std::lock_guard<std::mutex> lock(cacheMx);
+
+    for (size_t i = 0; i < n; ++i) {
+        if (c[i].t == t) return c[i].n;
+    }
+
     const char* nm = il2cpp_type_get_name(t);
     if (!nm) nm = "?";
-    if (n < 512) { c[n].t = t; c[n].n = nm; ++n; }
+    if (n < (sizeof(c) / sizeof(c[0]))) {
+        c[n].t = t;
+        c[n].n = nm;
+        ++n;
+    }
     return nm;
 }
 
@@ -2416,9 +2430,19 @@ namespace SDK {
 
     std::vector<Target> Snapshot() {
         std::vector<Target> out;
-        EnterCriticalSection(&g_targetCs);
-        out.assign(g_targets, g_targets + g_targetCount);
-        LeaveCriticalSection(&g_targetCs);
+        struct CriticalSectionGuard {
+            CRITICAL_SECTION* cs;
+            explicit CriticalSectionGuard(CRITICAL_SECTION* value) : cs(value) {
+                EnterCriticalSection(cs);
+            }
+            ~CriticalSectionGuard() { LeaveCriticalSection(cs); }
+            CriticalSectionGuard(const CriticalSectionGuard&) = delete;
+            CriticalSectionGuard& operator=(const CriticalSectionGuard&) = delete;
+        } guard(&g_targetCs);
+
+        const int count = (g_targetCount < 0) ? 0 :
+            ((g_targetCount > MAX_TARGETS) ? MAX_TARGETS : g_targetCount);
+        out.assign(g_targets, g_targets + count);
         return out;
     }
 
