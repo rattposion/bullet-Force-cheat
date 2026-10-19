@@ -45,9 +45,6 @@ struct Config {
     bool  fps = false;
 
     // ---- PERFORMANCE ----
-    // LOS: quantos alvos podem ser testados por frame (rodizio).
-    //   8 = equilibrio bom.  0 = sem teto (todos, todo frame -> o que travava).
-    // Cada alvo e' reavaliado a cada ceil(nAlvos / losPerFrame) frames.
     int   losPerFrame = 8;
 
     // ---- AIMBOT ----
@@ -59,18 +56,14 @@ struct Config {
     int   aimMode = 0;              // 0=Camera(screen) 1=Angulo(3D) 2=Mouse(->Camera)
     bool  aimVisible = true;
 
-    // Checar visao (LOS):
-    //   MARCADO   -> mira SOMENTE em quem esta visivel.
-    //   DESMARCADO-> sem filtro, mira atraves da parede.
+    // Checar visao (LOS): MARCADO -> mira SOMENTE em quem esta visivel.
     bool  aimVisCheck = true;
 
-    // Nao mirar atras do muro:
-    //   true  -> se ninguem estiver visivel, NAO mira em ninguem (padrao).
-    //   false -> cai no mais proximo da mira (volta a mirar no muro).
+    // Nao mirar atras do muro: true = descarta invisivel (padrao).
     bool  aimStrictVis = true;
 
     bool  aimTeam = false;
-    bool  aimRotate = true;         // escreve a rotacao (camera/player)
+    bool  aimRotate = true;
     bool  showFovCircle = false;
     float aimMaxDist = 250.f;
     float aimColor[4] = { 0.f, 1.f, 0.f, 1.f };
@@ -78,11 +71,20 @@ struct Config {
     bool  silentAim = false;
     bool  magicBullets = false;
 
+    // =======================================================================
+    //  ALIASES / CAMPOS NOVOS  (nome exato usado pelo aimbot.cpp)
+    // =======================================================================
+    bool  aimEnabled = true;
+    bool  aimTeamCheck = false;     // true = nao mira em companheiro de time
+    int   aimSelect = 0;            // 0=mais perto da mira  1=mais perto  2=hibrido
+    bool  aimToggle = false;
+    bool  aimAutoFire = false;
+    int   aimFireDelayMs = 50;
+
     // ---- TRIGGERBOT ----
     bool  triggerbot = false;
     int   triggerKey = VK_MENU;
     float triggerDelay = 30.f;
-    // raio em px: so atira se a mira estiver EM CIMA do alvo. 0 = desliga.
     float triggerRadius = 10.f;
 
     // ---- ARMA ----
@@ -129,38 +131,32 @@ struct Config {
     float unlockInterval = 0.5f;
     int   unlockLevel = 999;
 
-    // ---- NOMES (arma / skin / acessorio) ----
+    // ---- NOMES ----
     bool  forceNames = false;
     char  weaponName[32] = "";
     char  skinName[32] = "";
     char  attachName[32] = "";
 
-    // ---- SKIN CHANGER (campos int, se existirem) ----
+    // ---- SKIN CHANGER ----
     bool  skinChanger = false;
     int   skinIndex = 0;
 
     bool  aimKeyDown = false;
     float lastHitTime = 0.f;
 
-    // =======================================================================
-    //  SELECAO DO LOADOUT / SKINS / PERSONAGENS
-    //  Os indices sao os das listas Unlock::WeaponList() / CamoList() /
-    //  CharList() / AttachList(slot).  -1 = "nao mexer".
-    // =======================================================================
-    bool  unlockChars = true;               // destrava personagens
-    bool  applySelection = true;            // aplica o que voce escolheu abaixo
-    int   selWeapon = -1;                   // indice em Unlock::WeaponList()
-    int   selCamo = -1;                     // indice em Unlock::CamoList()
-    int   selChar = -1;                     // indice em Unlock::CharList()
-    int   selAttach[3] = { -1, -1, -1 };    // 0=sights 1=accessories 2=barrels
-    int   loadoutSlot = 0;                  // slot do loadout (0..2) que recebe selWeapon
-    char  charName[32] = "";                // nome do personagem escolhido
+    // ---- SELECAO DO LOADOUT / SKINS / PERSONAGENS ----
+    bool  unlockChars = true;
+    bool  applySelection = true;
+    int   selWeapon = -1;
+    int   selCamo = -1;
+    int   selChar = -1;
+    int   selAttach[3] = { -1, -1, -1 };
+    int   loadoutSlot = 0;
+    char  charName[32] = "";
 
-    // =======================================================================
-    //  LOG / DUMP  (campos novos ficam no FIM de proposito)
-    // =======================================================================
-    bool  probeLog = false;                 // [watch] / [probe] / [fire7] / [aim]
-    bool  beatLog = true;                   // "[hooks] beat: ..." a cada 2s
+    // ---- LOG / DUMP ----
+    bool  probeLog = false;
+    bool  beatLog = true;
     bool  verboseUnlock = true;
     int   watchMaxLines = 12;
 
@@ -171,7 +167,7 @@ struct Config {
     bool  gunCustomizeAllSlots = true;
 
     bool  showAimTargetName = false;
-    bool  showFpsGraph = false;             // profiler por passo no overlay
+    bool  showFpsGraph = false;
 };
 
 extern Config  g_cfg;
@@ -181,8 +177,6 @@ extern Config  g_cfg;
 #endif
 extern Config& C;
 
-// C.menuOpen  -> funciona (macro function-like so expande com parenteses)
-// C(menuOpen) -> g_cfg.menuOpen
 #define C(f) g_cfg.f
 
 namespace ConfigIO {

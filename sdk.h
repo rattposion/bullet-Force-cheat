@@ -1,16 +1,7 @@
 #pragma once
 // ============================================================================
-//  sdk.h — UMBRELLA. Mantem compatibilidade total.
-//
-//  A responsabilidade esta' separada em:
-//      sdk_types.h  -> Target, MAX_TARGETS
-//      sdk_state.h  -> todo o estado mutavel + regra de concorrencia
-//      sdk.h        -> funcoes + o bloco 'using' global
-//
-//  Se um arquivo so' precisa de 'Target', inclua sdk_types.h.
-//  Se so' precisa do estado, inclua sdk_state.h.
-//  O bloco 'using' no fim e' o motivo de quase tudo incluir este header —
-//  ele joga ~60 nomes no escopo global.
+//  sdk.h — UMBRELLA.
+//  >>> v6.6 — GetTeamId/GetLocalTeam expostos publicamente (fix C2039/C3861).
 // ============================================================================
 
 #include "common.h"
@@ -18,7 +9,7 @@
 #include "il2cpp_api.h"
 #include "memory.h"
 #include "config.h"
-#include "hooks.h"          // dono de Hooks::g_viewW/g_viewH (nao redeclare aqui)
+#include "hooks.h"
 #include "sdk_types.h"
 #include "sdk_state.h"
 
@@ -31,13 +22,16 @@ extern const char* g_phase;
 #define PHASE(x) (g_phase = (x))
 #endif
 
+// globais (escopo de arquivo, definidas em sdk.cpp)
+bool         ValidInstance_(const void* o);
+Il2CppClass* SafeClass_(Il2CppObject* o);
+
 namespace SDK {
 
     int           ScreenW();
     int           ScreenH();
     Il2CppObject* CameraObj();
 
-    // raio do FOV em pixels derivado da camera REAL.
     float FovRadiusPx(float deg);
 
     bool Init();
@@ -47,7 +41,7 @@ namespace SDK {
     void UpdateView();
     void RefreshTargets();
     void UpdateTargets();
-    std::vector<Target> Snapshot();     // copia sob lock; seguro fora do lock
+    std::vector<Target> Snapshot();
 
     Il2CppObject* GetLocalPlayer();
     Il2CppObject* GetCamera();
@@ -59,17 +53,18 @@ namespace SDK {
     Vec3  GetVelocity(Il2CppObject* o);
     Vec3  MuzzlePos();
 
+    // >>> NOVO v6.6 — team helpers (fix C2039/C3861 no aimbot.cpp)
+    int   GetTeamId(Il2CppObject* o);
+    int   GetLocalTeam();
+
     Il2CppObject* FindBoneContains(Il2CppObject* root, const char* sub, int budget = 8192);
     Vec3  GetBonePos(void* bone);
-    void  GetNameBuf(Il2CppObject* o, char* out, int n);   // respeita 'n' e termina
+    void  GetNameBuf(Il2CppObject* o, char* out, int n);
     std::string GetName(Il2CppObject* o);
 
     bool  WorldToScreen(Vec3 w, Vec2& s);
     bool  VisibleLine(Vec3 a, Vec3 b);
     Vec3  TargetAimPos(Il2CppObject* p, int boneMode);
-
-    // mapeamento de osso compartilhado (aimbot.cpp e TargetAimPos usam o MESMO).
-    // 0=auto 1=cabeca 2=peito 3=estomago 4=perna 5=aleatorio.
     Vec3  BonePoint(Vec3 head, Vec3 feet, int boneMode);
 
     Il2CppObject* CamTfObj();
@@ -107,7 +102,15 @@ namespace SDK {
         Il2CppObject* localTf, Il2CppObject* targetTf);
     bool  HasLineOfSightExRaw(Vec3 eye, Vec3 aim,
         Il2CppObject* localTf, Il2CppObject* targetTf);
+
     void  LosInvalidate();
+    void  ClearTfCache();
+    void  ClearBoneCache();
+    void  PruneTfCache();
+
+    // fachadas publicas
+    bool         ValidInstance(Il2CppObject* o);
+    Il2CppClass* SafeClass(Il2CppObject* o);
 
     bool  LosReady();
     const char* LosBackend();
@@ -121,7 +124,7 @@ namespace SDK {
     void  ListClassesContaining(const char* sub);
 
     Il2CppObject* FindGunStatsObj();
-    Il2CppObject* GetGunStatsLive();     // nunca devolve o clone em branco
+    Il2CppObject* GetGunStatsLive();
 
     int  ResolveWeaponFields(Il2CppObject* stats, uint32_t& cur, uint32_t& max,
         uint32_t& reserve, uint32_t& reload, uint32_t& spread,
@@ -130,9 +133,7 @@ namespace SDK {
 }
 
 // ---------------------------------------------------------------------------
-//  BLOCO 'using' — joga os nomes do SDK no escopo global. Mantido por
-//  compatibilidade. Se um dia quiser reduzir o acoplamento, e' aqui que se
-//  corta: cada arquivo passaria a qualificar com SDK:: o que usa.
+//  BLOCO 'using'
 // ---------------------------------------------------------------------------
 using SDK::g_targets;
 using SDK::g_targetCount;
@@ -194,3 +195,13 @@ using SDK::AntiHackClass;
 using SDK::FindAntiHackClass;
 using SDK::AntiHackInstance;
 using SDK::ListClassesContaining;
+
+// >>> NOVO v6.6
+using SDK::GetTeamId;
+using SDK::GetLocalTeam;
+
+using SDK::ClearTfCache;
+using SDK::ClearBoneCache;
+using SDK::PruneTfCache;
+using SDK::ValidInstance;
+using SDK::SafeClass;

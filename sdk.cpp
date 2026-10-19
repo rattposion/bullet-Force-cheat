@@ -1,27 +1,8 @@
 // ============================================================================
 //  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, LOS via Physics.Raycast
 //
-//  >>> v6.2 — CORRECAO QUE RESTAUROU O ESP:
-//   R2c) SafeClass nao usa mais "klass->klass == klass" (nesse build o offset 0
-//        do Il2CppClass e' o image, nao auto-ref). Agora valida pela existencia
-//        do nome (se_class_name), que toda classe valida tem. Removida a
-//        auto-calibracao g_klassStrict (ela rejeitava tudo por ~512 chamadas).
-//
-//  >>> v6.1 — CORRECOES DE BUILD:
-//   R1b) Forward decls de ResolveOffsets/ResolveMethods/Init (C3861).
-//   R2b) LosEnt/OkEnt/IdEnt com default member initializers (C26495).
-//   R3b) Declaracao duplicada de Log removida (C28251 vs globals.h).
-//
-//  >>> v6 — CORRECOES DA REVIEW:
-//   R1) InvalidateRuntime/OnDomainReload: limpa statics em reload de dominio.
-//   R2) PlausibleObj com memo por frame.
-//   R3) Fim da corrida de t.visible (LOS sob g_targetCs) + g_viewProjOk no seqlock.
-//   R4) ReadHealthEx/ReadTeamEx com bool de sucesso.
-//   R5) MethodCached thread-safe + round-robin.
-//   R6) FindClass desempata pela chave mais curta.
-//   R7) SnapshotInto reusa buffer; FireBullet descoberto por nome.
-//
-//  >>> v5 — FPS: P11..P18 mantidos.
+//  >>> v6.5 — FIX F5: globais renomeadas p/ ValidInstance_ / SafeClass_
+//      (evita C2883/C2084/C2264 causados pelo 'using SDK::...' no header).
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -42,9 +23,6 @@
 #include "config.h"
 #include "sdk.h"
 #include "hooks.h"
-
-// >>> FIX R3b: Log ja e' declarado (com anotacao SAL) em globals.h (via common.h).
-// void Log(const char* fmt, ...);
 
 extern HMODULE g_hModule;
 const char* g_phase = "boot";
@@ -258,9 +236,6 @@ static void* se_object_unbox(Il2CppObject* o) {
     return r;
 }
 
-// ---------------------------------------------------------------------------
-//  attach preguicoso por thread
-// ---------------------------------------------------------------------------
 static thread_local bool t_il2cppAttached = false;
 static void EnsureThreadAttached() {
     if (t_il2cppAttached) return;
@@ -338,7 +313,7 @@ static bool se_read_vec3(void* base, size_t off, Vec3* out) {
 }
 
 // ===========================================================================
-//  >>> FIX R5: caches em escopo de arquivo (para poder limpar em reload).
+//  caches
 // ===========================================================================
 static std::mutex g_methodMx;
 static std::mutex g_typeMx;
@@ -394,7 +369,7 @@ static const char* TypeNameCached(const Il2CppType* t) {
 }
 
 // ===========================================================================
-//  >>> FIX R2: VALIDACAO DE PONTEIRO
+//  validacao de ponteiro
 // ===========================================================================
 static uint64_t g_plausStamp = 0;
 static inline void PlausibleBeginFrame(uint64_t f) { g_plausStamp = f; }
@@ -429,13 +404,9 @@ static bool PlausibleObj(const void* p) {
 }
 
 // ===========================================================================
-//  >>> FIX R2c: liveness independente de layout.
-//  O offset 0 do Il2CppClass NAO e' auto-referente nesse build (e' o image),
-//  entao "klass->klass == klass" rejeitava tudo. Validamos pelo nome, que
-//  toda classe valida tem. se_class_name tem SEH, entao ponteiro podre nao
-//  derruba — so retorna nullptr.
+//  [FIX F5] globais renomeadas com '_' — nao colidem com o 'using SDK::'
 // ===========================================================================
-static bool ValidInstance(const void* o) {
+bool ValidInstance_(const void* o) {
     if (!o || ((uintptr_t)o & 7)) return false;
     if (!PlausibleObj(o)) return false;
     void* k = nullptr;
@@ -443,11 +414,11 @@ static bool ValidInstance(const void* o) {
     return se_class_name((Il2CppClass*)k) != nullptr;
 }
 
-static Il2CppClass* SafeClass(Il2CppObject* o) {
+Il2CppClass* SafeClass_(Il2CppObject* o) {
     if (!o || !PlausibleObj(o)) return nullptr;
     Il2CppClass* k = se_object_get_class(o);
     if (!k || !PlausibleObj(k)) return nullptr;
-    if (!se_class_name(k)) return nullptr;   // classe valida sempre tem nome
+    if (!se_class_name(k)) return nullptr;
     return k;
 }
 
@@ -574,10 +545,13 @@ namespace SDK {
     static bool         g_dumpTarget = false;
     static bool         g_inited = false;
 
-    // >>> FIX R1b: forward decls (OnDomainReload vem antes das definicoes)
     static void ResolveOffsets();
     static void ResolveMethods();
     bool Init();
+
+    // >>> [FIX F5] fachadas publicas — chamam as globais renomeadas.
+    bool         ValidInstance(Il2CppObject* o) { return ValidInstance_((const void*)o); }
+    Il2CppClass* SafeClass(Il2CppObject* o) { return SafeClass_(o); }
 
     // ======================= pick de campo =======================
     static uint32_t FindTypedField(Il2CppClass* k, std::initializer_list<const char*> names,
@@ -869,18 +843,23 @@ namespace SDK {
         return tr;
     }
 
-    static void ClearTfCache() {
+    void ClearTfCache() {
         std::lock_guard<std::mutex> lk(g_tfMx);
         g_tfCache.clear();
     }
 
-    static void PruneTfCache() {
+    void PruneTfCache() {
         std::lock_guard<std::mutex> lk(g_tfMx);
         for (auto it = g_tfCache.begin(); it != g_tfCache.end(); ) {
             Il2CppObject* o = it->first;
             if (!o || !PlausibleObj(o)) it = g_tfCache.erase(it);
             else ++it;
         }
+    }
+
+    void ClearBoneCache() {
+        memset(g_boneCache, 0, sizeof(g_boneCache));
+        g_boneEvict = 0;
     }
 
     static bool IsTransformClass(Il2CppClass* k) {
@@ -1602,7 +1581,7 @@ namespace SDK {
         static uint64_t g_losStamp = (uint64_t)-1;
         static int      g_losBudget = 0;
 
-        static const int   kLosBudget = 0;
+        static const int   kLosBudget = 4;
         static const float kLosEps2 = 0.25f;
 
         static LosEnt* LosFind(Vec3 aim) {
@@ -1779,6 +1758,9 @@ namespace SDK {
         memset(g_losState, 0xFF, sizeof(g_losState));
         memset(g_idCache, 0, sizeof(g_idCache));
         g_idRing = 0;
+
+        ClearTfCache();
+        ClearBoneCache();
     }
 
     bool TargetVisible(int idx, Vec3 eye, Vec3 aim) {
@@ -2373,7 +2355,7 @@ namespace SDK {
             if (!g_localPlayer) return;
         }
 
-        ++g_frameId;                       // UMA vez por frame.
+        ++g_frameId;
         PlausibleBeginFrame(g_frameId);
         g_localPos = GetPos(g_localPlayer);
         g_localTeam = ReadTeam(g_localPlayer);
@@ -2407,7 +2389,6 @@ namespace SDK {
         }
         LeaveCriticalSection(&g_targetCs);
 
-        // >>> FIX R3: bloco de LOS sob g_targetCs (reentrante na mesma thread).
         if ((C.espVisCheck || C.aimVisCheck) && LosReady()) {
             float cap = C.espMaxDist > C.aimMaxDist ? C.espMaxDist : C.aimMaxDist;
             if (cap < 50.f) cap = 300.f;
@@ -2421,7 +2402,7 @@ namespace SDK {
             if (budget > n) budget = n;
 
             static int losCursor = 0;
-            if (n > 0) losCursor %= n;
+            if (n > 0) { losCursor %= n; if (losCursor < 0) losCursor = 0; }
 
             int done = 0;
             for (int k = 0; k < n && done < budget; ++k) {
@@ -2814,7 +2795,22 @@ namespace SDK {
         g_phase = "sdk.done";
         Log("[sdk] Init: CONCLUIDO");
         return true;
+
     }
 
+    // ===================================================================
+    //  [FIX LNK2019] GetTeamId / GetLocalTeam — implementacao
+    //  chamadas por Aimbot::IsSameTeam em aimbot.cpp
+    // ===================================================================
+    int GetTeamId(Il2CppObject* o) {
+        if (!o) return -1;
+        int t = -1;
+        if (!ReadTeamEx(o, t)) return -1;
+        return t;
+    }
+
+    int GetLocalTeam() {
+        return g_localTeam;
+    }
 } // namespace SDK
 // ==== FIM DO ARQUIVO ====
