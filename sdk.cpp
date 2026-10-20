@@ -1,8 +1,12 @@
 // ============================================================================
 //  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, LOS via Physics.Raycast
-//
-//  >>> v6.5 — FIX F5: globais renomeadas p/ ValidInstance_ / SafeClass_
-//      (evita C2883/C2084/C2264 causados pelo 'using SDK::...' no header).
+//  v6.8 — FIX LOS:
+//    [FIXL1] OwnerKindUncached: walk de parent até 15 níveis, checando
+//            localTf e targetTf em CADA nó + fallback por distância.
+//    [FIXL2] HasLineOfSightExRaw: loop avança pelo hit REAL (hitDist+0.05),
+//            não por 0.30 fixo. Sai do próprio corpo do player.
+//    [FIXL3] kind==0 com remaining<1.5m -> considera VIS (evita falso bloqueio).
+//    Mantidos todos os FIXT1..FIXT5 e FIX1..FIX5 anteriores.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -403,19 +407,30 @@ static bool PlausibleObj(const void* p) {
     return ok;
 }
 
-// ===========================================================================
-//  [FIX F5] globais renomeadas com '_' — nao colidem com o 'using SDK::'
-// ===========================================================================
 bool ValidInstance_(const void* o) {
-    if (!o || ((uintptr_t)o & 7)) return false;
+    uintptr_t p = (uintptr_t)o;
+    if (p == 0) return false;
+    if (p == (uintptr_t)-1) return false;
+    if (p < 0x10000) return false;
+    if (p > 0x00007FFFFFFFFFFF) return false;
+    if ((p & 7) != 0) return false;
+
     if (!PlausibleObj(o)) return false;
-    void* k = nullptr;
-    if (!se_read_ptr((void*)o, 0, &k) || !k || !PlausibleObj(k)) return false;
-    return se_class_name((Il2CppClass*)k) != nullptr;
+
+    __try {
+        void* k = nullptr;
+        if (!se_read_ptr((void*)o, 0, &k) || !k) return false;
+        if (!PlausibleObj(k)) return false;
+        return se_class_name((Il2CppClass*)k) != nullptr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 Il2CppClass* SafeClass_(Il2CppObject* o) {
-    if (!o || !PlausibleObj(o)) return nullptr;
+    if (!o) return nullptr;
+    if (!PlausibleObj(o)) return nullptr;
     Il2CppClass* k = se_object_get_class(o);
     if (!k || !PlausibleObj(k)) return nullptr;
     if (!se_class_name(k)) return nullptr;
@@ -442,7 +457,7 @@ namespace SDK {
 
     Target g_targets[MAX_TARGETS];
     int    g_targetCount = 0;
-    int    g_localTeam = 0;
+    int    g_localTeam = -1;
     int    dbg_drawn = 0;
     Vec3   g_localPos{ 0.f, 0.f, 0.f };
     CRITICAL_SECTION g_targetCs;
@@ -463,6 +478,8 @@ namespace SDK {
     uint32_t O_curAmmo = 0, O_maxAmmo = 0, O_reloading = 0, O_spread = 0, O_fireRate = 0, O_dmg = 0;
     static uint32_t O_localPlayerScript = 0;
     bool     O_rotationIsQuat = true;
+
+    static int g_teamKind = 0;
 
     static bool g_rotIsSyncVar = false;
     static bool g_healthIsSync = false;
@@ -549,7 +566,6 @@ namespace SDK {
     static void ResolveMethods();
     bool Init();
 
-    // >>> [FIX F5] fachadas publicas — chamam as globais renomeadas.
     bool         ValidInstance(Il2CppObject* o) { return ValidInstance_((const void*)o); }
     Il2CppClass* SafeClass(Il2CppObject* o) { return SafeClass_(o); }
 
@@ -678,15 +694,25 @@ namespace SDK {
     static bool ReadTeamEx(Il2CppObject* e, int& out) {
         out = -1;
         if (!e || !O_team) return false;
+
         uintptr_t a = SyncVarValueAddr(e, O_team, "Byte");
         if (!a) a = SyncVarValueAddr(e, O_team, "Int32");
         if (a) {
-            unsigned char b = SafeRead<unsigned char>(a, 0);
-            out = (int)b;
-            return true;
+            unsigned char b = SafeRead<unsigned char>(a, 0xFF);
+            if (b != 0xFF) { out = (int)b; return true; }
+            int i = SafeRead<int>(a, -1);
+            if (i >= 0) { out = i & 0xFF; return true; }
         }
-        if (g_teamIsSync) return false;
-        out = SafeRead<int>((uintptr_t)e + O_team, 0) & 0xFF;
+
+        unsigned char bb = 0;
+        SE_BEGIN{ bb = *(unsigned char*)((uintptr_t)e + O_team); } SE_END{ bb = 0; return false; }
+        if (bb <= 63) { out = (int)bb; return true; }
+
+        int ii = 0;
+        SE_BEGIN{ ii = *(int*)((uintptr_t)e + O_team); } SE_END{ ii = -1; return false; }
+        if (ii >= 0 && ii <= 63) { out = ii; return true; }
+
+        out = (int)bb;
         return true;
     }
 
@@ -1019,9 +1045,11 @@ namespace SDK {
     bool IsEnemy(Il2CppObject* o) {
         if (!o) return false;
         if (!O_team) return true;
+
         int t = -1;
         if (!ReadTeamEx(o, t)) return true;
-        if (t < 0 || g_localTeam < 0) return true;
+        if (t < 0) return true;
+        if (g_localTeam < 0) return true;
         return t != g_localTeam;
     }
 
@@ -1056,20 +1084,26 @@ namespace SDK {
     void GetNameBuf(Il2CppObject* o, char* out, int n) {
         if (!out || n <= 0) return;
         out[0] = 0;
-        if (!o) return;
+        if (!PtrOk_(o)) return;
+        if (!ValidInstance_(o)) return;
 
-        char buf[64];
+        __try {
+            char buf[64];
 
-        if (O_name && ReadStringField(o, O_name, buf, sizeof(buf)) && PlausibleName(buf)) {
-            strncpy_s(out, (size_t)n, buf, _TRUNCATE);
-            return;
+            if (O_name && ReadStringField(o, O_name, buf, sizeof(buf)) && PlausibleName(buf)) {
+                strncpy_s(out, (size_t)n, buf, _TRUNCATE);
+                return;
+            }
+            for (uint32_t off : g_strOffs) {
+                if (!ReadStringField(o, off, buf, sizeof(buf))) continue;
+                if (!PlausibleName(buf)) continue;
+                if (!g_pickedNameOff) { g_pickedNameOff = off; Log("[sdk] campo de nome = 0x%X (\"%s\")", off, buf); }
+                strncpy_s(out, (size_t)n, buf, _TRUNCATE);
+                return;
+            }
         }
-        for (uint32_t off : g_strOffs) {
-            if (!ReadStringField(o, off, buf, sizeof(buf))) continue;
-            if (!PlausibleName(buf)) continue;
-            if (!g_pickedNameOff) { g_pickedNameOff = off; Log("[sdk] campo de nome = 0x%X (\"%s\")", off, buf); }
-            strncpy_s(out, (size_t)n, buf, _TRUNCATE);
-            return;
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            out[0] = 0;
         }
     }
 
@@ -1626,24 +1660,35 @@ namespace SDK {
 
     } // namespace
 
+    // =========================================================================
+    //  [FIXL1] OwnerKindUncached — walk de parent até 15 níveis
+    // =========================================================================
     static int OwnerKindUncached(Il2CppObject* col, Il2CppObject* localTf,
         Il2CppObject* targetTf, Vec3 aim) {
-        Il2CppObject* tf = ResolveGetTransform(col);
-        if (!tf) return 0;
+        if (!col) return 0;
 
+        Il2CppObject* tf = ResolveGetTransform(col);
+
+        // sobe a hierarquia comparando com localTf E targetTf em CADA nó
         Il2CppObject* walk = tf;
-        for (int d = 0; walk && d < 10; ++d) {
+        for (int d = 0; walk && d < 15; ++d) {
             if (localTf && walk == localTf) return 1;
             if (targetTf && walk == targetTf) return 2;
             walk = ParentOf(walk);
         }
 
-        if (targetTf && localTf) return 0;
+        // fallback por distancia
+        if (tf) {
+            Vec3 op = GetPos(tf);
+            if (!op.zero()) {
+                if (targetTf && (op - aim).len() < 3.0f) return 2;
+                if (localTf && (op - g_localPos).len() < 3.0f) return 1;
+            }
+        }
 
-        Vec3 op = GetPos(tf);
-        if (op.zero()) return 0;
-        if (!targetTf && (op - aim).len() < 2.5f) return 2;
-        if (!localTf && (op - g_localPos).len() < 2.5f) return 1;
+        // último recurso: bateu perto de MIM -> é meu corpo
+        if (!localTf && (aim - g_localPos).len() < 3.0f) return 1;
+
         return 0;
     }
 
@@ -1659,6 +1704,9 @@ namespace SDK {
         return kind;
     }
 
+    // =========================================================================
+    //  [FIXL2/FIXL3] HasLineOfSightExRaw — avança pelo hit REAL, não por 0.30
+    // =========================================================================
     bool HasLineOfSightExRaw(Vec3 eye, Vec3 aim, Il2CppObject* localTf, Il2CppObject* targetTf) {
         if (!M_raycast) ResolveRaycast();
         if (!M_raycast) { ++g_losFalhou; return true; }
@@ -1677,9 +1725,6 @@ namespace SDK {
         dist -= adv;
         if (dist < 0.2f) { ++g_losOk; return true; }
 
-        float skip = dist * 0.30f;
-        if (skip > 1.4f) skip = 1.4f;
-
         alignas(16) unsigned char hitBuf[160];
         float travelled = 0.f;
 
@@ -1689,7 +1734,6 @@ namespace SDK {
 
             memset(hitBuf, 0, sizeof(hitBuf));
             Vec3 sv = eye + dir * travelled;
-
             int r = ShootRayEx(sv, dir, len, hitBuf);
 
             if (r == 0) { ++g_losFalhou; if (C.probeLog) LosLog("FALHOU", sv, -1.f, dist, -1); return true; }
@@ -1701,23 +1745,28 @@ namespace SDK {
             if (hitDist < 0.01f)
                 se_read_bytes(hitBuf + O_hitDist, &hitDist, sizeof(float));
 
-            if (Il2CppObject* col = ColliderFromHit(hitBuf)) {
-                int kind = OwnerKind(col, localTf, targetTf, aim);
-                if (kind == 2) { ++g_losOk; if (C.probeLog) LosLog("BATEU NO ALVO", sv, hitDist, dist, 2); return true; }
-                if (kind == 1) { travelled += 0.30f; continue; }
-                ++g_losBloqueado;
-                if (C.probeLog) LosLog("BLOQUEADO", sv, hitDist, dist, 0);
-                return false;
+            Il2CppObject* col = ColliderFromHit(hitBuf);
+            int kind = col ? OwnerKind(col, localTf, targetTf, aim) : 0;
+
+            if (kind == 2) { ++g_losOk; if (C.probeLog) LosLog("BATEU NO ALVO", sv, hitDist, dist, 2); return true; }
+
+            if (kind == 1) {
+                // bateu em mim: avança até o fim do hit e continua
+                float step = hitDist + 0.05f;
+                if (step < 0.2f) step = 0.2f;
+                travelled += step;
+                if (travelled >= dist) { ++g_losOk; return true; }
+                continue;
             }
 
-            if (hitDist < 0.05f) { travelled += 0.30f; continue; }
-            float abs = travelled + hitDist;
-            if (abs < skip) { travelled = abs + 0.06f; continue; }
+            // kind == 0: bateu em algo desconhecido
+            // se o que falta até o alvo é pouco, considera visível
+            float remaining = dist - (travelled + hitDist);
+            if (remaining < 1.5f) { ++g_losOk; if (C.probeLog) LosLog("remaining<1.5 VIS", sv, travelled + hitDist, dist, 0); return true; }
 
-            bool vis = (abs >= (dist - 0.9f));
-            if (vis) ++g_losOk; else ++g_losBloqueado;
-            if (C.probeLog) LosLog(vis ? "dist->VIS" : "dist->BLOQ", sv, abs, dist, -1);
-            return vis;
+            ++g_losBloqueado;
+            if (C.probeLog) LosLog("BLOQUEADO", sv, travelled + hitDist, dist, 0);
+            return false;
         }
         ++g_losOk;
         return true;
@@ -1852,8 +1901,24 @@ namespace SDK {
         return Vec3();
     }
 
-    void LockTargets() { EnterCriticalSection(&g_targetCs); }
-    void UnlockTargets() { LeaveCriticalSection(&g_targetCs); }
+    void LockTargets() {
+        if (g_targets[0].player == nullptr && g_targetCount == 0) return;
+        __try {
+            EnterCriticalSection(&g_targetCs);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            InitializeCriticalSection(&g_targetCs);
+            EnterCriticalSection(&g_targetCs);
+        }
+    }
+
+    void UnlockTargets() {
+        __try {
+            LeaveCriticalSection(&g_targetCs);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
 
     void* MethodPtr(MethodInfo* m) {
         if (!m) return nullptr;
@@ -2312,6 +2377,20 @@ namespace SDK {
         g_targetCount = c;
         LeaveCriticalSection(&g_targetCs);
 
+        static ULONGLONG lastTeamLog = 0;
+        ULONGLONG nowt = GetTickCount64();
+        if (nowt - lastTeamLog >= 1000) {
+            lastTeamLog = nowt;
+            Log("[team] localTeam=%d O_team=0x%X kind=%d alvos=%d",
+                g_localTeam, O_team, g_teamKind, g_targetCount);
+            for (int i = 0; i < g_targetCount && i < 4; ++i) {
+                Target& t = g_targets[i];
+                int tt = ReadTeam(t.player);
+                Log("[team]   alvo[%d] \"%s\" team=%d enemy=%d",
+                    i, t.name, tt, (int)IsEnemy(t.player));
+            }
+        }
+
         static ULONGLONG lastScan2 = 0;
         ULONGLONG nows = GetTickCount64();
         if (nows - lastScan2 >= 2000) {
@@ -2367,8 +2446,9 @@ namespace SDK {
         EnterCriticalSection(&g_targetCs);
         for (int i = 0; i < g_targetCount; ++i) {
             Target& t = g_targets[i];
-            if (!t.player) continue;
-            if (!PlausibleObj(t.player)) { t.player = nullptr; t.obj = nullptr; continue; }
+
+            if (!PtrOk_(t.player)) { t.player = nullptr; t.obj = nullptr; continue; }
+            if (!ValidInstance_(t.player)) { t.player = nullptr; t.obj = nullptr; continue; }
 
             t.health = ReadHealth(t.player);
             t.alive = (t.health > 0.5f);
@@ -2562,10 +2642,12 @@ namespace SDK {
         O_gsMagSize = O_gsAmmo = O_gsGunObj = 0;
         O_gunStatsArray = 0;
         O_localPlayerScript = 0;
+        g_teamKind = 0;
 
         g_localPlayer = nullptr; g_local = nullptr; g_camera = nullptr; g_aimTarget = nullptr;
         g_targetCount = 0;
         g_viewProjOk = false;
+        g_localTeam = -1;
 
         g_plausStamp = 0;
 
@@ -2620,7 +2702,6 @@ namespace SDK {
             O_gunStats = PickFieldOff(kPlayerScript, { "mpCurrentGunStats", "gunStats" });
             O_gunView = PickFieldOff(kPlayerScript, { "fpsGunView", "gunView" });
             O_gunStatsOnView = PickFieldOff(kPlayerScript, { "gunStatsOnView", "statsOnView" });
-            O_team = PickFieldOff(kPlayerScript, { "mpTeamNumber", "team", "teamNumber" });
             O_weapon = PickFieldOff(kPlayerScript, { "weapon", "currentWeapon" });
             O_speed = PickFieldOff(kPlayerScript, { "movementSpeedMultiplier", "lastMoveVelocity" });
             O_mCamera = PickFieldOff(kPlayerScript, { "mCamera", "camera" });
@@ -2628,12 +2709,28 @@ namespace SDK {
             O_humanMeshReferences = PickFieldOff(kPlayerScript, { "humanMeshReferences", "meshReferences" });
         }
 
+        g_teamKind = 0;
+        if (kPlayerScript) {
+            O_team = PickFieldOff(kPlayerScript, { "mpTeamNumber" }, "Byte");
+            if (O_team) g_teamKind = 1;
+            if (!O_team) { O_team = PickFieldOff(kPlayerScript, { "mpTeamNumber" }, "Int32"); if (O_team) g_teamKind = 2; }
+            if (!O_team) { O_team = PickFieldOff(kPlayerScript, { "mpTeamNumber" }); if (O_team) g_teamKind = 3; }
+            if (!O_team) { O_team = PickFieldOff(kPlayerScript, { "team", "teamNumber" }, "Byte"); if (O_team) g_teamKind = 1; }
+            if (!O_team) { O_team = PickFieldOff(kPlayerScript, { "team", "teamNumber" }, "Int32"); if (O_team) g_teamKind = 2; }
+            if (!O_team) { O_team = PickFieldOff(kPlayerScript, { "team", "teamNumber" }); if (O_team) g_teamKind = 3; }
+        }
+        if (!O_team && kEntity) {
+            O_team = PickFieldOff(kEntity, { "team", "teamNumber", "mpTeamNumber" }, "Byte");
+            if (O_team) g_teamKind = 1;
+            if (!O_team) { O_team = PickFieldOff(kEntity, { "team", "teamNumber", "mpTeamNumber" }, "Int32"); if (O_team) g_teamKind = 2; }
+            if (!O_team) { O_team = PickFieldOff(kEntity, { "team", "teamNumber", "mpTeamNumber" }); if (O_team) g_teamKind = 3; }
+        }
+
         if (!O_rotation) O_rotation = 0x9B8;
         if (!O_camTf)    O_camTf = 0x828;
         if (!O_alive)    O_alive = 0x63C;
         if (!O_health)   O_health = 0x108;
         if (!O_gunStats) O_gunStats = 0x570;
-        if (!O_team)     O_team = 0x6D0;
         if (!O_name)     O_name = 0xA68;
         if (!O_weapon)   O_weapon = 0x1A8;
         if (!O_mCamera)  O_mCamera = 0xAC8;
@@ -2685,10 +2782,10 @@ namespace SDK {
             }
         }
 
-        Log("[sdk] offsets: hp=0x%X(%s) name=0x%X(%s) team=0x%X(%s) rot=0x%X(%s) camTf=0x%X(%s) anim=0x%X syncRot=%d",
+        Log("[sdk] offsets: hp=0x%X(%s) name=0x%X(%s) team=0x%X(%s) kind=%d rot=0x%X(%s) camTf=0x%X(%s) anim=0x%X syncRot=%d",
             O_health, FieldTypeOf(kPlayerScript, "_health"),
             O_name, FieldTypeOf(kPlayerScript, "username"),
-            O_team, FieldTypeOf(kPlayerScript, "mpTeamNumber"),
+            O_team, FieldTypeOf(kPlayerScript, "mpTeamNumber"), g_teamKind,
             O_rotation, FieldTypeOf(kPlayerScript, "rotation"),
             O_camTf, FieldTypeOf(kPlayerScript, "cameraTransform"),
             O_humanMeshAnimator, (int)g_rotIsSyncVar);
@@ -2795,15 +2892,10 @@ namespace SDK {
         g_phase = "sdk.done";
         Log("[sdk] Init: CONCLUIDO");
         return true;
-
     }
 
-    // ===================================================================
-    //  [FIX LNK2019] GetTeamId / GetLocalTeam — implementacao
-    //  chamadas por Aimbot::IsSameTeam em aimbot.cpp
-    // ===================================================================
     int GetTeamId(Il2CppObject* o) {
-        if (!o) return -1;
+        if (!PtrOk_(o)) return -1;
         int t = -1;
         if (!ReadTeamEx(o, t)) return -1;
         return t;
