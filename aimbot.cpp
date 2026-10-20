@@ -1,5 +1,5 @@
 // ============================================================================
-//  aimbot.cpp — v16 (corrigido)
+//  aimbot.cpp — v17 (corrigido)
 //
 //  FIXES desta versão:
 //   [A1] TargetSnap com inicializadores default (mata C26495).
@@ -12,6 +12,13 @@
 //   [FIX TEAM] team check duplo: IsEnemy + fallback por teamId.
 //   [FIX COMPILE] linha 99/100: GetTeamId agora existe no SDK.
 //   [FIX COMPILE] linha 167: TargetVisible chamado com 3 args (idx, eye, aim).
+//
+//  >>> v17 — [FIX CAMPO ERRADO]
+//      O menu escreve C.aimbot e C.aimTeam, mas a logica lia C.aimEnabled e
+//      C.aimTeamCheck — campos orfaos, que NENHUMA UI tocava. Resultado:
+//        - aimbot mirando com o checkbox "Aimbot" desmarcado;
+//        - "Ignorar time" sem efeito nenhum.
+//      Agora a logica usa os MESMOS campos que o menu escreve.
 // ============================================================================
 
 #include "aimbot.h"
@@ -83,7 +90,6 @@ namespace Aimbot {
 
     // =======================================================================
     //  [FIX TEAM] — checagem de time robusta
-    //  >>> CORRIGE LINHAS 99 e 100 (SDK::GetTeamId agora existe)
     // =======================================================================
     static bool IsSameTeam(Il2CppObject* a, Il2CppObject* b) {
         if (!a || !b) return false;
@@ -91,9 +97,9 @@ namespace Aimbot {
         // 1) caminho oficial
         if (!SDK::IsEnemy(a)) return true;   // IsEnemy false = mesmo time
 
-        // 2) fallback por teamId (linhas 99/100 — agora compilam)
-        int ta = SDK::GetTeamId(a);          // <<< linha ~99 corrigida
-        int tb = SDK::GetTeamId(b);          // <<< linha ~100 corrigida
+        // 2) fallback por teamId
+        int ta = SDK::GetTeamId(a);
+        int tb = SDK::GetTeamId(b);
         if (ta >= 0 && tb >= 0) return ta == tb;
 
         return false;
@@ -121,8 +127,10 @@ namespace Aimbot {
             if (hp <= 0.5f) continue;
 
             // ---------------- [FIX TEAM] ----------------
+            // >>> v17: o gate usa C.aimTeam (o menu escreve AQUI), nao o orfao
+            //          C.aimTeamCheck que nunca era ligado.
             bool enemy = SDK::IsEnemy(t.player);
-            if (C.aimTeamCheck) {
+            if (C.aimTeam) {
                 if (!enemy) continue;                       // IsEnemy confiavel
                 if (IsSameTeam(t.player, local)) continue;  // fallback reforcando
             }
@@ -153,7 +161,6 @@ namespace Aimbot {
             sn.hasAim = true;
 
             // ---------------- [FIX VIS] ----------------
-            // >>> CORRIGE LINHA 167: TargetVisible recebe (idx, eye, aim)
             sn.visible = true;
             if (C.aimVisCheck) {
                 if (!SDK::LosReady()) {
@@ -162,7 +169,7 @@ namespace Aimbot {
                 else {
                     sn.visible = SDK::TargetVisible(sn.slot,
                         SDK::MuzzlePos(),
-                        sn.aimPos);   // <<< 3 args
+                        sn.aimPos);
                 }
             }
             if (C.aimVisCheck && C.aimStrictVis && !sn.visible) continue;
@@ -254,7 +261,10 @@ namespace Aimbot {
     //  loop interno + API publica
     // =======================================================================
     static void CoreTick() {
-        if (!C.aimEnabled) { s_active = false; RestoreAimIfNeeded(); return; }
+        // >>> v17: gate no campo que o menu escreve (C.aimbot), nao no orfao
+        //          C.aimEnabled. Era isso que fazia o aimbot mirar com o
+        //          checkbox "Aimbot" DESMARCADO.
+        if (!C.aimbot) { s_active = false; RestoreAimIfNeeded(); return; }
 
         bool key = (GetAsyncKeyState(C.aimKey) & 0x8000) != 0;
 
@@ -321,7 +331,7 @@ namespace Aimbot {
         s_lastFire = 0;
         s_lastTargetSwitch = 0;
         Log("[aimbot] Install OK (bone=%d fov=%.1f vis=%d strict=%d team=%d)",
-            C.aimBone, C.aimFov, (int)C.aimVisCheck, (int)C.aimStrictVis, (int)C.aimTeamCheck);
+            C.aimBone, C.aimFov, (int)C.aimVisCheck, (int)C.aimStrictVis, (int)C.aimTeam);
         return true;
     }
 
