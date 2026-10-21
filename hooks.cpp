@@ -1,24 +1,28 @@
 // ============================================================================
-//  hooks.cpp  (v4 — alinhado com o hooks.h novo)
+//  hooks.cpp  (v5 — alinhado com o hooks.h novo)
 //
-//  >>> MUDANCAS DESTA VERSAO (interface):
-//  A) g_frameCounter: uint32_t -> uint64_t. Todos os pontos que comparavam
-//     com ele passaram a usar uint64_t e sentinela ~0ull.
-//  B) g_viewW/g_viewH: int -> std::atomic<int>, escritos SO' por
-//     SetViewSize(). Para o par coerente, GetViewSize().
-//  C) SafeFont: ImFont* -> ImFont& (sempre referencia valida) + FontCount().
-//  D) Shutdown: void -> bool. Idempotente, termina sempre em Down.
-//  E) Ciclo de vida por Stage. SetStage() e' o UNICO escritor dos espelhos
-//     g_sdkReady/g_hooksLive/g_imguiReady. InitImGui/Init usam Advance(),
-//     que so' avanca — nunca regride um espelho ja' publicado.
+//  >>> MUDANCAS DESTA VERSAO (correcao do ESP piscando/sumindo):
+//  F) RENDER GATE: 'if (g_sdkReady) ESP::Draw()' -> 'if (AtLeast(Stage::Hooks))'.
+//     g_sdkReady e' reescrito a cada frame por Combat::Tick() e pisca; usa-lo
+//     como gate de render acoplava o overlay a camada de dados. O gate
+//     correto e' o ESTAGIO DE VIDA.
+//  G) AtLeast(): durante Tearing, Down devolvia false (o early-return
+//     mascarava 0 >= 0). Agora Down e' sempre alcancado.
+//  H) GetViewSize(): spin com teto (poderia girar indefinidamente se o
+//     writer fosse preemptado entre os dois stores).
+//  I) hk_SetCursorPos(): usava so' C.menuOpen e engolia TODO reposicionamento
+//     de cursor com o menu aberto — o jogo nao conseguia recentrar a mira.
+//     Agora consulta Menu_WantsMouse() (que existia e nunca era chamada).
+//  J) Removidos (sem chamador): g_hooksLive, FrameNow, FontCount, SafeFont.
 //
-//  >>> CONTEUDO FUNCIONAL DA v3 (preservado):
-//  23) hk_lateUpdate SEM early-return por instancia (era o que matava o ESP).
+//  >>> CONTEUDO FUNCIONAL DA v4/v3 (preservado):
+//  A) g_frameCounter: uint64_t. B) g_viewW/g_viewH atomicos.
+//  D) Shutdown: bool. E) Ciclo de vida por Stage.
+//  23) hk_lateUpdate SEM early-return por instancia.
 //  24) WATCHDOG: swap assume o tick se o LateUpdate sumir por >250 ms.
 //  25) ClassOf valida com Plausible/PlausibleObj.
 //  26) Shutdown reseta g_lastTickMs.
-//  16-22, 1-15: mantidos (throttle de log, __try nos blocos certos, CS manual,
-//     rebind sem re-init, FindClassNamed exato, etc.)
+//  16-22, 1-15: mantidos.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -54,15 +58,12 @@ namespace Hooks {
     //  Estado global
     // -----------------------------------------------------------------------
     std::atomic<bool>     g_imguiReady{ false };
-    std::atomic<bool>     g_hooksLive{ false };
     std::atomic<bool>     g_sdkReady{ false };
     std::atomic<uint64_t> g_frameCounter{ 0 };
 
     // Espelhos do viewport. Escritos SO' por SetViewSize().
     std::atomic<int> g_viewW{ 1920 };
     std::atomic<int> g_viewH{ 1080 };
-
-    uint32_t FrameId() { return (uint32_t)g_frameCounter.load(std::memory_order_relaxed); }
 
     // -----------------------------------------------------------------------
     //  Ciclo de vida — fonte unica
@@ -74,7 +75,9 @@ namespace Hooks {
 
     bool AtLeast(Stage s) {
         const Stage cur = StageNow();
-        if (cur == Stage::Tearing) return false;   // durante teardown nada e' garantido
+        // >>> FIX [G]: 'Down' e' SEMPRE alcancado (0 >= 0). Antes o early-return
+        //     de Tearing devolvia false ate' para Down.
+        if (cur == Stage::Tearing) return s == Stage::Down;
         return (int)cur >= (int)s;
     }
 
@@ -96,8 +99,9 @@ namespace Hooks {
         const int v = (int)s;
         g_stage.store(v, std::memory_order_release);
 
+        // g_sdkReady e' TELEMETRIA: Combat::Tick() reescreve a cada frame.
+        // g_imguiReady e' gate REAL (menu + Menu_WantsMouse).
         g_sdkReady.store(v >= (int)Stage::Sdk, std::memory_order_release);
-        g_hooksLive.store(v >= (int)Stage::Hooks, std::memory_order_release);
         g_imguiReady.store(v >= (int)Stage::ImGui, std::memory_order_release);
     }
 
@@ -113,19 +117,24 @@ namespace Hooks {
     //  Viewport — par publicado por um unico writer
     // -----------------------------------------------------------------------
     void SetViewSize(int w, int h) {
-        g_viewW.store(w, std::memory_order_release);
         g_viewH.store(h, std::memory_order_release);
+        g_viewW.store(w, std::memory_order_release);
     }
 
     ViewSize GetViewSize() {
         // Re-tenta enquanto a largura estiver mudando. O writer publica
         // altura antes de largura, entao largura estavel => par coerente.
-        for (;;) {
+        // >>> FIX [H]: com teto. Sem ele, um preempt entre os dois stores
+        //     do writer podia girar sem limite.
+        for (int guard = 0; guard < 64; ++guard) {
             const int w1 = g_viewW.load(std::memory_order_acquire);
             const int h = g_viewH.load(std::memory_order_acquire);
             if (w1 == g_viewW.load(std::memory_order_acquire))
                 return ViewSize{ w1, h };
+            YieldProcessor();
         }
+        return ViewSize{ g_viewW.load(std::memory_order_relaxed),
+                         g_viewH.load(std::memory_order_relaxed) };
     }
 
     static bool g_mhInit = false;
@@ -276,7 +285,12 @@ namespace Hooks {
     static tSetCursorPos o_setCursorPos = nullptr;
 
     static BOOL WINAPI hk_SetCursorPos(int x, int y) {
-        if (C.menuOpen) return TRUE;
+        // >>> FIX [I]: antes era 'if (C.menuOpen) return TRUE', que engolia
+        //     TODO reposicionamento de cursor enquanto o menu estivesse
+        //     aberto — o jogo nao conseguia recentrar a mira. Menu_WantsMouse()
+        //     (definida em features.cpp) e' quem sabe se o mouse e' do ImGui,
+        //     e nunca era chamada.
+        if (Menu_WantsMouse()) return TRUE;
         return o_setCursorPos ? o_setCursorPos(x, y) : TRUE;
     }
 
@@ -309,33 +323,6 @@ namespace Hooks {
         ImLock() { if (g_imCsInit) EnterCriticalSection(&g_imCs); }
         ~ImLock() { if (g_imCsInit) LeaveCriticalSection(&g_imCs); }
     };
-
-    // -----------------------------------------------------------------------
-    //  Fontes
-    //  SafeFont devolve SEMPRE referencia valida. FontCount() devolve 0 antes
-    //  do atlas existir.
-    // -----------------------------------------------------------------------
-    int FontCount() {
-        if (!g_imguiReady.load()) return 0;
-        if (!ImGui::GetCurrentContext()) return 0;
-        ImGuiIO& io = ImGui::GetIO();
-        return io.Fonts ? io.Fonts->Fonts.Size : 0;
-    }
-
-    ImFont& SafeFont(int idx) {
-        if (g_imguiReady.load() && ImGui::GetCurrentContext()) {
-            ImGuiIO& io = ImGui::GetIO();
-            const int n = io.Fonts ? io.Fonts->Fonts.Size : 0;
-            if (n > 0) {
-                if (idx < 0) idx = 0;
-                if (idx >= n) idx = n - 1;
-                if (ImFont* f = io.Fonts->Fonts[idx]) return *f;
-            }
-            if (ImFont* f = ImGui::GetFont()) return *f;
-        }
-        static ImFont s_dummy;
-        return s_dummy;
-    }
 
     static thread_local int t_wndDepth = 0;
 
@@ -505,9 +492,10 @@ namespace Hooks {
                 ULONGLONG nb = GetTickCount64();
                 if (nb - lastBeat > 2000) {
                     lastBeat = nb;
-                    Log("[hooks] beat: menu=%d stage=%s alvos=%d local=%p fase=%s",
+                    Log("[hooks] beat: menu=%d stage=%s alvos=%d local=%p localValid=%d fase=%s",
                         (int)C.menuOpen, StageName(StageNow()), SDK::g_targetCount,
-                        SDK::g_localPlayer, g_phase ? g_phase : "?");
+                        SDK::g_localPlayer, (int)SDK::g_localValid.load(),
+                        g_phase ? g_phase : "?");
                 }
             }
 
@@ -544,7 +532,13 @@ namespace Hooks {
             ImGui::NewFrame();
 
             Menu::Render();
-            if (g_sdkReady.load()) { ESP::Draw(); Misc::Draw(); }
+
+            // >>> FIX [F]: gate por ESTAGIO DE VIDA, nao pelo flag VOLATIL de
+            //     prontidao. g_sdkReady e' reescrito todo frame por
+            //     Combat::Tick() e pisca; usa-lo aqui acoplava o overlay a
+            //     camada de dados. Quem decide se ha o que desenhar e' o
+            //     snapshot (g_targetCount / onScreen).
+            if (AtLeast(Stage::Hooks)) { ESP::Draw(); Misc::Draw(); }
 
             ImGui::Render();
             g_frameOpen = false;
@@ -979,7 +973,6 @@ namespace Hooks {
         // Durante o teardown nada e' garantido: derruba os espelhos na mao
         // (SetStage(Tearing) os deixaria em true, porque Tearing > Live).
         g_sdkReady.store(false, std::memory_order_release);
-        g_hooksLive.store(false, std::memory_order_release);
         g_imguiReady.store(false, std::memory_order_release);
 
         SDK::g_recoilHookActive = false;

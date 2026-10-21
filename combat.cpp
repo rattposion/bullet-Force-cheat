@@ -1,21 +1,27 @@
 // ============================================================================
-//  combat.cpp — UNICO orquestrador por frame. (v5)
+//  combat.cpp — UNICO orquestrador por frame. (v6)
 //
-//  v5 = v4 + endurecimento:
-//    [1] INIT REAL: Hooks::g_sdkReady NAO e' mais setado na mao. Ele so vira
-//        true depois de N frames consecutivos com estado minimo valido
-//        (local player resolvido + passos criticos sem falha). Camera NAO
-//        entra nessa conta — camera e' condicao de passo, nao de init.
+//  v6 = v5 + correcao do ESP piscando/sumindo:
+//    [A] ORDEM: UpdateView roda ANTES de UpdateTargets. Antes o onScreen era
+//        calculado com a matriz do frame ANTERIOR e um frame sem camera
+//        deixava todo o snapshot com onScreen=false.
+//    [B] Passo critico identificado por NOME (IsCoreStep), nao por indice.
+//    [C] PRONTIDAO LATCHED: exige kBadTolerance frames ruins CONSECUTIVOS
+//        para derrubar. Antes, UM frame com excecao capturada zerava
+//        g_okFrames e o render ficava >=3 frames sem desenhar -> piscada
+//        sincronizada com spawn/morte/excecao.
+//    [D] O local player deixou de ser condicao de prontidao. Ele e'
+//        telemetria (SDK::g_localValid): estar morto/respawnando nao
+//        significa que a partida parou nem que os alvos sao invalidos.
+//
+//  v5 = v4 + endurecimento (preservado):
+//    [1] INIT REAL: Hooks::g_sdkReady NAO e' setado na mao.
 //    [2] SEM RETURN POR CAMERA: UpdateView so marca SDK::g_viewProjOk.
-//        Nenhum passo e' abortado por causa disso.
-//    [3] PROFILER por passo via QPC, com media/last/min/max, escrito sob
-//        lock (overlay le em outra thread).
+//    [3] PROFILER por passo via QPC, com media/last/min/max, escrito sob lock.
 //    [4] FALHA ISOLADA: __try/__except por passo, logando code+addr.
-//        Um AV em um passo nao mata o frame nem os passos seguintes.
 //    [5] SHUTDOWN LIMPO: g_unload -> espera tick em voo (bounded), limpa
 //        alvo, stats e flag de ready, loga o resumo.
-//    [6] ANTI-DUPLICIDADE: CAS em g_ticking. Chamada reentrante/concorrente
-//        nao roda o frame duas vezes; contabiliza em g_skippedTicks.
+//    [6] ANTI-DUPLICIDADE: CAS em g_ticking.
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -36,11 +42,16 @@ namespace Combat {
     static uint32_t g_okFrames = 0;   // frames consecutivos "validos"
     static uint32_t g_skippedTicks = 0;   // chamadas descartadas pelo guard
     static uint32_t g_crashCount = 0;   // total de excecoes capturadas
+    static uint32_t g_badStreak = 0;   // frames ruins CONSECUTIVOS
 
     static std::atomic<bool> g_ticking{ false };
     static std::atomic<bool> g_unloaded{ false };  // shutdown ja executado
 
-    static const uint32_t kWarmupFrames = 3;          // init real precisa disso
+    // Frames bons necessarios para PUBLICAR o ready.
+    static const uint32_t kWarmupFrames = 3;
+    // Frames ruins CONSECUTIVOS necessarios para DERRUBAR o ready.
+    // Com 1, qualquer excecao capturada apagava o ESP por 3 frames.
+    static const uint32_t kBadTolerance = 8;
 
     StepStat g_stats[kMaxSteps];
     int      g_statsN = 0;
@@ -102,15 +113,6 @@ namespace Combat {
         return n;
     }
 
-    float StepMinMs(int i) {
-        if (i < 0 || i >= g_statsN) return 0.f;
-        StatsLockShared(); float v = g_statMin[i]; StatsUnlockShared(); return v;
-    }
-    float StepMaxMs(int i) {
-        if (i < 0 || i >= g_statsN) return 0.f;
-        StatsLockShared(); float v = g_statMax[i]; StatsUnlockShared(); return v;
-    }
-
     void ResetStats() {
         StatsLock();
         g_statsN = 0;
@@ -153,7 +155,7 @@ namespace Combat {
     // retornamos true (executou) — falha real vem do __except, nao do retorno.
     static bool S_Unlock() { Unlock::Tick();             return true; }
     static bool S_UpdateTargets() { SDK::UpdateTargets();       return true; }
-    static bool S_UpdateView() { SDK::UpdateView();          return true; }  // so marca viewProjOk
+    static bool S_UpdateView() { SDK::UpdateView();          return true; }
     static bool S_AimbotBest() {
         SDK::g_aimTarget = (C.aimbot || C.triggerbot) ? Aimbot::Best() : nullptr;
         return true;
@@ -168,28 +170,31 @@ namespace Combat {
     // Tabela unica: execucao e profiler saem da mesma fonte.
     struct StepDef { const char* nome; bool (*fn)(); };
 
+    // >>> [A] A ORDEM IMPORTA.
+    //     UpdateView publica a matriz view*proj do frame ATUAL. UpdateTargets
+    //     precisa dela para calcular onScreen. Com a ordem antiga
+    //     (UpdateTargets antes), o onScreen saia com a matriz do frame
+    //     anterior e um frame sem camera deixava o snapshot inteiro em
+    //     onScreen=false -> ESP vazio.
     static const StepDef kSteps[] = {
-        { "Unlock",        S_Unlock        },
-        { "UpdateTargets", S_UpdateTargets },  // nao depende da camera
-        { "UpdateView",    S_UpdateView    },  // camera opcional aqui
-        { "AimbotBest",    S_AimbotBest    },
-        { "Misc",          S_Misc          },
-        { "Aimbot",        S_Aimbot        },
-        { "Triggerbot",    S_Triggerbot    },
-        { "Weapons",       S_Weapons       },
-        { "Movement",      S_Movement      },
-        { "AntiCheat",     S_AntiCheat     },
+        { "Unlock",        S_Unlock },
+        { "UpdateView",    S_UpdateView },  // camera/viewProj PRIMEIRO
+        { "UpdateTargets", S_UpdateTargets },  // usa a matriz DESTE frame
+        { "AimbotBest",    S_AimbotBest },
+        { "Misc",          S_Misc },
+        { "Aimbot",        S_Aimbot },
+        { "Triggerbot",    S_Triggerbot },
+        { "Weapons",       S_Weapons },
+        { "Movement",      S_Movement },
+        { "AntiCheat",     S_AntiCheat },
     };
     static const int kStepsN = (int)(sizeof(kSteps) / sizeof(kSteps[0]));
     static_assert(sizeof(kSteps) / sizeof(kSteps[0]) <= kMaxSteps,
         "kMaxSteps pequeno para a tabela de passos");
 
-    // ------------------------------------------------------- validacao init
-    // Condicao REAL de prontidao. Sem atribuicao artificial de g_sdkReady.
-    // Camera entra como informacao, nao como bloqueio.
-    static bool ValidateCoreState() {
-        if (!SDK::g_localPlayer) return false;   // ainda nao resolvido
-        return true;
+    // >>> [B] Passo critico por NOME: reordenar kSteps nao muda a semantica.
+    static bool IsCoreStep(const char* nome) {
+        return strcmp(nome, "Unlock") == 0 || strcmp(nome, "UpdateTargets") == 0;
     }
 
     // ------------------------------------------------------------ shutdown
@@ -204,6 +209,7 @@ namespace Combat {
         SDK::g_aimTarget = nullptr;
         ResetStats();
         g_okFrames = 0;
+        g_badStreak = 0;
 
         Log("combat: shutdown limpo frames=%u skipped=%u crashes=%u",
             g_frame, g_skippedTicks, g_crashCount);
@@ -237,16 +243,28 @@ namespace Combat {
             const bool ok = RunStep(kSteps[i].nome, kSteps[i].fn, &dt);
             Stat(kSteps[i].nome, dt);       // [3] sempre mede, mesmo em falha
 
-            // passos criticos para considerar o SDK "pronto"
-            if (i == 0 || i == 1) allCoreOk &= ok;   // Unlock, UpdateTargets
+            if (IsCoreStep(kSteps[i].nome)) allCoreOk &= ok;
         }
 
-        // [1] prontidao real: N frames consecutivos validos
-        if (allCoreOk && ValidateCoreState()) {
+        // =============================================================
+        //  >>> [C] PRONTIDAO LATCHED.
+        //  Liga: kWarmupFrames frames bons consecutivos.
+        //  Desliga: kBadTolerance frames ruins CONSECUTIVOS.
+        //  Com o reset imediato antigo, UMA excecao capturada zerava
+        //  g_okFrames e o render ficava >=3 frames sem desenhar.
+        //
+        //  >>> [D] O local player NAO entra mais nesta conta. Estar
+        //  morto/respawnando nao significa que a partida parou nem que
+        //  os alvos sao invalidos. A validade dele e' telemetria
+        //  (SDK::g_localValid).
+        // =============================================================
+        if (allCoreOk) {
+            g_badStreak = 0;
             if (g_okFrames < kWarmupFrames) ++g_okFrames;
         }
-        else {
-            g_okFrames = 0;
+        else if (g_badStreak < 1000000u) {
+            ++g_badStreak;
+            if (g_badStreak >= kBadTolerance) g_okFrames = 0;
         }
         Hooks::g_sdkReady = (g_okFrames >= kWarmupFrames);
 
@@ -258,11 +276,12 @@ namespace Combat {
         const uint64_t now = GetTickCount64();
         if (now - g_lastDbg >= 1000) {
             g_lastDbg = now;
-            Log("dbg: alvos=%d local=%p team=%d viewProj=%d ready=%d tick=%.2fms "
-                "frame=%u skip=%u crash=%u fase=%s obj=[ac=%d wp=%d]",
-                SDK::g_targetCount, SDK::g_localPlayer, SDK::g_localTeam,
-                (int)SDK::g_viewProjOk, (int)Hooks::g_sdkReady,
-                (double)g_tickMs, g_frame, g_skippedTicks, g_crashCount,
+            Log("dbg: alvos=%d local=%p localValid=%d team=%d viewProj=%d ready=%d "
+                "bad=%u tick=%.2fms frame=%u skip=%u crash=%u fase=%s obj=[ac=%d wp=%d]",
+                SDK::g_targetCount, SDK::g_localPlayer,
+                (int)SDK::g_localValid.load(std::memory_order_relaxed),
+                SDK::g_localTeam, (int)SDK::g_viewProjOk, (int)Hooks::g_sdkReady,
+                g_badStreak, (double)g_tickMs, g_frame, g_skippedTicks, g_crashCount,
                 g_phase ? g_phase : "?", bfi_anticheat_obj, bfi_weapons_obj);
         }
 
@@ -275,6 +294,7 @@ namespace Combat {
         g_ticking.store(false);
         g_lastDbg = GetTickCount64();
         g_frame = g_okFrames = g_skippedTicks = g_crashCount = 0;
+        g_badStreak = 0;
         ResetStats();
         Hooks::g_sdkReady = false;   // unico ponto onde mexemos nele fora do tick
     }

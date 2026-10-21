@@ -32,10 +32,12 @@ inline constexpr int kTargetNameLen = 40;
 //    - g_targets[] e' reescrito in-place pelo thread do jogo. Para usar fora
 //      do lock, copie (Snapshot()).
 //
-//  health x hp
-//    Mesmo conceito. 'health' e' o campo autoritativo; 'hp' e' um espelho
-//    legado mantido para nao quebrar call site. Sao escritos SEMPRE juntos —
-//    se divergirem, e' bug de quem escreveu. Codigo novo usa 'health'.
+//  >>> onScreen
+//    Quem escreve e' UpdateTargets(), e ele precisa SEMPRE rodar — inclusive
+//    quando o local player nao existe naquele frame. RefreshTargets() zera
+//    'onScreen' de todo mundo; se UpdateTargets() saisse antes de recomputar
+//    (era o caso), o ESP ficava vazio com os alvos perfeitamente validos.
+//    O esp.cpp trata 'onScreen == false' como "nao desenha este alvo".
 // ============================================================================
 struct Target {
     Il2CppObject* obj = nullptr;        // emprestado
@@ -51,14 +53,12 @@ struct Target {
 
     bool   onScreen = false;
     bool   alive = false;
-    bool   enemy = true;
     bool   npc = false;
     bool   visible = false;
 
     int    team = 0;
     int    weapon = 0;
     float  health = 100.f;
-    float  hp = 100.f;                  // espelho legado de health
     float  dist = 0.f;
 
     uint32_t slot = 0;                  // estavel enquanto o player existir

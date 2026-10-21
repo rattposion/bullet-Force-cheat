@@ -10,11 +10,25 @@
 //      Escritos UMA vez no Init(), antes de os hooks ficarem vivos.
 //      Leitura: qualquer thread, SEM lock.
 //
-//  [B] ESTADO VIVO           — g_localPlayer, g_camera, g_aimTarget,
+//  [B] ESTADO VIVO           — g_localPlayer, g_camera, g_local, g_aimTarget,
 //      g_localTeam, g_localPos, g_viewProj, g_viewProjOk, g_frameId.
 //      Escritos pelo thread do jogo no tick. Leia UMA vez por frame para um
 //      local e use o local — nao releia campo a campo no meio de um calculo,
 //      senao voce mistura dois frames.
+//
+//      >>> STICKY (importante): g_localPlayer e g_camera NAO sao zerados
+//          numa falha transitoria (objeto destruido, SafeClass reprovando
+//          por um frame, respawn, troca de cena). O tick so' os SUBSTITUI
+//          quando a re-resolucao devolve algo valido.
+//
+//          Consequencia direta: "g_localPlayer != nullptr" passou a
+//          significar "ULTIMO local conhecido", NAO "local valido agora".
+//          Quem precisa da segunda pergunta le g_localValid ([D]).
+//
+//          Motivo: o pipeline de alvos (posicao, tela, onScreen) NAO depende
+//          do local player para funcionar. Ele so' alimenta dist/team/filtro.
+//          Zerar o ponteiro por uma falha de um frame derrubava o frame
+//          inteiro — era a causa do ESP sumir.
 //
 //  [C] PROTEGIDO POR LOCK    — g_targets[]/g_targetCount (g_targetCs) e
 //      g_classes (g_classesMx).
@@ -22,8 +36,13 @@
 //      FindClass(). O lock e' do CONJUNTO: ler g_targetCount e depois
 //      g_targets[i] fora do lock pode ver dois frames diferentes.
 //
-//  [D] ATOMICOS              — g_fireDirSlot, g_recoilHookActive.
+//  [D] ATOMICOS              — g_fireDirSlot, g_recoilHookActive,
+//      g_localValid, g_viewValid.
 //      Sem lock. Use .load()/.store().
+//
+//      g_localValid / g_viewValid sao TELEMETRIA de prontidao, escritas pelo
+//      tick e lidas livremente (log, gate de render). NUNCA use g_localValid
+//      como pre-requisito para desenhar: local ausente nao invalida alvos.
 //
 //  Se um dia um global nao couber em nenhuma: e' sinal de que ele precisa de
 //  um dono unico e de uma regra escrita aqui.
@@ -86,6 +105,7 @@ namespace SDK {
     extern MethodInfo* M_set_fov;
 
     // ---- [B] estado vivo (escrito no tick, lido 1x por frame) ----
+    //  g_localPlayer e g_camera sao STICKY: ver doc no topo do arquivo.
     extern Il2CppObject* g_camera;
     extern Il2CppObject* g_local;
     extern Il2CppObject* g_aimTarget;
@@ -107,6 +127,14 @@ namespace SDK {
     extern std::atomic<int>  g_fireDirSlot;
     // hook de recoil ativo (se true, noRecoil nao usa fallback de rotacao)
     extern std::atomic<bool> g_recoilHookActive;
+
+    // ---- [D] TELEMETRIA de prontidao ----
+    //  g_localValid : o local player foi RESOLVIDO E VALIDADO no frame atual.
+    //                 (false enquanto morto/respawnando NAO significa que o
+    //                 pipeline parou — ver [B].)
+    //  g_viewValid  : existe matriz view*proj publicada e dentro do TTL.
+    extern std::atomic<bool> g_localValid;
+    extern std::atomic<bool> g_viewValid;
 
     // ---- [A] flag de diagnostico ----
     // o campo de cadencia resolvido e RPM (e nao um delay em segundos)

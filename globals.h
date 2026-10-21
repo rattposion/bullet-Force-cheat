@@ -1,14 +1,23 @@
 #pragma once
 // =====================================================================
 //  globals.h
-//  Declaracoes globais compartilhadas.
+//  Declaracoes globais compartilhadas. DONO UNICO da macro C.
+//
+//  >>> FIX: config.h TAMBEM definia 'C' (com corpo diferente) e redeclarava
+//      g_cfg/C. Duas definicoes concorrentes da MESMA macro, com o vencedor
+//      decidido pela ordem de include — funcionava por acidente e quebrava
+//      silenciosamente se um include mudasse de lugar. Agora so' este arquivo
+//      define a macro. config.h cuida apenas da ESTRUTURA Config.
+//
+//  Como este header e' alcancado por TODOS os TUs (via common.h), todo mundo
+//  que usa C.<campo> tem a macro disponivel, sem depender de ordem.
 // =====================================================================
 
 #include "deps.h"
 
 // ---------------------------------------------------------------------
 //  Config
-//  A definicao completa de Config vive em outro arquivo. Aqui apenas a
+//  A definicao completa de Config vive em config.h. Aqui apenas a
 //  declaracao antecipada, suficiente para os simbolos abaixo.
 // ---------------------------------------------------------------------
 struct Config;
@@ -53,7 +62,8 @@ void Log(VN_PRINTF_FMT const char* fmt, ...);
 //
 //  ATENCAO: a macro e definida aqui, DEPOIS de todos os includes de
 //  terceiros. Assim "imgui.h"/"MinHook.h" nao enxergam "C" como macro.
-//  Se algum header posterior definir "C", ele sobrescreveria esta macro.
+//  Se algum header posterior definir "C", ele sobrescreveria esta macro —
+//  e' por isso que config.h nao define mais nada.
 // =====================================================================
 #ifdef C
 #undef C

@@ -32,7 +32,9 @@
 //  Aqui so' o flag de saida do processo.
 extern std::atomic<bool> g_unload;
 
-// Menu_WantsMouse: definida em features.cpp, consultada pelo hook de cursor.
+// Menu_WantsMouse: definida em features.cpp, consultada pelo hook de cursor
+// (hk_SetCursorPos) E pelo WndProc. E' o unico lugar que sabe se o mouse e' do
+// ImGui — usar C.menuOpen no lugar dela engolia o SetCursorPos do jogo.
 bool Menu_WantsMouse();
 
 namespace Menu {
@@ -51,6 +53,10 @@ namespace Misc { void Panic(); void Draw(); void Tick(); }
 //  COMBAT + PROFILER POR PASSO
 //  Cada passo do Tick e' cronometrado (QPC) e exposto pro overlay, pra achar
 //  o gargalo real em vez de chutar.
+//
+//  >>> As estatisticas sao escritas sob SRWLOCK em Combat::Stat(). O overlay
+//      roda em OUTRA thread: ler g_stats/g_statsN direto e' leitura rasgada.
+//      Use CopyStats() (compartilhado) ou ResetStats() (exclusivo).
 // ============================================================================
 namespace Combat {
     const int kMaxSteps = 16;
@@ -58,7 +64,13 @@ namespace Combat {
     extern StepStat g_stats[kMaxSteps];
     extern int       g_statsN;
     extern float     g_tickMs;      // media exponencial do tick inteiro
-    void Tick();
+    void  Tick();
+    void  Init();
+    void  Shutdown();
+    // Copia o snapshot das estatisticas para 'out'. Devolve quantas linhas
+    // escreveu (<= maxN). Nunca segura o lock durante o desenho.
+    int   CopyStats(StepStat* out, int maxN);
+    void  ResetStats();
 }
 
 namespace Weapons { void Init(); void Tick(); }

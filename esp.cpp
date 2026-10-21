@@ -8,6 +8,19 @@
 //      Agora copia a lista sob o lock e solta ANTES de desenhar -> a thread do
 //      jogo nao fica esperando o overlay.
 //  >>> FIX 2: sem sprintf por alvo/frame. Formatador de inteiro na mao.
+//
+//  >>> FIX 3 (ESP piscando/sumindo): o local player NAO e' mais pre-requisito
+//      para desenhar. Ele so' serve para (a) excluir o proprio corpo e
+//      (b) o filtro de time — que ja' tem fallback. Com o gate antigo
+//      ("if (!g_localPlayer) return"), qualquer frame em que o tick nao
+//      conseguisse validar o local zerava o desenho inteiro, mesmo com a
+//      lista de alvos completa e valida.
+//  >>> FIX 4: o local e' lido UMA vez no inicio. Antes era lido tres vezes
+//      (gate + comparacao por alvo) e o tick pode troca-lo no meio do loop,
+//      misturando dois frames.
+//  >>> FIX 5: contadores por motivo de skip + log de 1 Hz com TODOS os gates
+//      (local / viewProj / ready). E' o que discrimina, em runtime, se o ESP
+//      esta vazio por dado invalido ou por gate.
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -42,7 +55,9 @@ namespace ESP {
         SDK::dbg_drawn = 0;
 
         if (!C.esp) return;
-        if (!SDK::g_localPlayer) return;
+
+        // >>> FIX 3/4: o local player nao e' mais pre-requisito. Lido UMA vez.
+        Il2CppObject* local = SDK::g_localPlayer;
 
         // >>> FIX 1: snapshot sob o lock, desenho fora dele.
         static Target snap[MAX_TARGETS];
@@ -68,6 +83,7 @@ namespace ESP {
         if (th < 1.f) th = 1.f;
 
         int drawn = 0, visCount = 0, snapCount = 0;
+        int skSelf = 0, skDead = 0, skNpc = 0, skTeam = 0, skOff = 0, skDist = 0;
         float cx = scrW * 0.5f;
         float cyMid = scrH * 0.5f;
         float cyBot = scrH;
@@ -76,12 +92,15 @@ namespace ESP {
             Target& t = snap[i];
 
             if (!t.player) continue;
-            if (t.player == SDK::g_localPlayer) continue;
-            if (!t.alive) continue;
-            if (C.espNpc && t.npc) continue;
-            if ((C.teamCheck || C.aimTeam) && t.team == SDK::g_localTeam) continue;
-            if (!t.onScreen) continue;
-            if (C.espMaxDist > 1.f && t.dist > C.espMaxDist) continue;
+            if (local && t.player == local) { ++skSelf; continue; }
+            if (!t.alive) { ++skDead; continue; }
+            if (C.espNpc && t.npc) { ++skNpc; continue; }
+            if ((C.teamCheck || C.aimTeam) && SDK::g_localTeam >= 0 &&
+                t.team == SDK::g_localTeam) {
+                ++skTeam; continue;
+            }
+            if (!t.onScreen) { ++skOff; continue; }
+            if (C.espMaxDist > 1.f && t.dist > C.espMaxDist) { ++skDist; continue; }
 
             float top = t.scrHead.y + C.espOffY;
             float h = (t.scrFeet.y - top) * C.espScaleY;
@@ -178,9 +197,16 @@ namespace ESP {
         ULONGLONG now = GetTickCount64();
         if (now - lastLog >= 1000) {
             lastLog = now;
-            Log("[esp] alvos=%d desenhados=%d visiveis=%d snap=%d/%d visCheck=%d los=%s",
+            // >>> FIX 5: todos os gates no mesmo lugar. Se 'desenhados' cai a
+            //     zero, o motivo esta' explicito: local/viewProj/ready, ou a
+            //     distribuicao dos 'skip'.
+            Log("[esp] alvos=%d desenhados=%d visiveis=%d snap=%d/%d visCheck=%d los=%s "
+                "| skip eu=%d morto=%d npc=%d time=%d fora=%d dist=%d "
+                "| local=%d viewProj=%d ready=%d",
                 n, drawn, visCount, snapCount, C.espSnapline ? 1 : 0,
-                C.espVisCheck ? 1 : 0, SDK::LosReady() ? "OK" : "OFF");
+                C.espVisCheck ? 1 : 0, SDK::LosReady() ? "OK" : "OFF",
+                skSelf, skDead, skNpc, skTeam, skOff, skDist,
+                local ? 1 : 0, (int)SDK::g_viewProjOk, (int)Hooks::g_sdkReady);
         }
     }
 

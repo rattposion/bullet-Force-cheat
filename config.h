@@ -4,6 +4,19 @@
 
 #include <windows.h>
 
+// =====================================================================
+//  config.h — ESTRUTURA de configuracao + persistencia.
+//
+//  >>> A macro 'C' e os 'extern g_cfg / extern Config& C' vivem em
+//      globals.h (dono unico). Aqui NAO se redefine nada disso.
+//
+//  >>> Removidos por nao terem leitor NEM escritor de UI:
+//        aimEnabled    (o aimbot v17 passou a usar C.aimbot)
+//        aimTeamCheck  (idem; passou a usar C.aimTeam)
+//      Nenhum dos dois estava no Save()/Load() de config.cpp, logo a
+//      remocao nao afeta bfi.ini existente.
+// =====================================================================
+
 struct Config {
 
     // ---- JANELA / MENU ----
@@ -72,10 +85,8 @@ struct Config {
     bool  magicBullets = false;
 
     // =======================================================================
-    //  ALIASES / CAMPOS NOVOS  (nome exato usado pelo aimbot.cpp)
+    //  CAMPOS USADOS PELO aimbot.cpp
     // =======================================================================
-    bool  aimEnabled = true;
-    bool  aimTeamCheck = false;     // true = nao mira em companheiro de time
     int   aimSelect = 0;            // 0=mais perto da mira  1=mais perto  2=hibrido
     bool  aimToggle = false;
     bool  aimAutoFire = false;
@@ -169,15 +180,6 @@ struct Config {
     bool  showAimTargetName = false;
     bool  showFpsGraph = false;
 };
-
-extern Config  g_cfg;
-
-#ifdef C
-#undef C
-#endif
-extern Config& C;
-
-#define C(f) g_cfg.f
 
 namespace ConfigIO {
     void Init();

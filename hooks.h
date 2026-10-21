@@ -3,29 +3,37 @@
 //  hooks.h — estado de ciclo de vida + hooks de plataforma.
 //  DONO UNICO do namespace Hooks.
 //
-//  >>> Se este arquivo ainda tiver as linhas ANTIGAS junto das novas, apague:
-//        extern int g_viewW; extern int g_viewH;   (agora sao std::atomic<int>)
-//        void Shutdown();                          (agora e' bool)
+//  >>> Removidos por nao terem nenhum chamador (auditoria):
+//        extern std::atomic<bool> g_hooksLive;   (espelho nunca lido)
+//        inline uint64_t FrameNow();
+//        int FontCount(); ImFont& SafeFont(int); (menu usa a fonte default)
+//      Se algum deles voltar a ser necessario, re-adicione com um leitor real.
 //
 //  ===========================================================================
 //  UM UNICO ESTADO. OS FLAGS SAO DERIVADOS.
 //  ===========================================================================
 //  Tres atomics escritos em tres lugares permitem combinacao invalida
 //  (hooksLive = true com sdkReady = false). Aqui a verdade e' UMA: g_stage.
-//  Os tres flags sao espelhos escritos SO' por SetStage().
+//  Os flags espelho sao escritos SO' por SetStage().
 //
 //  Progressao: Down -> Init -> Sdk -> Hooks -> ImGui -> Live
 //  Shutdown() passa por Tearing e volta para Down.
 //
 //  Espelhos:  g_sdkReady = (stage >= Sdk)
-//             g_hooksLive = (stage >= Hooks)
 //             g_imguiReady = (stage >= ImGui)
+//
+//  >>> g_sdkReady e' TELEMETRIA, nao gate de render.
+//      Ele e' reescrito a cada frame por Combat::Tick() conforme a saude dos
+//      passos criticos, e por isso pisca. Usa-lo para decidir "desenhar ou
+//      nao" acoplava o overlay a camada de dados (era a causa do ESP sumir).
+//      O gate de render correto e' AtLeast(Stage::Hooks) — ciclo de vida.
+//      g_imguiReady e' gate REAL (o menu depende do contexto do ImGui).
 //
 //  ===========================================================================
 //  THREADS
 //  ===========================================================================
 //  SetStage/Init/Shutdown : thread de init/unload, uma por vez.
-//  StageNow/AtLeast/FrameNow/GetViewSize : qualquer thread, lock-free.
+//  StageNow/AtLeast/GetViewSize : qualquer thread, lock-free.
 // ============================================================================
 
 #include <atomic>
@@ -48,14 +56,16 @@ namespace Hooks {
 
     Stage       StageNow();
     bool        IsLive();
+    // AtLeast(Down) e' SEMPRE true (inclusive durante Tearing).
+    // Durante Tearing, qualquer stage acima de Down e' false.
     bool        AtLeast(Stage s);
     const char* StageName(Stage s);
 
     void SetStage(Stage s);              // UNICO escritor dos espelhos
 
     // Espelhos (compat). Derivados de Stage(). NAO escreva por fora.
+    // ATENCAO: g_sdkReady tambem e' escrito por Combat::Tick() todo frame.
     extern std::atomic<bool> g_sdkReady;
-    extern std::atomic<bool> g_hooksLive;
     extern std::atomic<bool> g_imguiReady;
 
     // -----------------------------------------------------------------------
@@ -66,14 +76,13 @@ namespace Hooks {
     //  um snapshot e compare (a != b) — nao use o valor absoluto.
     // -----------------------------------------------------------------------
     extern std::atomic<uint64_t> g_frameCounter;
-    inline uint64_t FrameNow() { return g_frameCounter.load(std::memory_order_acquire); }
 
     // -----------------------------------------------------------------------
     //  Viewport
     //  std::atomic<int>: leitura/escrita sem corrida. SetViewSize e' o UNICO
     //  writer (hook de resize). Ler os dois separadamente pode misturar um
     //  frame; se precisar do par coerente, use GetViewSize(), que re-tenta
-    //  enquanto a largura estiver mudando.
+    //  enquanto a largura estiver mudando (com teto de tentativas).
     // -----------------------------------------------------------------------
     struct ViewSize { int w, h; };
 
@@ -85,16 +94,6 @@ namespace Hooks {
     // Espelhos por nome antigo. Mesmo writer unico.
     extern std::atomic<int> g_viewW;
     extern std::atomic<int> g_viewH;
-
-    // -----------------------------------------------------------------------
-    //  Fontes
-    //  SafeFont devolve SEMPRE referencia valida: idx fora de
-    //  [0, FontCount()) e' clampado; se o atlas nao existe, devolve o font
-    //  default do contexto. Validade: ate' o atlas ser reconstruido — pegue
-    //  por frame, nao guarde.
-    // -----------------------------------------------------------------------
-    int     FontCount();
-    ImFont& SafeFont(int idx);
 
     // -----------------------------------------------------------------------
     //  Ciclo de vida

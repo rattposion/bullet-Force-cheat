@@ -1,7 +1,9 @@
 #pragma once
 // ============================================================================
 //  sdk.h — UMBRELLA.
-//  v6.8 — TeamRelation exposto (1=inimigo, 0=aliado, -1=indeterminado).
+//  v6.9 — TeamRelation exposto (1=inimigo, 0=aliado, -1=indeterminado).
+//         Removidos: PtrOk_, VisibleLine, RaycastTest, GetWeapon, GetBonePos,
+//         GetName (nenhum chamador — ver relatorio da auditoria).
 // ============================================================================
 
 #include "common.h"
@@ -25,17 +27,6 @@ extern const char* g_phase;
 // globais (escopo de arquivo, definidas em sdk.cpp)
 bool         ValidInstance_(const void* o);
 Il2CppClass* SafeClass_(Il2CppObject* o);
-
-// >>> [FIX] helper de validacao de ponteiro (inline, publico)
-static inline bool PtrOk_(const void* o) {
-    uintptr_t p = (uintptr_t)o;
-    if (p == 0) return false;
-    if (p == (uintptr_t)-1) return false;
-    if (p < 0x10000) return false;
-    if (p > 0x00007FFFFFFFFFFF) return false;
-    if ((p & 0x7) != 0) return false;
-    return true;
-}
 
 namespace SDK {
 
@@ -73,12 +64,9 @@ namespace SDK {
     int   TeamRelation(Il2CppObject* o);
 
     Il2CppObject* FindBoneContains(Il2CppObject* root, const char* sub, int budget = 8192);
-    Vec3  GetBonePos(void* bone);
     void  GetNameBuf(Il2CppObject* o, char* out, int n);
-    std::string GetName(Il2CppObject* o);
 
     bool  WorldToScreen(Vec3 w, Vec2& s);
-    bool  VisibleLine(Vec3 a, Vec3 b);
     Vec3  TargetAimPos(Il2CppObject* p, int boneMode);
     Vec3  BonePoint(Vec3 head, Vec3 feet, int boneMode);
 
@@ -90,7 +78,6 @@ namespace SDK {
     Quat  GetPlayerRot(Il2CppObject* p);
 
     Il2CppObject* GetGunStats(Il2CppObject* player);
-    Il2CppObject* GetWeapon(Il2CppObject* player);
 
     bool  AimLock(Il2CppObject* p, Quat& savedOriginal);
     void  RestoreAim(Il2CppObject* p, const Quat& q);
@@ -130,7 +117,6 @@ namespace SDK {
     bool  LosReady();
     const char* LosBackend();
     bool  TargetVisible(int idx, Vec3 eye, Vec3 aim);
-    bool  RaycastTest(Vec3 from, Vec3 to, float& outHitDist);
     float CameraCotHalfFovY();
 
     Il2CppClass* AntiHackClass();
@@ -163,7 +149,6 @@ using SDK::CameraObj;
 using SDK::FindClass;
 using SDK::GetTransform;
 using SDK::SafeReadObjPub;
-using SDK::VisibleLine;
 using SDK::HasLineOfSight;
 using SDK::HasLineOfSightEx;
 using SDK::HasLineOfSightExRaw;
@@ -171,25 +156,21 @@ using SDK::LosInvalidate;
 using SDK::LosReady;
 using SDK::LosBackend;
 using SDK::TargetVisible;
-using SDK::RaycastTest;
 using SDK::CameraCotHalfFovY;
 using SDK::FovRadiusPx;
 using SDK::BonePoint;
 using SDK::LockTargets;
 using SDK::UnlockTargets;
 using SDK::FindBoneContains;
-using SDK::GetBonePos;
 using SDK::GetPos;
 using SDK::SetPos;
 using SDK::GetHealth;
 using SDK::IsA;
 using SDK::IsEnemy;
-using SDK::GetName;
 using SDK::GetNameBuf;
 using SDK::GetVelocity;
 using SDK::GetGunStats;
 using SDK::GetGunStatsLive;
-using SDK::GetWeapon;
 using SDK::FindGunStatsObj;
 using SDK::ResolveWeaponFields;
 using SDK::DumpFieldsWithValues;
