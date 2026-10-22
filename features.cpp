@@ -1,22 +1,17 @@
 // ============================================================================
-//  features.cpp — Menu::Render / Aimbot::Bone / Menu_WantsMouse
-//  O menu de verdade vive em menu.cpp (Menu::Draw).
+//  features.cpp — Menu::Render / Aimbot::Bone / Menu_WantsMouse.
+//  O menu de verdade vive em menu.cpp (Menu::Draw). O ESTILO tambem: dono
+//  unico e' menu.cpp::ApplyStyle. Aqui nao existe mais ApplyStyle.
 //
-//  >>> UNICO dono de Menu::Render(). O menu.cpp NAO define Render, senao:
-//        LNK2005 "void __cdecl Menu::Render(void)" ja definida em features.obj
-//        LNK1169
-//
-//  >>> FIX (estilo duplicado): Menu::ApplyStyle() vivia AQUI e
-//      menu.cpp::ApplyStyleOnce() aplicava o mesmo estilo. Como as duas rodam
-//      no mesmo frame apos a criacao de um contexto novo, o estilo era
-//      aplicado duas vezes (e os dois 'styledCtx' podiam divergir). Dono unico
-//      agora e' menu.cpp, que aplica por dentro do Draw().
+//  v3: Menu::Render blindado (__try) — um AV no Draw do menu nao sobe pro
+//      frame. O hooks.cpp tambem ja envolve a chamada; isto e' 2a camada.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
 #include <cmath>
+#include <atomic>
 
 #include "imgui.h"
 
@@ -30,8 +25,7 @@
 #include "features.h"
 
 // ---------------------------------------------------------------------------
-//  Input — o hook de cursor e o WndProc consultam isto antes de deixar o mouse
-//  pro jogo.
+//  Input — o hook de cursor consulta isto ANTES de engolir o SetCursorPos.
 // ---------------------------------------------------------------------------
 bool Menu_WantsMouse() {
     if (!C.menuOpen)                 return false;
@@ -42,13 +36,12 @@ bool Menu_WantsMouse() {
 
 namespace Menu {
 
-    // Ponto de entrada chamado pelo hk_wglSwapBuffers.
-    // O menu.cpp define Draw() e aplica o estilo proprio dele.
     void Render() {
-        ImGuiContext* ctx = ImGui::GetCurrentContext();
-        if (!ctx || !Hooks::g_imguiReady.load()) return;
+        if (!ImGui::GetCurrentContext()) return;
+        if (!Hooks::g_imguiReady.load())    return;
 
-        Draw();                        // menu.cpp (aplica o estilo por dentro)
+        __try { Draw(); }   // menu.cpp; o estilo e' responsabilidade dele
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] Menu::Draw"); }
     }
 
 } // namespace Menu
@@ -61,25 +54,32 @@ namespace Aimbot {
     void Bone(Il2CppObject* p, Il2CppObject* target) {
         if (!p || !target || !SDK::O_rotation || !SDK::O_rotationIsQuat) return;
 
-        Vec3 me = SDK::GetPos(p);
-        if (!me.isSane()) return;
+        // SEH: 'target' pode estar reciclado. Sem isto, um AV aqui derruba o
+        // passo (e o Bone pode ser chamado do thread de render).
+        __try {
+            Vec3 me = SDK::GetPos(p);
+            if (!me.isSane()) return;
 
-        // TargetAimPos devolve Vec3() quando nao resolve o bone, mas (0,0,0)
-        // tambem e um ponto VALIDO. Por isso as duas checagens: isSane() pega
-        // NaN/Inf/valores absurdos, zero() pega o sentinela de falha.
-        Vec3 tp = SDK::TargetAimPos(target, C.aimBone);
-        if (!tp.isSane() || tp.zero())
-            tp = SDK::GetPos(target);
-        if (!tp.isSane()) return;
+            // TargetAimPos devolve Vec3() quando nao resolve o bone, mas
+            // (0,0,0) tambem e' ponto valido: por isso as duas checagens.
+            Vec3 tp = SDK::TargetAimPos(target, C.aimBone);
+            if (!tp.isSane() || tp.zero())
+                tp = SDK::GetPos(target);
+            if (!tp.isSane()) return;
 
-        Vec3 dir = tp - me;
-        const float L = dir.len();
-        if (L < 0.0001f) return;
+            Vec3 dir = tp - me;
+            const float L = dir.len();
+            if (L < 0.0001f) return;
 
-        ::Quat q = SDK::LookRot(dir * (1.f / L));
+            ::Quat q = SDK::LookRot(dir * (1.f / L));
 
-        // SetPlayerRot trata o caso do campo ser SyncVar<Quaternion>
-        SDK::SetPlayerRot(p, q);
+            // Caminho da camera E do player: escrever so' o player nao converge
+            // quando a mira do jogo e' dirigida pela camera.
+            Il2CppObject* camTf = SDK::CamTfObj();
+            if (camTf) SDK::SetRot(camTf, q);
+            SDK::SetPlayerRot(p, q);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] Aimbot::Bone"); }
     }
 
 } // namespace Aimbot

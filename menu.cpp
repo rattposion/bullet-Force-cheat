@@ -1,23 +1,16 @@
 // ============================================================
 //  menu.cpp - bfi / Bullet Force (ImGui)
 //
-//  >>> v16:
-//   - aba Aimbot: "So visivel (sem fallback)" -> C.aimStrictVis
-//   - aba Visual: slider "LOS por frame" -> C.losPerFrame
-//   - aba Trigger: slider "Raio da mira (px)" -> C.triggerRadius
-//   - aba Misc: checkbox "Profiler (ms por passo)" -> C.showFpsGraph
-//
-//  >>> FIX (LNK2005): Menu::Render() NAO e definido aqui. Ele vive em
-//      features.cpp (hooks.cpp chama Render -> features.cpp -> Draw).
-//  >>> FIX C6011: ComboIdx checava 'list' na linha do 'cur' mas nao dentro do
-//      loop do combo; com lista nula, list[i] estourava.
-//  >>> FIX (v17): VkName() usava UM buffer estatico. Tres chamadas na mesma
-//      expressao (rodape) devolviam o mesmo ponteiro e imprimiam o ultimo
-//      valor. Agora usa buffer rotativo.
-//  >>> FIX (v17): Menu::g_open agora e' REFERENCIA para C.menuOpen. Antes era
-//      um bool proprio -> duas verdades sobre "menu aberto".
-//  >>> FIX (v17): estilo aplicado 2x (aqui e em features.cpp). Dono unico agora
-//      e' este arquivo; features.cpp::Render so chama Draw().
+//  >>> v18:
+//   - ApplyStyle e' DONO UNICO do estilo (era duplicado em features.cpp).
+//   - ApplyStyleOnce usa GERACAO de contexto, nao ponteiro: DestroyContext +
+//     CreateContext reaproveita o endereco e o ponteiro dava ABA.
+//   - Keybind: espera todas as teclas subirem antes de escutar (antes
+//     capturava o VK_LBUTTON do proprio clique) + Esc cancela.
+//   - _snprintf_s no lugar de sprintf_s (truncamento em vez de string vazia).
+//   - C.selAttach[s] clampado em kMaxAttach.
+//   - Janela mantida viva quando fechada (alpha 0 + NoInputs): antes o ImGui
+//     reciclava a janela e posicao/tamanho se perdiam.
 // ============================================================
 #include "common.h"
 #include "config.h"
@@ -31,22 +24,14 @@
 
 namespace Menu {
 
-    // Mesma celula de memoria que C.menuOpen. Nao existe estado duplicado.
-    bool& g_open = g_cfg.menuOpen;
+    bool& g_open = C.menuOpen;      // mesma celula, sem estado duplicado
 
-    // ---------- estilo (dono unico) ----------
-    static ImGuiContext* g_styledCtx = nullptr;
-
-    static void ApplyStyleOnce()
+    // ---------------------------------------------------------- estilo
+    void ApplyStyle()
     {
-        // Reaplica quando o contexto do ImGui for (re)criado. So marca depois
-        // de aplicar de fato.
-        ImGuiContext* ctx = ImGui::GetCurrentContext();
-        if (!ctx || g_styledCtx == ctx) return;
-        g_styledCtx = ctx;
+        if (!ImGui::GetCurrentContext()) return;
 
-        // ORDEM IMPORTA: StyleColorsDark() ZERA os campos de rounding antes de
-        // escrever as cores. Se vier depois, os overrides abaixo sao apagados.
+        // ORDEM IMPORTA: StyleColorsDark() zera os campos de rounding.
         ImGui::StyleColorsDark();
 
         ImGuiStyle& s = ImGui::GetStyle();
@@ -72,6 +57,7 @@ namespace Menu {
         c[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.07f, 0.09f, 0.94f);
         c[ImGuiCol_TitleBg] = ImVec4(0.10f, 0.10f, 0.13f, 1.f);
         c[ImGuiCol_TitleBgActive] = ImVec4(0.13f, 0.13f, 0.17f, 1.f);
+        c[ImGuiCol_TitleBgCollapsed] = ImVec4(0.10f, 0.10f, 0.13f, 0.80f);
         c[ImGuiCol_Button] = ImVec4(0.17f, 0.17f, 0.22f, 1.f);
         c[ImGuiCol_ButtonHovered] = ImVec4(0.24f, 0.24f, 0.31f, 1.f);
         c[ImGuiCol_ButtonActive] = ImVec4(0.30f, 0.30f, 0.38f, 1.f);
@@ -87,10 +73,19 @@ namespace Menu {
         c[ImGuiCol_Separator] = ImVec4(0.24f, 0.24f, 0.30f, 1.f);
     }
 
-    // ---------- keybind ----------
-    // Buffer ROTATIVO: VkName() e' chamada varias vezes na MESMA expressao
-    // (ex.: rodape com menu/panic/salvar). Com um buffer unico, os tres "%s"
-    // recebiam o mesmo ponteiro e imprimiam o ultimo valor calculado.
+    // Aplica uma vez por GERACAO de contexto. Marca DEPOIS de aplicar.
+    static void ApplyStyleOnce()
+    {
+        static uint32_t styledGen = 0;
+        const uint32_t gen = Hooks::g_imguiGeneration.load(std::memory_order_acquire);
+        if (gen == styledGen) return;
+        if (!ImGui::GetCurrentContext()) return;
+        ApplyStyle();
+        styledGen = gen;
+    }
+
+    // ---------------------------------------------------------- keybind
+    // Buffer rotativo: VkName() e' chamada varias vezes na MESMA expressao.
     static const char* VkName(int vk)
     {
         static char     s_buf[8][32];
@@ -122,17 +117,24 @@ namespace Menu {
         }
         if (vk >= '0' && vk <= '9') { b[0] = (char)vk; b[1] = 0; return b; }
         if (vk >= 'A' && vk <= 'Z') { b[0] = (char)vk; b[1] = 0; return b; }
-        sprintf_s(b, 32, "0x%02X", vk);
+        _snprintf_s(b, 32, _TRUNCATE, "0x%02X", vk);
         return b;
     }
 
     static int* g_waitKey = nullptr;
-    static bool  g_waitArm = false;   // pula o frame do clique (LBUTTON ainda pode estar down)
+    static bool g_waitArm = false;
+
+    static bool AlgumaTeclaDown() {
+        for (int vk = 1; vk < 256; ++vk)
+            if (GetAsyncKeyState(vk) & 0x8000) return true;
+        return false;
+    }
 
     static void Keybind(const char* label, int* key)
     {
         char buf[96];
-        sprintf_s(buf, "%s: %s", label, (g_waitKey == key) ? "..." : VkName(*key));
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%s: %s",
+            label, (g_waitKey == key) ? "..." : VkName(*key));
 
         if (ImGui::Button(buf, ImVec2(170, 0))) {
             g_waitKey = key;
@@ -141,9 +143,17 @@ namespace Menu {
 
         if (g_waitKey != key) return;
 
-        if (!g_waitArm) { g_waitArm = true; return; }   // arma no frame seguinte
+        // Espera TODAS as teclas subirem: sem isso o proprio clique do botao
+        // (VK_LBUTTON) era capturado no frame seguinte.
+        if (!g_waitArm) {
+            if (AlgumaTeclaDown()) return;
+            g_waitArm = true;
+            return;
+        }
 
-        for (int vk = 1; vk < 256; vk++) {
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) { g_waitKey = nullptr; return; }
+
+        for (int vk = 1; vk < 256; ++vk) {
             if (GetAsyncKeyState(vk) & 0x8000) {
                 *key = vk;
                 g_waitKey = nullptr;
@@ -152,7 +162,7 @@ namespace Menu {
         }
     }
 
-    // ---------- abas ----------
+    // ---------------------------------------------------------- abas
     static void TabAimbot();
     static void TabTrigger();
     static void TabVisual();
@@ -167,11 +177,21 @@ namespace Menu {
         if (!ctx) return;
 
         ApplyStyleOnce();
-        if (!C.menuOpen) return;
+
+        // Janela mantida viva quando fechada: o ImGui recicla janelas nao
+        // submetidas, e sem ini a posicao/tamanho se perdiam.
+        if (!C.menuOpen) {
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.0f);
+            ImGui::SetNextWindowSize(ImVec2(600, 560), ImGuiCond_FirstUseEver);
+            ImGui::Begin("bfi##main", nullptr,
+                ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoBringToFrontOnFocus);
+            ImGui::End();
+            ImGui::PopStyleVar();
+            return;
+        }
 
         ImGui::SetNextWindowSize(ImVec2(600, 560), ImGuiCond_FirstUseEver);
-        if (!ImGui::Begin("bfi##main", &C.menuOpen))
-        {
+        if (!ImGui::Begin("bfi##main", &C.menuOpen)) {
             ImGui::End();
             return;
         }
@@ -249,7 +269,6 @@ namespace Menu {
         ImGui::Checkbox("Triggerbot", &C.triggerbot);
         ImGui::SliderFloat("Delay (ms)", &C.triggerDelay, 0.0f, 300.0f, "%.0f");
 
-        // >>> NOVO: so atira se a mira estiver EM CIMA do alvo.
         ImGui::SliderFloat("Raio da mira (px)", &C.triggerRadius, 0.0f, 60.0f, "%.0f");
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("So atira se o alvo estiver a menos de N pixels\n"
@@ -330,7 +349,6 @@ namespace Menu {
     }
 
     // ------------------------------------------------------------
-    // Item seguro: devolve 'fallback' quando indice fora da faixa OU string nula.
     static const char* ItemOr(const char* const* list, int idx, int count,
         const char* fallback)
     {
@@ -346,7 +364,7 @@ namespace Menu {
         const char* cur = ItemOr(list, *sel, count, vazio);
         bool mudou = false;
         if (ImGui::BeginCombo(label, cur)) {
-            for (int i = 0; i < count; i++) {
+            for (int i = 0; i < count; ++i) {
                 const char* item = (list && list[i]) ? list[i] : "(?)";
                 if (ImGui::Selectable(item, *sel == i)) { *sel = i; mudou = true; }
             }
@@ -389,7 +407,10 @@ namespace Menu {
         ImGui::SameLine();
         if (ImGui::Button("Cancelar") && Dupe::Building()) Dupe::Cancel();
         ImGui::SameLine();
-        if (ImGui::Button("Dump no log")) Unlock::Dump();
+        if (ImGui::Button("Dump no log")) {
+            __try { Unlock::Dump(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] Unlock::Dump"); }
+        }
 
         ImGui::TextDisabled("armas=%d skins=%d chars=%d anexos=%d/%d/%d",
             Dupe::WeaponCount(), Dupe::CamoCount(), Dupe::CharCount(),
@@ -406,15 +427,18 @@ namespace Menu {
         {
             ImGui::SliderInt("Slot do loadout", &C.loadoutSlot, 0, 2);
 
-            int wn = Unlock::WeaponCount();
+            const int wn = Unlock::WeaponCount();
             const char* const* wl = Unlock::WeaponList();
             if (wn > 0 && wl)
                 ComboIdx("Arma", &C.selWeapon, wn, wl, "(nenhuma)");
             else
                 ImGui::TextDisabled("Arma: catalogo vazio (aperte DUPE COMPLETO)");
 
-            for (int s = 0; s < Unlock::AttachSlotCount(); ++s) {
-                int an = Unlock::AttachCount(s);
+            // clamp em kMaxAttach: C.selAttach tem kMaxAttach posicoes e o
+            // AttachSlotCount() vem do jogo.
+            const int slots = Unlock::AttachSlotCount();
+            for (int s = 0; s < slots && s < kMaxAttach; ++s) {
+                const int an = Unlock::AttachCount(s);
                 const char* const* al = Unlock::AttachList(s);
                 ImGui::PushID(s);
                 if (an > 0 && al) {
@@ -431,12 +455,11 @@ namespace Menu {
 
         if (ImGui::CollapsingHeader("Skins", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            int cn = Unlock::CamoCount();
+            const int cn = Unlock::CamoCount();
             const char* const* cl = Unlock::CamoList();
             if (cn > 0 && cl) {
                 if (ComboIdx("Skin / Camo", &C.selCamo, cn, cl, "(nenhuma)")) {
                     C.skinIndex = C.selCamo;
-                    // cl[i] pode ser nulo -> strncpy_s com src nulo e' UB.
                     strncpy_s(C.skinName, sizeof(C.skinName),
                         ItemOr(cl, C.selCamo, cn, ""), _TRUNCATE);
                 }
@@ -451,7 +474,7 @@ namespace Menu {
 
         if (ImGui::CollapsingHeader("Personagens", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            int pn = Unlock::CharCount();
+            const int pn = Unlock::CharCount();
             const char* const* pl = Unlock::CharList();
             if (pn > 0 && pl) {
                 if (ComboIdx("Personagem", &C.selChar, pn, pl, "(nenhum)"))
@@ -492,7 +515,6 @@ namespace Menu {
         ImGui::Checkbox("Watermark", &C.watermark);
         ImGui::Checkbox("Mostrar FPS", &C.fps);
 
-        // >>> NOVO: profiler por passo
         ImGui::Checkbox("Profiler (ms por passo)", &C.showFpsGraph);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Mostra o tempo de CADA passo do tick.\n"
@@ -525,6 +547,5 @@ namespace Menu {
 
 } // namespace Menu
 
-// ---------- aliases de entrada ----------
 void DrawMenu() { Menu::Draw(); }
 void DrawOverlay() { Menu::Draw(); }

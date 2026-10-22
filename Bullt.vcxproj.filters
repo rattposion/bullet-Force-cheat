@@ -126,6 +126,9 @@
     <ClInclude Include="aimbot.h">
       <Filter>core\features.h</Filter>
     </ClInclude>
+    <ClInclude Include="esp.h">
+      <Filter>core\features.h</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="imgui\imgui.cpp">

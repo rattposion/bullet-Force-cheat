@@ -1,31 +1,20 @@
 // ============================================================================
-//  unlock.cpp — bfi (v26)
+//  unlock.cpp — bfi (v25)
 //
-//  >>> v26 (AV contido em GameAssembly+0x406C2A, alvo=0, fase=Unlock):
-//      Diagnostico pelo log de runtime: il2cpp_field_static_get_value em campo
-//      estatico cuja CLASSE nunca teve o bloco de estaticos alocado.
-//      Field::GetStaticFieldAddress = f->parent->static_fields + f->offset;
-//      com static_fields==NULL e offset==0 (primeiro estatico da classe) o
-//      endereco vira 0 e o memcpy do runtime le de 0. Contido pelo __try de
-//      StaticGetSafe (nao houve linha [crash]), mas custa excecao de 1a chance
-//      e faz o campo ser lido como NULL.
-//      Correcao: il2cpp_class_init antes de todo static get/set.
+//  >>> v25 (FPS): o Install() era RETENTADO TODO FRAME enquanto falhava (ex.:
+//      fora de partida) e o FindWeaponArray varre todos os campos do
+//      PlayerScript chamando il2cpp_type_get_name em cada um. Agora o retry e'
+//      no maximo 2x/s. Tambem: Dupe::EnsureLoaded() nao roda mais por frame.
 //
-//  >>> v26 tambem:
-//    U2 CallEquip: o 2o argumento era NULL e o metodo resolvido pode ter argc=2
-//       com parametro de tipo-valor -> Runtime::Invoke faz memcpy de params[1]
-//       (NULL) -> AV em 0. Agora o 2o argumento e' sempre um buffer valido.
-//    U3 InvokeSafe2 devolve sucesso; apos 3 AVs o metodo e' descartado.
-//    U4 strings literais de prefs PINADAS com il2cpp_gchandle_new (p_strNew
-//       devolve objeto sem raiz; um GC deixaria o ponteiro pendurado).
-//    U5 LooksLikeObj/ArrLen usam leitura protegida.
-//    U6 todos os acessos a metadata por wrapper com __try (frames POD-only).
-//    U7 PHASE() granular: o proximo [veh] aponta o sub-passo exato.
-//    U8 o ramo Dupe::Wants() do Tick() roda dentro de __try.
+//  >>> v24: a tela SELECIONE LOADOUT nao le o que pokeamos em memoria. O
+//  loadout de ALFA/BRAVO/CHARLIE vem dos PlayerPrefs do jogo. Entao agora:
+//   1) Resolve UnityEngine.PlayerPrefs e DESCOBRE as chaves de prefs.
+//   2) Escreve o weaponType (chave int) ou o nome da arma (chave string).
+//   3) PROBE 1x o formato de cada chave (int ou string).
 //
-//  >>> v25 (FPS): o Install() era RETENTADO TODO FRAME enquanto falhava e o
-//      FindWeaponArray varre todos os campos do PlayerScript. Retry 2x/s.
-//  >>> v24: a tela SELECIONE LOADOUT le dos PlayerPrefs do jogo.
+//  >>> v23: reaplica a cada 4s (sobrevive a respawn) e LOGA o readback [r].
+//  >>> v22: as escritas do loadout sao uma por FRAME, logadas "[w] passo N/M".
+//  v21 mantido: is_valuetype no ELEMENTO do array (nao na classe do array).
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -42,7 +31,7 @@
 #include <string>
 #include <vector>
 
-#define BFI_UNLOCK_VER "v26"
+#define BFI_UNLOCK_VER "v25"
 
 namespace Unlock {
 
@@ -72,6 +61,7 @@ namespace Unlock {
     static int   g_charLen = 0;
     static bool  g_charIsList = false;
 
+    // >>> v25: throttle do retry de Install + guarda do EnsureLoaded
     static ULONGLONG g_nextInstallTry = 0;
     static bool      g_dupeEnsured = false;
 
@@ -88,14 +78,6 @@ namespace Unlock {
     typedef Il2CppClass* (*fn_class_from_type)(const Il2CppType*);
     typedef Il2CppType* (*fn_class_get_type)(Il2CppClass*);
     typedef void* (*fn_type_get_object)(const Il2CppType*);
-    typedef void     (*fn_class_init)(Il2CppClass*);
-    typedef uint32_t(*fn_gchandle_new)(Il2CppObject*, bool);
-
-    // >>> v24: dominio / PlayerPrefs
-    typedef void* (*fn_dom_get)();
-    typedef const void** (*fn_dom_asms)(void*, size_t*);
-    typedef void* (*fn_asm_image)(const void*);
-    typedef void* (*fn_str_new)(const char*);
 
     static fn_elem p_elem = nullptr;
     static fn_arrlen p_arrlen = nullptr;
@@ -109,16 +91,7 @@ namespace Unlock {
     static fn_class_from_type p_classFromType = nullptr;
     static fn_class_get_type p_classGetType = nullptr;
     static fn_type_get_object p_typeGetObject = nullptr;
-    // >>> v26
-    static fn_class_init p_classInit = nullptr;
-    static fn_gchandle_new p_gcHandleNew = nullptr;
-    // >>> v24
-    static fn_dom_get   p_domGet = nullptr;
-    static fn_dom_asms  p_domAsms = nullptr;
-    static fn_asm_image p_asmImage = nullptr;
-    static fn_str_new   p_strNew = nullptr;
 
-    // Resolve TUDO de uma vez. p_* de metadata + dominio + prefs.
     static void ResolveExtra() {
         static bool done = false;
         if (done) return;
@@ -137,15 +110,14 @@ namespace Unlock {
         p_classFromType = (fn_class_from_type)GetProcAddress(ga, "il2cpp_class_from_type");
         p_classGetType = (fn_class_get_type)GetProcAddress(ga, "il2cpp_class_get_type");
         p_typeGetObject = (fn_type_get_object)GetProcAddress(ga, "il2cpp_type_get_object");
-        p_classInit = (fn_class_init)GetProcAddress(ga, "il2cpp_class_init");
-        p_gcHandleNew = (fn_gchandle_new)GetProcAddress(ga, "il2cpp_gchandle_new");
-        p_domGet = (fn_dom_get)GetProcAddress(ga, "il2cpp_domain_get");
-        p_domAsms = (fn_dom_asms)GetProcAddress(ga, "il2cpp_domain_get_assemblies");
-        p_asmImage = (fn_asm_image)GetProcAddress(ga, "il2cpp_assembly_get_image");
-        p_strNew = (fn_str_new)GetProcAddress(ga, "il2cpp_string_new");
-        Log("[unlock] procs: class_init=%d gchandle=%d prefs=%d",
-            (int)(p_classInit != nullptr), (int)(p_gcHandleNew != nullptr),
-            (int)(p_domGet && p_domAsms && p_asmImage && p_strNew));
+    }
+
+    static void* TypeGetObjectSafe(Il2CppType* t) {
+        if (!t || !p_typeGetObject) return nullptr;
+        void* r = nullptr;
+        __try { r = p_typeGetObject(t); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
+        return r;
     }
 
     static bool Plausible(const void* p) {
@@ -158,179 +130,12 @@ namespace Unlock {
         if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
         return true;
     }
-
-    // =====================================================================
-    //  ACESSO PROTEGIDO A METADATA (v26)
-    //
-    //  Toda chamada ao runtime passa por aqui. Motivo: metadata em
-    //  carregamento, classe generica nao inflada e classe sem static_fields
-    //  alocado fazem o runtime AVar. Todos os frames destes wrappers sao
-    //  POD-only, entao nenhum deles pode dar C2712.
-    // =====================================================================
-    static void SClassInit(Il2CppClass* k) {
-        if (!k || !p_classInit) return;
-        __try { p_classInit(k); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-    static Il2CppClass* SParent(Il2CppClass* c) {
-        if (!c) return nullptr;
-        Il2CppClass* r = nullptr;
-        __try { r = il2cpp_class_get_parent(c); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static const char* SClassName(Il2CppClass* c) {
-        if (!c) return nullptr;
-        const char* r = nullptr;
-        __try { r = il2cpp_class_get_name(c); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static const char* STypeName(const Il2CppType* t) {
-        if (!t || !il2cpp_type_get_name) return nullptr;
-        const char* r = nullptr;
-        __try { r = il2cpp_type_get_name(t); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static FieldInfo* SFieldFromName(Il2CppClass* c, const char* n) {
-        if (!c || !n) return nullptr;
-        FieldInfo* r = nullptr;
-        __try { r = il2cpp_class_get_field_from_name(c, n); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static FieldInfo* SFields(Il2CppClass* c, void** it) {
-        if (!c || !it) return nullptr;
-        FieldInfo* r = nullptr;
-        __try { r = il2cpp_class_get_fields(c, it); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; *it = nullptr; }
-        return r;
-    }
-    static MethodInfo* SMethodFromName(Il2CppClass* c, const char* n, int argc) {
-        if (!c || !n) return nullptr;
-        MethodInfo* r = nullptr;
-        __try { r = il2cpp_class_get_method_from_name(c, n, argc); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static uint32_t SFieldOff(FieldInfo* f) {
-        if (!f) return 0;
-        size_t r = 0;
-        __try { r = il2cpp_field_get_offset(f); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = 0; }
-        return (uint32_t)r;
-    }
-    static const Il2CppType* SFieldType(FieldInfo* f) {
-        if (!f) return nullptr;
-        const Il2CppType* r = nullptr;
-        __try { r = il2cpp_field_get_type(f); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static const char* SFieldName(FieldInfo* f) {
-        if (!f) return nullptr;
-        const char* r = nullptr;
-        __try { r = il2cpp_field_get_name(f); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static Il2CppClass* SClass(void* o) {
-        if (!o) return nullptr;
-        Il2CppClass* r = nullptr;
-        __try { r = il2cpp_object_get_class((Il2CppObject*)o); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static Il2CppClass* SClassFromType(const Il2CppType* t) {
-        if (!t || !p_classFromType) return nullptr;
-        Il2CppClass* r = nullptr;
-        __try { r = p_classFromType(t); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static Il2CppClass* SElemClass(Il2CppClass* k) {
-        if (!k || !p_elem) return nullptr;
-        Il2CppClass* r = nullptr;
-        __try { r = p_elem(k); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static bool SIsValue(Il2CppClass* k) {
-        if (!k || !p_isValue) return false;
-        bool r = false;
-        __try { r = p_isValue(k); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = false; }
-        return r;
-    }
-    static Il2CppType* SClassGetType(Il2CppClass* k) {
-        if (!k || !p_classGetType) return nullptr;
-        Il2CppType* r = nullptr;
-        __try { r = p_classGetType(k); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static void* STypeGetObject(Il2CppType* t) {
-        if (!t || !p_typeGetObject) return nullptr;
-        void* r = nullptr;
-        __try { r = p_typeGetObject(t); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static void* SClassImage(Il2CppClass* k) {
-        if (!k || !p_classImage) return nullptr;
-        void* r = nullptr;
-        __try { r = p_classImage(k); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static size_t SImageCount(void* img) {
-        if (!img || !p_imgCount) return 0;
-        size_t r = 0;
-        __try { r = p_imgCount(img); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = 0; }
-        return r;
-    }
-    static Il2CppClass* SImageClass(void* img, size_t i) {
-        if (!img || !p_imgClass) return nullptr;
-        Il2CppClass* r = nullptr;
-        __try { r = p_imgClass(img, i); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static void* SStrNew(const char* s) {
-        if (!s || !p_strNew) return nullptr;
-        void* r = nullptr;
-        __try { r = p_strNew(s); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
-        return r;
-    }
-    static uint32_t SGcHandleNew(void* o) {
-        if (!o || !p_gcHandleNew) return 0;
-        uint32_t r = 0;
-        __try { r = p_gcHandleNew((Il2CppObject*)o, false); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { r = 0; }
-        return r;
-    }
-    // FieldInfo { const char* name; Il2CppClass* parent; ... } -> parent em +8.
-    // Se o layout mudar, Plausible reprova e caimos no comportamento antigo.
-    static Il2CppClass* SFieldParent(FieldInfo* f) {
-        if (!f) return nullptr;
-        Il2CppClass* k = SafeRead<Il2CppClass*>((uintptr_t)f + 8, nullptr);
-        return Plausible(k) ? k : nullptr;
-    }
-
     static bool LooksLikeObj(const void* p) {
         if (!Plausible(p)) return false;
-        Il2CppClass* k = SafeRead<Il2CppClass*>((uintptr_t)p, nullptr);
-        return Plausible(k);
+        return Plausible(*(Il2CppClass**)p);
     }
     static bool IsStatic(FieldInfo* f) {
-        if (!p_fieldFlags || !f) return false;
-        uint32_t fl = 0;
-        __try { fl = p_fieldFlags(f); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-        return (fl & 0x10u) != 0;
+        return (p_fieldFlags && f) ? ((p_fieldFlags(f) & 0x10) != 0) : false;
     }
 
     static void CStr(void* s, char* out, size_t n) {
@@ -355,12 +160,7 @@ namespace Unlock {
 
     static int ArrLen(Il2CppArray* a) {
         if (!a) return 0;
-        if (p_arrlen) {
-            uint32_t r = 0;
-            __try { r = p_arrlen(a); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { r = 0; }
-            return (int)r;
-        }
+        if (p_arrlen) return (int)p_arrlen(a);
         return SafeRead<int>((uintptr_t)a + 0x18, 0);
     }
     static void* ArrElem(Il2CppArray* a, int i) {
@@ -396,26 +196,16 @@ namespace Unlock {
         return SafeRead<int>((uintptr_t)items + 0x20 + (size_t)i * 4, -1);
     }
 
-    // ---------------------------------------------------------------- estaticos
-    // >>> v26: o AV de 0x406C2A nasce aqui. il2cpp_field_static_get_value faz
-    //     address = field->parent->static_fields + field->offset. Classe nunca
-    //     inicializada => static_fields NULL; primeiro estatico => offset 0 =>
-    //     memcpy de 0. SClassInit no dono resolve.
-    static void StaticGetSafeFrom(FieldInfo* f, Il2CppClass* owner, void** out) {
+    static void StaticGetSafe(FieldInfo* f, void** out) {
         if (out) *out = nullptr;
         if (!f || !p_fieldStaticGet || !out) return;
-        SClassInit(owner ? owner : SFieldParent(f));
         unsigned char buf[256];
-        memset(buf, 0, sizeof(buf));
         __try { p_fieldStaticGet(f, buf); }
         __except (EXCEPTION_EXECUTE_HANDLER) { return; }
         memcpy(out, buf, sizeof(void*));
     }
-    static void StaticGetSafe(FieldInfo* f, void** out) { StaticGetSafeFrom(f, nullptr, out); }
-
     static void StaticSetInt(FieldInfo* f, int value, int isByte) {
         if (!f || !p_fieldStaticSet) return;
-        SClassInit(SFieldParent(f));
         unsigned char buf[64];
         memset(buf, 0, sizeof(buf));
         if (isByte) buf[0] = (unsigned char)(value & 0xFF);
@@ -423,19 +213,10 @@ namespace Unlock {
         __try { p_fieldStaticSet(f, buf); }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
-
     static void InvokeSafe(MethodInfo* m, void* obj, void** args) {
         if (!m) return;
         __try { il2cpp_runtime_invoke(m, obj, args, nullptr); }
         __except (EXCEPTION_EXECUTE_HANDLER) { Log("[unlock] AV no invoke"); }
-    }
-    // >>> v26: variante com status, para poder DESISTIR de um metodo que AVa.
-    static bool InvokeSafe2(MethodInfo* m, void* obj, void** args) {
-        if (!m) return false;
-        bool ok = false;
-        __try { il2cpp_runtime_invoke(m, obj, args, nullptr); ok = true; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
-        return ok;
     }
 
     static Dupe::Item MkItem(int v, const std::string& n, int aux = 0) {
@@ -465,26 +246,26 @@ namespace Unlock {
     // =============================================================== descoberta
     static uint32_t FieldOffNamed(Il2CppClass* k, const char* name) {
         if (!k) return 0;
-        for (Il2CppClass* c = k; c; c = SParent(c)) {
-            FieldInfo* f = SFieldFromName(c, name);
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+            FieldInfo* f = il2cpp_class_get_field_from_name(c, name);
             if (!f || IsStatic(f)) continue;
-            uint32_t off = SFieldOff(f);
+            uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
             if (off) return off;
         }
         return 0;
     }
     static uint32_t FieldOffByType(Il2CppClass* k, const char* typeKey) {
         if (!k) return 0;
-        for (Il2CppClass* c = k; c; c = SParent(c)) {
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
             void* it = nullptr;
             for (;;) {
-                FieldInfo* f = SFields(c, &it);
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
                 if (!f) break;
                 if (IsStatic(f)) continue;
-                const Il2CppType* t = SFieldType(f);
-                const char* tn = STypeName(t);
+                const Il2CppType* t = il2cpp_field_get_type(f);
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
                 if (!tn || !strstr(tn, typeKey)) continue;
-                uint32_t off = SFieldOff(f);
+                uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
                 if (off) return off;
             }
         }
@@ -492,20 +273,19 @@ namespace Unlock {
     }
 
     static bool FindWeaponArray(void* p, uint32_t& outOff, void*& outArr, int& outLen) {
-        PHASE("unlock.findarr");
         outOff = 0; outArr = nullptr; outLen = 0;
         if (!p || !SDK::kPlayerScript || !SDK::kGunStats) return false;
         uint32_t bestOff = 0; void* bestArr = nullptr; int bestLen = 0;
-        for (Il2CppClass* c = SDK::kPlayerScript; c; c = SParent(c)) {
+        for (Il2CppClass* c = SDK::kPlayerScript; c; c = il2cpp_class_get_parent(c)) {
             void* it = nullptr;
             for (;;) {
-                FieldInfo* f = SFields(c, &it);
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
                 if (!f) break;
                 if (IsStatic(f)) continue;
-                const Il2CppType* t = SFieldType(f);
-                const char* tn = STypeName(t);
+                const Il2CppType* t = il2cpp_field_get_type(f);
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
                 if (!tn || !strstr(tn, "[]")) continue;
-                uint32_t off = SFieldOff(f);
+                uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
                 if (!off) continue;
                 void* a = SafeRead<void*>((uintptr_t)p + off, nullptr);
                 if (!LooksLikeObj(a)) continue;
@@ -513,9 +293,9 @@ namespace Unlock {
                 if (len < 8 || len > 512) continue;
                 void* e0 = ArrElem((Il2CppArray*)a, 0);
                 if (!LooksLikeObj(e0)) continue;
-                Il2CppClass* k = SClass(e0);
+                Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)e0);
                 bool ok = (k == SDK::kGunStats);
-                for (Il2CppClass* q = k; !ok && q; q = SParent(q))
+                for (Il2CppClass* q = k; !ok && q; q = il2cpp_class_get_parent(q))
                     if (q == SDK::kGunStats) ok = true;
                 if (!ok) continue;
                 if (len > bestLen) { bestOff = off; bestArr = a; bestLen = len; }
@@ -595,26 +375,25 @@ namespace Unlock {
         if (g_loCN >= 160 || !f) return;
         LoCand& c = g_loC[g_loCN++];
         c.kind = kind; c.baseF = baseF; c.basePtr = basePtr;
-        c.off = SFieldOff(f);
+        c.off = (uint32_t)il2cpp_field_get_offset(f);
         c.f = f; c.type = type; c.useType = useType; c.slot = slot;
         strncpy_s(c.cls, cls ? cls : "?", _TRUNCATE);
-        const char* fn = SFieldName(f);
-        strncpy_s(c.name, fn ? fn : "?", _TRUNCATE);
+        strncpy_s(c.name, il2cpp_field_get_name(f), _TRUNCATE);
     }
 
     static bool FindElemSlotField(void* elemObj, int slot, int& offOut, int& typeOut, int& useTypeOut) {
         offOut = 0; typeOut = 0; useTypeOut = 0;
         if (!LooksLikeObj(elemObj)) return false;
-        Il2CppClass* k = SClass(elemObj);
+        Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)elemObj);
         if (!k) return false;
-        for (Il2CppClass* c = k; c; c = SParent(c)) {
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
             void* it = nullptr;
             for (;;) {
-                FieldInfo* f = SFields(c, &it);
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
                 if (!f) break;
                 if (IsStatic(f)) continue;
-                const Il2CppType* t = SFieldType(f);
-                const char* tn = STypeName(t);
+                const Il2CppType* t = il2cpp_field_get_type(f);
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
                 if (!tn) continue;
                 char tl[64]; Lower(tl, sizeof(tl), tn);
                 if (strstr(tl, "[]")) continue;
@@ -622,19 +401,17 @@ namespace Unlock {
                 if (strstr(tl, "int32")) { ty = 2; ut = 0; }
                 else if (strstr(tl, "byte")) { ty = 1; ut = 0; }
                 else if (p_classFromType && p_isValue) {
-                    Il2CppClass* ek = SClassFromType(t);
-                    if (!ek || !SIsValue(ek)) continue;
+                    Il2CppClass* ek = p_classFromType(t);
+                    if (!ek || !p_isValue(ek)) continue;
                     if (strstr(tl, "single") || strstr(tl, "double") ||
                         strstr(tl, "boolean") || strstr(tl, "string")) continue;
                     ty = 2; ut = 1;
                 }
                 else continue;
-                const char* fn = SFieldName(f);
-                if (!fn) continue;
-                char nl[64]; Lower(nl, sizeof(nl), fn);
+                char nl[64]; Lower(nl, sizeof(nl), il2cpp_field_get_name(f));
                 if (NameReject(nl)) continue;
                 if (SlotFromName(nl) != slot) continue;
-                uint32_t off = SFieldOff(f);
+                uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
                 if (!off) continue;
                 offOut = (int)off; typeOut = ty; useTypeOut = ut;
                 return true;
@@ -650,13 +427,13 @@ namespace Unlock {
         if (strstr(tl, "byte")) { type = 6; useType = 0; return true; }
         if (strstr(tl, "gunstats")) { type = 4; useType = 0; return true; }
         if (!p_classFromType || !p_isValue || !p_elem) return false;
-        Il2CppClass* arrCls = SClassFromType(t);
+        Il2CppClass* arrCls = p_classFromType(t);
         if (!arrCls) return false;
-        Il2CppClass* elemCls = SElemClass(arrCls);
+        Il2CppClass* elemCls = p_elem(arrCls);
         if (!elemCls) return false;
-        const char* en = SClassName(elemCls);
+        const char* en = il2cpp_class_get_name(elemCls);
         char el[64]; Lower(el, sizeof(el), en ? en : "");
-        if (SIsValue(elemCls)) {
+        if (p_isValue(elemCls)) {
             if (strstr(el, "vector") || strstr(el, "color") || strstr(el, "quaternion") ||
                 strstr(el, "rect") || strstr(el, "matrix") || strstr(el, "single") ||
                 strstr(el, "double") || strstr(el, "boolean")) return false;
@@ -671,9 +448,9 @@ namespace Unlock {
 
     static void AddCandField(int kind, void* instBase, void* basePtr, FieldInfo* baseF,
         FieldInfo* f, const char* cls, bool isStaticScope) {
-        const Il2CppType* t = SFieldType(f);
-        const char* tn = STypeName(t);
-        const char* fn = SFieldName(f);
+        const Il2CppType* t = il2cpp_field_get_type(f);
+        const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+        const char* fn = il2cpp_field_get_name(f);
         if (!tn || !fn) return;
         char tl[96]; Lower(tl, sizeof(tl), tn);
         char nl[64]; Lower(nl, sizeof(nl), fn);
@@ -689,8 +466,8 @@ namespace Unlock {
         else if (strstr(tl, "int32")) { type = 2; useType = 0; }
         else if (strstr(tl, "byte")) { type = 1; useType = 0; }
         else if (p_classFromType && p_isValue) {
-            Il2CppClass* ek = SClassFromType(t);
-            if (!ek || !SIsValue(ek)) return;
+            Il2CppClass* ek = p_classFromType(t);
+            if (!ek || !p_isValue(ek)) return;
             if (strstr(tl, "single") || strstr(tl, "double") ||
                 strstr(tl, "boolean") || strstr(tl, "string")) return;
             type = 2; useType = 1;
@@ -703,7 +480,7 @@ namespace Unlock {
             if (slot < 0) return;
         }
         else {
-            uint32_t off = SFieldOff(f);
+            uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
             void* a = nullptr;
             if (isStaticScope) StaticGetSafe(f, &a);
             else {
@@ -720,12 +497,12 @@ namespace Unlock {
     static void ScanInstanceFields(int kind, void* instBase, void* basePtr, FieldInfo* baseF,
         const char* cls) {
         if (!instBase) return;
-        Il2CppClass* k = SClass(instBase);
+        Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)instBase);
         if (!k) return;
-        for (Il2CppClass* c = k; c; c = SParent(c)) {
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
             void* it = nullptr;
             for (;;) {
-                FieldInfo* f = SFields(c, &it);
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
                 if (!f) break;
                 if (IsStatic(f)) continue;
                 AddCandField(kind, instBase, basePtr, baseF, f, cls, false);
@@ -736,35 +513,33 @@ namespace Unlock {
     static void DumpObjFields(void* o, const char* tag, int maxFields);
 
     static void ScanLoadoutSingletons() {
-        PHASE("unlock.singletons");
         if (!p_classImage || !p_imgCount || !p_imgClass || !SDK::kPlayerScript) return;
-        void* img = SClassImage(SDK::kPlayerScript);
+        void* img = p_classImage(SDK::kPlayerScript);
         if (!img) return;
-        size_t n = SImageCount(img);
+        size_t n = p_imgCount(img);
         if (n > 60000) n = 60000;
         int found = 0;
         for (size_t i = 0; i < n && found < 40; ++i) {
-            Il2CppClass* k = SImageClass(img, i);
+            Il2CppClass* k = p_imgClass(img, i);
             if (!k) continue;
-            const char* cn = SClassName(k);
+            const char* cn = il2cpp_class_get_name(k);
             if (!cn || !strstr(cn, "Loadout")) continue;
             ++found;
-            for (Il2CppClass* c = k; c; c = SParent(c)) {
+            for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
                 void* it = nullptr;
                 for (;;) {
-                    FieldInfo* f = SFields(c, &it);
+                    FieldInfo* f = il2cpp_class_get_fields(c, &it);
                     if (!f) break;
                     if (!IsStatic(f)) continue;
-                    const Il2CppType* t = SFieldType(f);
-                    const char* tn = STypeName(t);
+                    const Il2CppType* t = il2cpp_field_get_type(f);
+                    const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
                     if (!tn) continue;
                     if (strstr(tn, "[]") || strstr(tn, "List<")) continue;
                     if (!strstr(tn, cn)) continue;
                     void* obj = nullptr;
-                    StaticGetSafeFrom(f, c, &obj);
+                    StaticGetSafe(f, &obj);
                     if (!LooksLikeObj(obj)) continue;
-                    const char* fn = SFieldName(f);
-                    Log("[lod] STATIC OBJ %s::%s %s = %p", cn, fn ? fn : "?", tn, obj);
+                    Log("[lod] STATIC OBJ %s::%s %s = %p", cn, il2cpp_field_get_name(f), tn, obj);
                     if (found <= 2) DumpObjFields(obj, cn, 24);
                     ScanInstanceFields(3, obj, nullptr, f, cn);
                 }
@@ -776,16 +551,14 @@ namespace Unlock {
         outLen = 0;
         if (!k || !p_classGetType || !p_typeGetObject) return nullptr;
         Il2CppClass* oc = nullptr;
-        for (Il2CppClass* c = k; c; c = SParent(c)) {
-            const char* n = SClassName(c);
-            if (n && strcmp(n, "Object") == 0) { oc = c; break; }
-        }
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c))
+            if (strcmp(il2cpp_class_get_name(c), "Object") == 0) { oc = c; break; }
         if (!oc) return nullptr;
-        MethodInfo* fot = SMethodFromName(oc, "FindObjectsOfType", 1);
+        MethodInfo* fot = il2cpp_class_get_method_from_name(oc, "FindObjectsOfType", 1);
         if (!fot) return nullptr;
-        Il2CppType* t = SClassGetType(k);
+        Il2CppType* t = p_classGetType(k);
         if (!t) return nullptr;
-        void* typeObj = STypeGetObject(t);
+        void* typeObj = TypeGetObjectSafe(t);
         if (!typeObj) return nullptr;
         void* args[1] = { typeObj };
         void* arr = nullptr;
@@ -797,12 +570,11 @@ namespace Unlock {
     }
 
     static void ScanLoadoutContainers() {
-        PHASE("unlock.containers");
         static const char* names[] = { "PlayerLoadoutContainer", "DefaultLoadoutLoader" };
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
             Il2CppClass* k = SDK::FindClass(names[i]);
             if (!k) continue;
-            const char* kn = SClassName(k);
+            const char* kn = il2cpp_class_get_name(k);
             if (!kn || strcmp(kn, names[i]) != 0) continue;
             int len = 0;
             void* arr = FindObjsOfType(k, len);
@@ -815,34 +587,32 @@ namespace Unlock {
     }
 
     static void ScanLoadoutGlobals() {
-        PHASE("unlock.globals");
         if (!p_classImage || !p_imgCount || !p_imgClass || !SDK::kPlayerScript) return;
-        void* img = SClassImage(SDK::kPlayerScript);
+        void* img = p_classImage(SDK::kPlayerScript);
         if (!img) return;
-        size_t n = SImageCount(img);
+        size_t n = p_imgCount(img);
         if (n > 60000) n = 60000;
         for (size_t i = 0; i < n; ++i) {
-            Il2CppClass* k = SImageClass(img, i);
+            Il2CppClass* k = p_imgClass(img, i);
             if (!k) continue;
-            const char* cn = SClassName(k);
+            const char* cn = il2cpp_class_get_name(k);
             if (!cn) continue;
             const bool nameHit = (strstr(cn, "Loadout") || strstr(cn, "Class") ||
                 strstr(cn, "Slot") || strstr(cn, "Profile") ||
                 strstr(cn, "PlayerData") || strstr(cn, "WeaponData"));
-            for (Il2CppClass* c = k; c; c = SParent(c)) {
+            for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
                 void* it = nullptr;
                 for (;;) {
-                    FieldInfo* f = SFields(c, &it);
+                    FieldInfo* f = il2cpp_class_get_fields(c, &it);
                     if (!f) break;
                     if (!IsStatic(f)) continue;
-                    const Il2CppType* t = SFieldType(f);
-                    const char* tn = STypeName(t);
+                    const Il2CppType* t = il2cpp_field_get_type(f);
+                    const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
                     if (!tn) continue;
                     const bool isArr = (strstr(tn, "[]") != nullptr);
                     if (!isArr && !nameHit) continue;
                     void* v = nullptr;
-                    // >>> v26: passa o DONO para o class_init sair daqui.
-                    StaticGetSafeFrom(f, c, &v);
+                    StaticGetSafe(f, &v);
                     if (!LooksLikeObj(v)) continue;
                     if (isArr) {
                         int len = ArrLen((Il2CppArray*)v);
@@ -862,7 +632,6 @@ namespace Unlock {
         if (!SDK::kPlayerScript || !SDK::g_localPlayer) return;
         g_loDone = true;
         g_loCN = 0;
-        PHASE("unlock.scan");
         ScanInstanceFields(0, SDK::g_localPlayer, nullptr, nullptr, "PlayerScript");
         void* fv = FpsGunView();
         if (fv) ScanInstanceFields(2, fv, nullptr, nullptr, "FirstPersonGunView");
@@ -1021,18 +790,18 @@ namespace Unlock {
             for (int i = 0; i < n; ++i) if (arr[i] == (int)off) return;
             if (n < 4) arr[n++] = (int)off;
             };
-        for (Il2CppClass* c = SDK::kPlayerScript; c; c = SParent(c)) {
+        for (Il2CppClass* c = SDK::kPlayerScript; c; c = il2cpp_class_get_parent(c)) {
             void* it = nullptr;
             for (;;) {
-                FieldInfo* f = SFields(c, &it);
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
                 if (!f) break;
                 if (IsStatic(f)) continue;
-                const Il2CppType* t = SFieldType(f);
-                const char* tn = STypeName(t);
+                const Il2CppType* t = il2cpp_field_get_type(f);
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
                 if (!tn || (!strstr(tn, "Int32") && !strstr(tn, "Int64"))) continue;
-                const char* fn = SFieldName(f);
+                const char* fn = il2cpp_field_get_name(f);
                 if (!fn) continue;
-                uint32_t off = SFieldOff(f);
+                uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
                 if (!off) continue;
                 for (int q = 0; q < 4; ++q) if (_stricmp(fn, moneyKeys[q]) == 0) addOff(g_moneyOff, g_moneyN, off);
                 for (int q = 0; q < 4; ++q) if (_stricmp(fn, rankKeys[q]) == 0) addOff(g_rankOff, g_rankN, off);
@@ -1050,14 +819,9 @@ namespace Unlock {
             for (int i = 0; i < g_rankN; ++i) SafeWrite<int>(p + g_rankOff[i], C.unlockLevel);
     }
 
-    // ------------------------------------------------------------------ equip
     static MethodInfo* g_mEquip = nullptr;
     static bool        g_equipResolved = false;
-    static bool        g_equipIsStatic = false;
-    static int         g_equipArgc = 0;
-    static bool        g_equipArg2Value = false;
     static int         g_lastEquip = -2;
-    static int         g_equipFails = 0;
 
     static void ResolveEquipMethod() {
         if (g_equipResolved) return;
@@ -1071,73 +835,40 @@ namespace Unlock {
             "SetSecondary", "SetGadget", "Equip", "SetIndex", "SetWeaponIndex"
         };
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !g_mEquip; ++i) {
-            for (Il2CppClass* c = SDK::kPlayerScript; c && !g_mEquip; c = SParent(c)) {
+            for (Il2CppClass* c = SDK::kPlayerScript; c && !g_mEquip; c = il2cpp_class_get_parent(c)) {
                 for (int argc = 1; argc <= 2 && !g_mEquip; ++argc) {
-                    MethodInfo* m = SMethodFromName(c, names[i], argc);
-                    if (!m) continue;
-                    g_mEquip = m;
-                    g_equipArgc = argc;
-                    g_equipArg2Value = false;
-                    uint32_t mfl = 0;
-                    __try { mfl = il2cpp_method_get_flags ? il2cpp_method_get_flags(m, nullptr) : 0; }
-                    __except (EXCEPTION_EXECUTE_HANDLER) { mfl = 0; }
-                    g_equipIsStatic = ((mfl & 0x10u) != 0u);
-                    if (argc == 2) {
-                        // >>> v26: saber o TIPO do 2o parametro decide como
-                        //     preencher o argumento. Antes era sempre nullptr e
-                        //     um parametro de tipo-valor faz o Runtime::Invoke
-                        //     ler de NULL.
-                        const Il2CppType* p1 = nullptr;
-                        __try { p1 = il2cpp_method_get_param(m, 1); }
-                        __except (EXCEPTION_EXECUTE_HANDLER) { p1 = nullptr; }
-                        const char* tn = STypeName(p1);
-                        char tl[64]; Lower(tl, sizeof(tl), tn ? tn : "");
-                        const bool isRef = (strstr(tl, "string") || strstr(tl, "class") ||
-                            strstr(tl, "object") || strstr(tl, "[]"));
-                        g_equipArg2Value = !isRef;
-                        Log("[unlock] equip: %s argc=2 static=%d param1=%s -> %s",
-                            names[i], (int)g_equipIsStatic, tn ? tn : "?",
-                            isRef ? "REFERENCIA (mando objeto vazio)" : "TIPO-VALOR (mando buffer zerado)");
-                    }
-                    else {
-                        Log("[unlock] equip: %s argc=1 static=%d", names[i], (int)g_equipIsStatic);
-                    }
+                    MethodInfo* m = il2cpp_class_get_method_from_name(c, names[i], argc);
+                    if (m) { g_mEquip = m; Log("[unlock] equip: %s argc=%d", names[i], argc); }
                 }
             }
         }
-        if (!g_mEquip) Log("[unlock] equip: NENHUM metodo casou — equip nao sera chamado");
     }
 
     static void CallEquip(int weaponIdx) {
         if (!g_mEquip || !SDK::g_localPlayer) return;
-        PHASE("unlock.equip");
         union { int i; long long l; } v;
         v.l = 0; v.i = weaponIdx;
-
-        // >>> v26: o 2o argumento e' SEMPRE um endereco valido.
-        //     tipo-valor  -> buffer zerado (o runtime copia sizeof(param))
-        //     referencia  -> ponteiro para um objeto vazio real
-        unsigned char arg2[16];
-        memset(arg2, 0, sizeof(arg2));
-        if (g_equipArgc == 2 && !g_equipArg2Value) {
-            void* s = SStrNew("");
-            if (s) memcpy(arg2, &s, sizeof(void*));
-        }
-        void* args[2] = { &v, arg2 };
-        void* obj = g_equipIsStatic ? nullptr : SDK::g_localPlayer;
-
-        if (!InvokeSafe2(g_mEquip, obj, args)) {
-            if (++g_equipFails >= 3) {
-                Log("[unlock] equip: 3 AVs seguidos em %p — desistindo", (void*)g_mEquip);
-                g_mEquip = nullptr;
-            }
-        }
-        else g_equipFails = 0;
+        void* args[2] = { &v, nullptr };
+        InvokeSafe(g_mEquip, SDK::g_localPlayer, args);
     }
 
     // =====================================================================
     //  v24 — PlayerPrefs (a tela SELECIONE LOADOUT le dos prefs do jogo)
     // =====================================================================
+    typedef void* (*fn_dom_get)();
+    typedef const void** (*fn_dom_asms)(void*, size_t*);
+    typedef void* (*fn_asm_image)(const void*);
+    typedef size_t(*fn_img_cnt2)(const void*);
+    typedef Il2CppClass* (*fn_img_cls2)(const void*, size_t);
+    typedef void* (*fn_str_new)(const char*);
+
+    static fn_dom_get   p_domGet = nullptr;
+    static fn_dom_asms  p_domAsms = nullptr;
+    static fn_asm_image p_asmImage = nullptr;
+    static fn_img_cnt2  p_imgCnt = nullptr;
+    static fn_img_cls2  p_imgCls = nullptr;
+    static fn_str_new   p_strNew = nullptr;
+
     static Il2CppClass* g_ppCls = nullptr;
     static MethodInfo* g_ppSetInt = nullptr;
     static MethodInfo* g_ppGetInt = nullptr;
@@ -1158,47 +889,52 @@ namespace Unlock {
         return r;
     }
 
-    static void ResolvePrefsProcs() { ResolveExtra(); }
+    static void ResolvePrefsProcs() {
+        static bool done = false;
+        if (done) return;
+        done = true;
+        HMODULE ga = GetModuleHandleA("GameAssembly.dll");
+        if (!ga) return;
+        p_domGet = (fn_dom_get)GetProcAddress(ga, "il2cpp_domain_get");
+        p_domAsms = (fn_dom_asms)GetProcAddress(ga, "il2cpp_domain_get_assemblies");
+        p_asmImage = (fn_asm_image)GetProcAddress(ga, "il2cpp_assembly_get_image");
+        p_imgCnt = (fn_img_cnt2)GetProcAddress(ga, "il2cpp_image_get_class_count");
+        p_imgCls = (fn_img_cls2)GetProcAddress(ga, "il2cpp_image_get_class");
+        p_strNew = (fn_str_new)GetProcAddress(ga, "il2cpp_string_new");
+    }
 
     static bool ResolvePlayerPrefs() {
         if (g_ppTried) return g_ppOk;
         g_ppTried = true;
-        PHASE("unlock.ppresolve");
-        ResolveExtra();
-        if (!p_domGet || !p_domAsms || !p_asmImage || !p_imgCount || !p_imgClass) {
+        ResolvePrefsProcs();
+        if (!p_domGet || !p_domAsms || !p_asmImage || !p_imgCnt || !p_imgCls) {
             Log("[p] procs de dominio ausentes");
             return false;
         }
-        void* dom = nullptr;
-        __try { dom = p_domGet(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { dom = nullptr; }
+        void* dom = p_domGet();
         if (!dom) return false;
         size_t n = 0;
-        const void** asms = nullptr;
-        __try { asms = p_domAsms(dom, &n); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { asms = nullptr; }
+        const void** asms = p_domAsms(dom, &n);
         if (!asms) return false;
         for (size_t i = 0; i < n && !g_ppCls; ++i) {
-            void* img = nullptr;
-            __try { img = asms[i] ? p_asmImage(asms[i]) : nullptr; }
-            __except (EXCEPTION_EXECUTE_HANDLER) { img = nullptr; }
+            void* img = asms[i] ? p_asmImage(asms[i]) : nullptr;
             if (!img) continue;
-            size_t c = SImageCount(img);
+            size_t c = p_imgCnt(img);
             if (c > 80000) c = 80000;
             for (size_t j = 0; j < c; ++j) {
-                Il2CppClass* k = SImageClass(img, j);
+                Il2CppClass* k = p_imgCls(img, j);
                 if (!k) continue;
-                const char* cn = SClassName(k);
+                const char* cn = il2cpp_class_get_name(k);
                 if (cn && strcmp(cn, "PlayerPrefs") == 0) { g_ppCls = k; break; }
             }
         }
         if (!g_ppCls) { Log("[p] PlayerPrefs: NAO achado"); return false; }
-        g_ppSetInt = SMethodFromName(g_ppCls, "SetInt", 2);
-        g_ppGetInt = SMethodFromName(g_ppCls, "GetInt", 2);
-        g_ppSetStr = SMethodFromName(g_ppCls, "SetString", 2);
-        g_ppGetStr = SMethodFromName(g_ppCls, "GetString", 2);
-        g_ppHasKey = SMethodFromName(g_ppCls, "HasKey", 1);
-        g_ppSave = SMethodFromName(g_ppCls, "Save", 0);
+        g_ppSetInt = il2cpp_class_get_method_from_name(g_ppCls, "SetInt", 2);
+        g_ppGetInt = il2cpp_class_get_method_from_name(g_ppCls, "GetInt", 2);
+        g_ppSetStr = il2cpp_class_get_method_from_name(g_ppCls, "SetString", 2);
+        g_ppGetStr = il2cpp_class_get_method_from_name(g_ppCls, "GetString", 2);
+        g_ppHasKey = il2cpp_class_get_method_from_name(g_ppCls, "HasKey", 1);
+        g_ppSave = il2cpp_class_get_method_from_name(g_ppCls, "Save", 0);
         g_ppOk = (g_ppSetInt && g_ppGetInt && g_ppGetStr);
         Log("[p] PlayerPrefs=%p setInt=%p getInt=%p setStr=%p getStr=%p hasKey=%p save=%p -> %s",
             (void*)g_ppCls, (void*)g_ppSetInt, (void*)g_ppGetInt, (void*)g_ppSetStr,
@@ -1206,7 +942,7 @@ namespace Unlock {
         return g_ppOk;
     }
 
-    struct PpKey { char field[72]; char key[96]; void* str; uint32_t pin; };
+    struct PpKey { char field[72]; char key[96]; void* str; };
     static PpKey g_ppK[48];
     static int   g_ppKN = 0;
     static bool  g_ppKeysDone = false;
@@ -1218,13 +954,12 @@ namespace Unlock {
             strstr(low, "skin") || strstr(low, "class") || strstr(low, "type");
     }
 
-    static void PpAdd(void* s, const char* field, const char* val, uint32_t pin) {
+    static void PpAdd(void* s, const char* field, const char* val) {
         if (g_ppKN >= 48 || !val || !val[0]) return;
         for (int q = 0; q < g_ppKN; ++q) if (!strcmp(g_ppK[q].key, val)) return;
         strncpy_s(g_ppK[g_ppKN].field, field ? field : "?", _TRUNCATE);
         strncpy_s(g_ppK[g_ppKN].key, val, _TRUNCATE);
         g_ppK[g_ppKN].str = s;
-        g_ppK[g_ppKN].pin = pin;
         ++g_ppKN;
     }
 
@@ -1232,43 +967,36 @@ namespace Unlock {
         if (g_ppKeysDone && !force) return;
         g_ppKeysDone = true;
         g_ppKN = 0;
-        PHASE("unlock.prefkeys");
         if (!ResolvePlayerPrefs()) return;
 
         const ULONGLONG t0 = GetTickCount64();
         int logged = 0;
-        if (p_domGet && p_domAsms && p_asmImage && p_imgCount && p_imgClass) {
-            void* dom = nullptr;
-            __try { dom = p_domGet(); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { dom = nullptr; }
+        if (p_domGet && p_domAsms && p_asmImage && p_imgCnt && p_imgCls) {
+            void* dom = p_domGet();
             size_t nAsm = 0;
-            const void** asms = nullptr;
-            __try { asms = dom ? p_domAsms(dom, &nAsm) : nullptr; }
-            __except (EXCEPTION_EXECUTE_HANDLER) { asms = nullptr; }
+            const void** asms = dom ? p_domAsms(dom, &nAsm) : nullptr;
             for (size_t a = 0; asms && a < nAsm; ++a) {
-                void* img = nullptr;
-                __try { img = asms[a] ? p_asmImage(asms[a]) : nullptr; }
-                __except (EXCEPTION_EXECUTE_HANDLER) { img = nullptr; }
+                void* img = asms[a] ? p_asmImage(asms[a]) : nullptr;
                 if (!img) continue;
-                size_t nc = SImageCount(img);
+                size_t nc = p_imgCnt(img);
                 if (nc > 80000) nc = 80000;
                 for (size_t i = 0; i < nc; ++i) {
-                    Il2CppClass* k = SImageClass(img, i);
+                    Il2CppClass* k = p_imgCls(img, i);
                     if (!k) continue;
-                    for (Il2CppClass* c = k; c; c = SParent(c)) {
+                    for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
                         void* it = nullptr;
                         for (;;) {
-                            FieldInfo* f = SFields(c, &it);
+                            FieldInfo* f = il2cpp_class_get_fields(c, &it);
                             if (!f) break;
                             if (!IsStatic(f)) continue;
-                            const Il2CppType* t = SFieldType(f);
+                            const Il2CppType* t = il2cpp_field_get_type(f);
                             if (!t) continue;
-                            const char* tn = STypeName(t);
+                            const char* tn = il2cpp_type_get_name ? il2cpp_type_get_name(t) : nullptr;
                             if (!tn || !strstr(tn, "String")) continue;
-                            const char* fn = SFieldName(f);
+                            const char* fn = il2cpp_field_get_name(f);
                             if (!fn) continue;
                             char fl[80]; Lower(fl, sizeof(fl), fn);
-                            void* s = nullptr; StaticGetSafeFrom(f, c, &s);
+                            void* s = nullptr; StaticGetSafe(f, &s);
                             if (!LooksLikeObj(s)) continue;
                             char v[96]; v[0] = 0; CStr(s, v, sizeof(v));
                             if (!v[0] || strlen(v) > 80) continue;
@@ -1276,10 +1004,10 @@ namespace Unlock {
                             const bool nameHit = strstr(fl, "pref") || strstr(fl, "key");
                             if (!nameHit && !PrefWord(vl)) continue;
                             if (logged < 60) {
-                                Log("[p] chave %s::%s = \"%s\"", SClassName(k), fn, v);
+                                Log("[p] chave %s::%s = \"%s\"", il2cpp_class_get_name(k), fn, v);
                                 ++logged;
                             }
-                            PpAdd(s, fn, v, 0);   // vem de static field => ja' enraizado
+                            PpAdd(s, fn, v);
                         }
                     }
                 }
@@ -1294,24 +1022,17 @@ namespace Unlock {
         };
         if (p_strNew && g_ppHasKey) {
             for (size_t i = 0; i < sizeof(lit) / sizeof(lit[0]); ++i) {
-                void* ks = SStrNew(lit[i]);
+                void* ks = p_strNew(lit[i]);
                 if (!ks) continue;
-                // >>> v26: string criada por nos NAO tem raiz. Sem pin, um GC
-                //     deixa g_ppK[].str pendurado.
-                const uint32_t pin = SGcHandleNew(ks);
                 void* ar[1] = { ks };
                 void* r = InvokeRet(g_ppHasKey, nullptr, ar);
-                if (r) {
-                    Log("[p] LITERAL existe: \"%s\"%s", lit[i], pin ? "" : " (SEM PIN!)");
-                    PpAdd(ks, lit[i], lit[i], pin);
-                }
+                if (r) { Log("[p] LITERAL existe: \"%s\"", lit[i]); PpAdd(ks, lit[i], lit[i]); }
             }
         }
         Log("[p] chaves de prefs uteis: %d (scan %llu ms)", g_ppKN, GetTickCount64() - t0);
     }
 
     static void PrefsApply(int weaponType, void* nameStr) {
-        PHASE("unlock.prefs");
         if (!ResolvePlayerPrefs()) return;
         if (g_ppKN <= 0 && g_ppRetry < 3) { ++g_ppRetry; CollectPrefsKeys(true); }
         if (g_ppKN <= 0) return;
@@ -1428,7 +1149,6 @@ namespace Unlock {
         void* gun = ArrElem((Il2CppArray*)g_arr, live);
         if (LooksLikeObj(gun)) nameStr = SafeRead<void*>((uintptr_t)gun + g_offName, nullptr);
 
-        PHASE("unlock.sel");
         if (g_selStep < g_loCN) {
             const LoCand& c = g_loC[g_selStep];
             Log("[w] passo %d/%d: %s::%s (kind=%d type=%d useType=%d slot=%d off=0x%X)",
@@ -1479,7 +1199,6 @@ namespace Unlock {
 
     static void ApplyAll() {
         if (!g_arr || g_arrLen <= 0) return;
-        PHASE("unlock.apply");
         if (C.unlockAll || C.unlockWeapons) ApplyAvailable();
         if (C.unlockAll || C.unlockSkins || C.unlockAttachments || C.skinChanger) ApplyAttachments();
         if (C.unlockAll || C.unlockCurrency || C.unlockLevel) ApplyPlayerInts();
@@ -1531,7 +1250,7 @@ namespace Unlock {
         std::vector<Dupe::Item>& out) {
         Il2CppClass* k = SDK::FindClass("AllCamos");
         if (!k) return;
-        FieldInfo* f = SFieldFromName(k, field);
+        FieldInfo* f = il2cpp_class_get_field_from_name(k, field);
         if (!f) return;
         void* dict = nullptr;
         StaticGetSafe(f, &dict);
@@ -1554,27 +1273,27 @@ namespace Unlock {
     static void CollectStringsFromClasses(const char* key,
         std::vector<std::string>& out, const char* tag) {
         if (!p_classImage || !p_imgCount || !p_imgClass || !SDK::kPlayerScript) return;
-        void* img = SClassImage(SDK::kPlayerScript);
+        void* img = p_classImage(SDK::kPlayerScript);
         if (!img) return;
-        size_t n = SImageCount(img);
+        size_t n = p_imgCount(img);
         if (n > 60000) n = 60000;
         for (size_t i = 0; i < n; ++i) {
-            Il2CppClass* k = SImageClass(img, i);
+            Il2CppClass* k = p_imgClass(img, i);
             if (!k) continue;
-            const char* cn = SClassName(k);
+            const char* cn = il2cpp_class_get_name(k);
             if (!cn || !strstr(cn, key)) continue;
-            for (Il2CppClass* c = k; c; c = SParent(c)) {
+            for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
                 void* it = nullptr;
                 for (;;) {
-                    FieldInfo* f = SFields(c, &it);
+                    FieldInfo* f = il2cpp_class_get_fields(c, &it);
                     if (!f) break;
                     if (!IsStatic(f)) continue;
-                    const Il2CppType* t = SFieldType(f);
-                    const char* tn = STypeName(t);
+                    const Il2CppType* t = il2cpp_field_get_type(f);
+                    const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
                     if (!tn || !strstr(tn, "String")) continue;
                     if (!strstr(tn, "[]") && !strstr(tn, "List<")) continue;
                     void* v = nullptr;
-                    StaticGetSafeFrom(f, c, &v);
+                    StaticGetSafe(f, &v);
                     if (!LooksLikeObj(v)) continue;
                     bool isArr = (strstr(tn, "[]") != nullptr);
                     int cnt = isArr ? ArrLen((Il2CppArray*)v) : ListSize(v);
@@ -1612,16 +1331,16 @@ namespace Unlock {
     static bool CharNameOf(void* inst, char* out, size_t n) {
         out[0] = 0;
         if (!LooksLikeObj(inst)) return false;
-        Il2CppClass* k = SClass(inst);
+        Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)inst);
         static const char* keys[4] = { "name", "charName", "characterName", "displayName" };
         for (int q = 0; q < 4; ++q) {
-            for (Il2CppClass* c = k; c; c = SParent(c)) {
-                FieldInfo* f = SFieldFromName(c, keys[q]);
+            for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+                FieldInfo* f = il2cpp_class_get_field_from_name(c, keys[q]);
                 if (!f || IsStatic(f)) continue;
-                const Il2CppType* t = SFieldType(f);
-                const char* tn = STypeName(t);
+                const Il2CppType* t = il2cpp_field_get_type(f);
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
                 if (!tn || !strstr(tn, "String")) continue;
-                uint32_t off = SFieldOff(f);
+                uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
                 if (!off) continue;
                 char tmp[128]; tmp[0] = 0;
                 CStr(SafeRead<void*>((uintptr_t)inst + off, nullptr), tmp, sizeof(tmp));
@@ -1670,7 +1389,6 @@ namespace Unlock {
     void BuildStep() {
         if (!Dupe::Wants()) return;
         if (Dupe::Building()) return;
-        PHASE("unlock.build");
         Dupe::g_building.store(true);
         __try { BuildStepInner(); }
         __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1682,7 +1400,6 @@ namespace Unlock {
     }
 
     bool Install() {
-        PHASE("unlock.install");
         ResolveExtra();
         if (!SDK::g_localPlayer || !SDK::kPlayerScript || !SDK::kGunStats) return false;
         uint32_t off = 0; void* a = nullptr; int len = 0;
@@ -1702,6 +1419,8 @@ namespace Unlock {
         return true;
     }
 
+    // >>> v25: retry no maximo 2x/s (fora de partida o Install falha sempre e
+    //     FindWeaponArray varre todos os campos do PlayerScript).
     static bool EnsureInstalled() {
         if (g_installed && g_arr && g_arrLen > 0) return true;
         const ULONGLONG now = GetTickCount64();
@@ -1716,7 +1435,6 @@ namespace Unlock {
     }
 
     void Tick() {
-        PHASE("unlock.tick");
         const bool any = C.unlockAll || C.unlockWeapons || C.unlockSkins || C.unlockAttachments ||
             C.unlockCurrency || C.unlockLevel || C.unlockChars || C.applySelection ||
             C.skinChanger || C.applySlots || C.fillLoadoutSlots;
@@ -1724,15 +1442,8 @@ namespace Unlock {
         if (!SDK::g_localPlayer) return;
 
         if (Dupe::Wants()) {
-            // >>> v26: este ramo estava FORA de qualquer __try.
-            __try {
-                if (!EnsureInstalled()) return;
-                BuildStep();
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                static int n = 0;
-                if (n++ < 10) Log("[unlock] AV contido no ramo build");
-            }
+            if (!EnsureInstalled()) return;
+            BuildStep();
             return;
         }
         __try { TickInner(); }
@@ -1747,77 +1458,70 @@ namespace Unlock {
         Il2CppClass* k = SDK::FindClass(clsName);
         if (!k) { Log("[dump] classe '%s' NAO encontrada", clsName); return; }
         Log("[dump] ==== %s ====", clsName);
-        for (Il2CppClass* c = k; c; c = SParent(c)) {
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
             void* it = nullptr;
             for (;;) {
-                FieldInfo* f = SFields(c, &it);
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
                 if (!f) break;
-                const Il2CppType* t = SFieldType(f);
-                const char* tn = STypeName(t);
-                const char* cn = SClassName(c);
-                const char* fn = SFieldName(f);
+                const Il2CppType* t = il2cpp_field_get_type(f);
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : "?";
                 Log("[dump]   %s::%s %s @0x%X%s",
-                    cn ? cn : "?", fn ? fn : "?", tn ? tn : "?",
-                    (unsigned)SFieldOff(f), IsStatic(f) ? " [static]" : "");
+                    il2cpp_class_get_name(c), il2cpp_field_get_name(f), tn,
+                    (unsigned)il2cpp_field_get_offset(f), IsStatic(f) ? " [static]" : "");
             }
         }
     }
 
     static void DumpObjFields(void* o, const char* tag, int maxFields) {
         if (!LooksLikeObj(o)) return;
-        Il2CppClass* k = SClass(o);
+        Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)o);
         int n = 0;
-        for (Il2CppClass* c = k; c && n < maxFields; c = SParent(c)) {
+        for (Il2CppClass* c = k; c && n < maxFields; c = il2cpp_class_get_parent(c)) {
             void* it = nullptr;
             for (;;) {
-                FieldInfo* f = SFields(c, &it);
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
                 if (!f) break;
                 if (IsStatic(f)) continue;
                 if (n++ >= maxFields) break;
-                const Il2CppType* t = SFieldType(f);
-                const char* tn = STypeName(t);
-                uint32_t off = SFieldOff(f);
+                const Il2CppType* t = il2cpp_field_get_type(f);
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : "?";
+                uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
                 if (!off) continue;
-                const char* fn = SFieldName(f);
-                if (!fn) continue;
-                char tl[96]; Lower(tl, sizeof(tl), tn ? tn : "");
-                if (tn && strstr(tn, "String")) {
+                const char* fn = il2cpp_field_get_name(f);
+                char tl[96]; Lower(tl, sizeof(tl), tn);
+                if (strstr(tn, "String")) {
                     char s[64]; s[0] = 0;
                     CStr(SafeRead<void*>((uintptr_t)o + off, nullptr), s, sizeof(s));
                     Log("[lod]   %s.%s = \"%s\"", tag, fn, s);
                 }
-                else if (tn && (strstr(tn, "[]") || strstr(tn, "List<"))) {
+                else if (strstr(tn, "[]") || strstr(tn, "List<")) {
                     void* a = SafeRead<void*>((uintptr_t)o + off, nullptr);
                     Log("[lod]   %s.%s %s len=%d", tag, fn, tn, LooksLikeObj(a) ? ArrLen((Il2CppArray*)a) : -1);
                 }
                 else if (strstr(tl, "single") || strstr(tl, "double"))
-                    Log("[lod]   %s.%s %s = %.4f", tag, fn, tn ? tn : "?", SafeRead<float>((uintptr_t)o + off, -999.f));
+                    Log("[lod]   %s.%s %s = %.4f", tag, fn, tn, SafeRead<float>((uintptr_t)o + off, -999.f));
                 else if (strstr(tl, "boolean"))
-                    Log("[lod]   %s.%s %s = %d", tag, fn, tn ? tn : "?", SafeRead<unsigned char>((uintptr_t)o + off, 0));
+                    Log("[lod]   %s.%s %s = %d", tag, fn, tn, SafeRead<unsigned char>((uintptr_t)o + off, 0));
                 else if (strstr(tl, "int32") || strstr(tl, "byte"))
-                    Log("[lod]   %s.%s %s = %d", tag, fn, tn ? tn : "?", SafeRead<int>((uintptr_t)o + off, -999));
+                    Log("[lod]   %s.%s %s = %d", tag, fn, tn, SafeRead<int>((uintptr_t)o + off, -999));
                 else {
                     void* p = SafeRead<void*>((uintptr_t)o + off, nullptr);
-                    if (LooksLikeObj(p)) Log("[lod]   %s.%s %s = OBJ %p", tag, fn, tn ? tn : "?", p);
-                    else                 Log("[lod]   %s.%s %s = raw %d", tag, fn, tn ? tn : "?", SafeRead<int>((uintptr_t)o + off, -999));
+                    if (LooksLikeObj(p)) Log("[lod]   %s.%s %s = OBJ %p", tag, fn, tn, p);
+                    else                 Log("[lod]   %s.%s %s = raw %d", tag, fn, tn, SafeRead<int>((uintptr_t)o + off, -999));
                 }
             }
         }
     }
 
     void Dump() {
-        PHASE("unlock.dump");
         Log("=== DUMP UNLOCK %s ===", BFI_UNLOCK_VER);
-        __try {
-            ResolveExtra();
-            DumpClassFields("PlayerScript");
-            ScanLoadoutGlobals();
-            ScanLoadoutSingletons();
-            ScanLoadoutContainers();
-            ResolvePlayerPrefs();
-            CollectPrefsKeys(false);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[unlock] AV contido no Dump"); }
+        ResolveExtra();
+        DumpClassFields("PlayerScript");
+        ScanLoadoutGlobals();
+        ScanLoadoutSingletons();
+        ScanLoadoutContainers();
+        ResolvePlayerPrefs();
+        CollectPrefsKeys(false);
         Log("=== FIM DUMP UNLOCK ===");
     }
 

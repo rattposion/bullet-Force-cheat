@@ -1,27 +1,22 @@
 // ============================================================================
-//  aimbot.cpp — v17 (corrigido)
+//  aimbot.cpp — v18
 //
-//  FIXES desta versão:
-//   [A1] TargetSnap com inicializadores default (mata C26495).
-//   [A2] SDK::ClearTfCache / SDK::ClearBoneCache em OnDomainReload.
-//   [A3] SDK::ValidInstance / SDK::SafeClass.
-//   [A4] losCursor blindado contra n==0.
-//   [A5] Tick()/Install()/Best()/AimPoint()/Silent::Override() (LNK2019).
-//   [A6] Update() restaura rotacao tambem no modo hold.
-//   [FIX VIS]  vis check agora DESCARTA alvo invisivel (nao so penaliza).
-//   [FIX TEAM] team check duplo: IsEnemy + fallback por teamId.
-//   [FIX COMPILE] linha 99/100: GetTeamId agora existe no SDK.
-//   [FIX COMPILE] linha 167: TargetVisible chamado com 3 args (idx, eye, aim).
+//  FIX v18 (LINK):
+//   [L1] Dist3D(Vec3,Vec3) agora casa com o features.h (extern, por valor).
+//        Antes era static inline com const& -> overload distinto, e a versao
+//        do header ficava SEM definicao (LNK2019 pra quem chamasse de fora).
+//   [L2] Definidos os simbolos que o features.h declara e nao existiam em
+//        lugar nenhum: Sub/Dot/Norm/LookRot/Slerp/LocalPos/CamForward.
+//        >>> SE algum deles JA estiver definido em outro .cpp, apague daqui
+//            (senao vira LNK2005).
+//   [L3] <string> incluido (s_weaponStats usa std::string).
+//   [L4] features.h incluido -> o compilador confere as assinaturas.
 //
-//  >>> v17 — [FIX CAMPO ERRADO]
-//      O menu escreve C.aimbot e C.aimTeam, mas a logica lia C.aimEnabled e
-//      C.aimTeamCheck — campos orfaos, que NENHUMA UI tocava. Resultado:
-//        - aimbot mirando com o checkbox "Aimbot" desmarcado;
-//        - "Ignorar time" sem efeito nenhum.
-//      Agora a logica usa os MESMOS campos que o menu escreve.
+//  (mantidas: v17 com os fixes de campo C.aimbot/C.aimTeam, vis, team, etc.)
 // ============================================================================
 
 #include "aimbot.h"
+#include "features.h"
 #include "sdk.h"
 #include "config.h"
 #include "hooks.h"
@@ -30,6 +25,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
@@ -73,13 +69,69 @@ namespace Aimbot {
     static std::vector<TargetSnap> s_snap;
 
     // =======================================================================
-    //  helpers
+    //  math publica (casando com o features.h)   [L1][L2]
     // =======================================================================
-    static inline float Dist3D(const Vec3& a, const Vec3& b) {
-        float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+    Vec3 Sub(Vec3 a, Vec3 b) { return Vec3(a.x - b.x, a.y - b.y, a.z - b.z); }
+
+    float Dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+    Vec3 Norm(Vec3 v) {
+        const float L = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+        if (L < 0.000001f) return Vec3(0.f, 0.f, 0.f);
+        return Vec3(v.x / L, v.y / L, v.z / L);
+    }
+
+    float Dist3D(Vec3 a, Vec3 b) {
+        const float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
         return sqrtf(dx * dx + dy * dy + dz * dz);
     }
 
+    // yaw puro em torno de Y (Unity: frente = +Z)
+    ::Quat LookRot(Vec3 fwd) {
+        const float yaw = atan2f(fwd.x, fwd.z);
+        const float h = yaw * 0.5f;
+        return ::Quat{ 0.f, sinf(h), 0.f, cosf(h) };
+    }
+
+    ::Quat Slerp(::Quat a, ::Quat b, float t) {
+        float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        if (d < 0.f) { b.x = -b.x; b.y = -b.y; b.z = -b.z; b.w = -b.w; d = -d; }
+
+        if (d > 0.9995f) {
+            ::Quat r{ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
+                      a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t };
+            const float L = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);
+            if (L > 0.000001f) { r.x /= L; r.y /= L; r.z /= L; r.w /= L; }
+            return r;
+        }
+
+        const float th = acosf(d);
+        const float s = sinf(th);
+        const float wa = sinf((1.f - t) * th) / s;
+        const float wb = sinf(t * th) / s;
+        return ::Quat{ a.x * wa + b.x * wb, a.y * wa + b.y * wb,
+                       a.z * wa + b.z * wb, a.w * wa + b.w * wb };
+    }
+
+    Vec3 LocalPos() {
+        Il2CppObject* p = SDK::GetLocalPlayer();
+        return p ? SDK::GetPos(p) : Vec3();
+    }
+
+    Vec3 CamForward() {
+        Il2CppObject* cam = SDK::CamTfObj();
+        if (!cam) return Vec3(0.f, 0.f, 1.f);
+        const ::Quat q = SDK::GetPlayerRot(cam);
+        // roda (0,0,1) por q
+        const float x = q.x, y = q.y, z = q.z, w = q.w;
+        return Vec3(2.f * (x * z + w * y),
+            2.f * (y * z - w * x),
+            1.f - 2.f * (x * x + y * y));
+    }
+
+    // =======================================================================
+    //  helpers internos
+    // =======================================================================
     static bool InFov(const Vec2& screen, float radiusPx) {
         const float cx = (float)SDK::ScreenW() * 0.5f;
         const float cy = (float)SDK::ScreenH() * 0.5f;
@@ -88,20 +140,12 @@ namespace Aimbot {
         return (dx * dx + dy * dy) <= (radiusPx * radiusPx);
     }
 
-    // =======================================================================
-    //  [FIX TEAM] — checagem de time robusta
-    // =======================================================================
     static bool IsSameTeam(Il2CppObject* a, Il2CppObject* b) {
         if (!a || !b) return false;
-
-        // 1) caminho oficial
-        if (!SDK::IsEnemy(a)) return true;   // IsEnemy false = mesmo time
-
-        // 2) fallback por teamId
+        if (!SDK::IsEnemy(a)) return true;
         int ta = SDK::GetTeamId(a);
         int tb = SDK::GetTeamId(b);
         if (ta >= 0 && tb >= 0) return ta == tb;
-
         return false;
     }
 
@@ -126,13 +170,10 @@ namespace Aimbot {
             float hp = SDK::GetHealth(t.player);
             if (hp <= 0.5f) continue;
 
-            // ---------------- [FIX TEAM] ----------------
-            // >>> v17: o gate usa C.aimTeam (o menu escreve AQUI), nao o orfao
-            //          C.aimTeamCheck que nunca era ligado.
             bool enemy = SDK::IsEnemy(t.player);
             if (C.aimTeam) {
-                if (!enemy) continue;                       // IsEnemy confiavel
-                if (IsSameTeam(t.player, local)) continue;  // fallback reforcando
+                if (!enemy) continue;
+                if (IsSameTeam(t.player, local)) continue;
             }
 
             float dist = Dist3D(localPos, t.head);
@@ -160,16 +201,13 @@ namespace Aimbot {
             sn.aimPos = aim;
             sn.hasAim = true;
 
-            // ---------------- [FIX VIS] ----------------
             sn.visible = true;
             if (C.aimVisCheck) {
                 if (!SDK::LosReady()) {
-                    sn.visible = !C.aimStrictVis;     // sem LOS: bloqueia se strict
+                    sn.visible = !C.aimStrictVis;
                 }
                 else {
-                    sn.visible = SDK::TargetVisible(sn.slot,
-                        SDK::MuzzlePos(),
-                        sn.aimPos);
+                    sn.visible = SDK::TargetVisible(sn.slot, SDK::MuzzlePos(), sn.aimPos);
                 }
             }
             if (C.aimVisCheck && C.aimStrictVis && !sn.visible) continue;
@@ -189,7 +227,6 @@ namespace Aimbot {
 
         for (auto& s : s_snap) {
             if (!s.alive || !s.hasAim) continue;
-
             if (C.aimVisCheck && C.aimStrictVis && !s.visible) continue;
 
             Vec2 scr{};
@@ -261,9 +298,6 @@ namespace Aimbot {
     //  loop interno + API publica
     // =======================================================================
     static void CoreTick() {
-        // >>> v17: gate no campo que o menu escreve (C.aimbot), nao no orfao
-        //          C.aimEnabled. Era isso que fazia o aimbot mirar com o
-        //          checkbox "Aimbot" DESMARCADO.
         if (!C.aimbot) { s_active = false; RestoreAimIfNeeded(); return; }
 
         bool key = (GetAsyncKeyState(C.aimKey) & 0x8000) != 0;

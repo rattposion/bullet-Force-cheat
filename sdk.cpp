@@ -1,31 +1,24 @@
 // ============================================================================
 //  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, LOS via Physics.Raycast
 //
-//  >>> v7.0 — FIX DO AV EM -1 E DO VAZAMENTO DE LOCK
-//   [1] NENHUM memcpy cru a partir de il2cpp_object_unbox. Todo unbox passa
-//       por PlausibleObj() + se_read_bytes() (que tem __try). Era o unico
-//       memcpy NAO protegido do caminho de UpdateTargets — o [veh] do log
-//       apontava leitura em 0xFFFFFFFFFFFFFFFF dentro do ucrtbased, e o
-//       log terminava ali.
-//   [2] LOCKS COMPATIVEIS COM SEH. Com /EHsc, o __except do Combat::RunStep
-//       NAO roda destrutores ao desenrolar a pilha. Logo std::lock_guard
-//       DEIXAVA O MUTEX PRESO em qualquer AV abaixo dele, e o proximo
-//       MethodCached()/CachedTransform() travava o tick para sempre (o ESP
-//       sumia de vez). Agora os caminhos expostos usam lock()/unlock()
-//       explicitos dentro de __try/__finally, que roda no SEH tambem.
-//       Mesmo tratamento para g_targetCs (EnterCriticalSection).
-//   [3] MethodCached comparava 'const char*' por PONTEIRO. Um falso-positivo
-//       devolvia MethodInfo* de outra classe -> runtime_invoke com ABI
-//       errada -> retorno lixo. Agora tem fallback por strcmp.
-//   [4] PHASE() granular: o proximo [veh]/[crash] aponta o sub-passo exato.
-//   [5] PublishFound() extraido de RefreshTargets (frame POD-only) para
-//       poder usar __try/__finally no lock de publicacao.
+//  v7.0 — FONTE UNICA DE TAMANHO + SNAPSHOT DE FRAME:
+//    [F1] g_vpW/g_vpH: o viewport do GL vira a UNICA fonte de tamanho.
+//         ScreenW/ScreenH devolvem isso (com fallback no client rect). W2S,
+//         DisplaySize e glViewport passam a usar o mesmo par por construcao.
+//    [E1] FrameData publicado 1x por tick com seqlock (PublishFrame/ReadFrame).
+//         Quem nao e' a thread do jogo para de ler g_viewProj/g_localPos cru.
+//    [E2] WorldToScreenF(): W2S a partir do snapshot, para uso cross-thread.
 //
-//  >>> v6.9 — FIX ESP PISCANDO / SUMINDO (mantido)
-//   UpdateTargets sem return antes de recomputar; g_localPlayer sticky;
-//   UpdateView publica so' quando consegue (TTL 500ms); g_camera sticky.
+//  v6.9 — FIX CONTRATO DE PROJECAO (piscada do ESP):
+//    [P1] WorldToScreen escreve SENTINELA (-1,-1) em TODA falha.
+//    [P2] UpdateTargets calcula 'h' so' quando okH && okF.
+//    [P3] g_frameId passa a ter DONO UNICO (hk_wglSwapBuffers).
+//    [P4] Contadores de rejeicao separados (g_w2s*).
+//    [P5] TeamRelation definido.
 //
-//  >>> v6.5 — globais renomeadas p/ ValidInstance_ / SafeClass_.
+//  v6.8 — FIX DOMAIN RELOAD: ClearRuntimeCaches zera k*; OnDomainReload e
+//         InvalidateRuntime passam por ResolveAll(); statics do cursor no
+//         escopo do arquivo; <initializer_list>.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -38,6 +31,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
+#include <initializer_list>
 
 #include "il2cpp.h"
 #include "il2cpp_api.h"
@@ -49,28 +43,6 @@
 
 extern HMODULE g_hModule;
 const char* g_phase = "boot";
-
-// ---------------------------------------------------------------------------
-//  LOCK COMPATIVEL COM SEH
-//
-//  std::lock_guard depende do DESTRUTOR. Com /EHsc, o __except do
-//  Combat::RunStep NAO executa destrutores das molduras intermediarias quando
-//  desenrola por SEH. Consequencia real (vista no log): um AV abaixo de um
-//  lock_guard deixava o mutex PRESO e o proximo MethodCached() travava o tick.
-//
-//  __finally roda no desenrolar normal E no SEH -> e' o primitivo correto.
-//
-//  RESTRICAO: a funcao que usa __try nao pode ter locais com destrutor
-//  (C2712). Por isso:
-//    - MethodCached / TypeNameCached / CachedTransform / ClearTfCache /
-//      PruneTfCache / ClearRuntimeCaches / BuildCache / SnapshotInto /
-//      TargetAimPos / PublishFound  -> usam __finally (frames POD-only);
-//    - FindClass / RegisterClass / ListClassesContaining mantem lock_guard:
-//      elas criam std::string TEMPORARIO na busca do unordered_map (chave
-//      heterogenea), o que exige unwind info. Nao sao caminho quente.
-// ---------------------------------------------------------------------------
-#define LOCKED(mx)    (mx).lock(); __try {
-#define ENDLOCK(mx)   } __finally { (mx).unlock(); }
 
 extern "C" {
     Il2CppDomain* (*il2cpp_domain_get)() = nullptr;
@@ -270,6 +242,11 @@ static Il2CppClass* se_object_get_class(Il2CppObject* o) {
     } SE_END{ r = nullptr; }
     return r;
 }
+static Il2CppObject* se_object_new(Il2CppClass* k) {
+    Il2CppObject* r = nullptr;
+    SE_BEGIN{ if (il2cpp_object_new) r = il2cpp_object_new(k); } SE_END{ r = nullptr; }
+    return r;
+}
 static void* se_object_unbox(Il2CppObject* o) {
     void* r = nullptr;
     SE_BEGIN{ if (il2cpp_object_unbox) r = il2cpp_object_unbox(o); } SE_END{ r = nullptr; }
@@ -312,7 +289,6 @@ static Il2CppType* se_class_get_type(Il2CppClass* k) {
     SE_BEGIN{ if (il2cpp_class_get_type) r = il2cpp_class_get_type(k); } SE_END{ r = nullptr; }
     return r;
 }
-// >>> FIX [1]: leitura de bloco protegida. Substitui os memcpy() crus.
 static bool se_read_bytes(void* src, void* dst, size_t len) {
     SE_BEGIN{ memcpy(dst, src, len); } SE_END{ return false; }
     return true;
@@ -367,19 +343,10 @@ static uint32_t   g_methodEvict = 0;
 
 static MethodInfo* MethodCached(Il2CppClass* k, const char* name, int argc) {
     if (!k || !name) return nullptr;
-    PHASE("methodcached");
-    // >>> FIX [2]: __finally, nao lock_guard. Se um AV desenrolar a pilha
-    //     daqui, o mutex NAO fica preso.
-    LOCKED(g_methodMx)
-        for (int i = 0; i < g_methodCacheN; ++i) {
-            // >>> FIX [3]: comparacao por ponteiro + fallback strcmp. Um
-            //     falso-positivo devolvia MethodInfo* de OUTRA classe.
-            if (g_methodCache[i].k != k) continue;
-            if (g_methodCache[i].a != argc) continue;
-            if (g_methodCache[i].n != name &&
-                strcmp(g_methodCache[i].n, name) != 0) continue;
+    std::lock_guard<std::mutex> lk(g_methodMx);
+    for (int i = 0; i < g_methodCacheN; ++i)
+        if (g_methodCache[i].k == k && g_methodCache[i].a == argc && g_methodCache[i].n == name)
             return g_methodCache[i].m;
-        }
 
     MethodInfo* m = se_class_get_method_from_name(k, name, argc);
 
@@ -392,7 +359,6 @@ static MethodInfo* MethodCached(Il2CppClass* k, const char* name, int argc) {
     g_methodCache[slot].a = argc;
     g_methodCache[slot].m = m;
     return m;
-    ENDLOCK(g_methodMx)
 }
 
 struct TypeCacheEnt { const Il2CppType* t; const char* n; };
@@ -403,9 +369,9 @@ static size_t        g_typeEvict = 0;
 
 static const char* TypeNameCached(const Il2CppType* t) {
     if (!t || !il2cpp_type_get_name) return "?";
-    LOCKED(g_typeMx)
-        for (size_t i = 0; i < g_typeCacheN; ++i)
-            if (g_typeCache[i].t == t) return g_typeCache[i].n;
+    std::lock_guard<std::mutex> lock(g_typeMx);
+    for (size_t i = 0; i < g_typeCacheN; ++i)
+        if (g_typeCache[i].t == t) return g_typeCache[i].n;
 
     const char* nm = il2cpp_type_get_name(t);
     if (!nm) nm = "?";
@@ -417,7 +383,6 @@ static const char* TypeNameCached(const Il2CppType* t) {
     g_typeCache[slot].t = t;
     g_typeCache[slot].n = nm;
     return nm;
-    ENDLOCK(g_typeMx)
 }
 
 // ===========================================================================
@@ -456,7 +421,7 @@ static bool PlausibleObj(const void* p) {
 }
 
 // ===========================================================================
-//  [FIX F5] globais renomeadas com '_' — nao colidem com o 'using SDK::'
+//  globais com '_' — nao colidem com o 'using SDK::'
 // ===========================================================================
 bool ValidInstance_(const void* o) {
     if (!o || ((uintptr_t)o & 7)) return false;
@@ -498,22 +463,32 @@ namespace SDK {
     int    dbg_drawn = 0;
     Vec3   g_localPos{ 0.f, 0.f, 0.f };
     CRITICAL_SECTION g_targetCs;
-    uint64_t g_frameId = 0;
+    uint64_t g_frameId = 0;                 // dono unico: hk_wglSwapBuffers
+
+    // -1 = API de cursor ausente | bit0 = visible | (>>1)&3 = lockState
+    std::atomic<int> g_cursorState{ -1 };
 
     std::atomic<int>  g_fireDirSlot{ -1 };
     std::atomic<bool> g_recoilHookActive{ false };
-    std::atomic<bool> g_localValid{ false };
-    std::atomic<bool> g_viewValid{ false };
     bool g_rateIsRpm = false;
 
     bool  g_viewProjOk = false;
     float g_viewProj[16] = { 0 };
     static volatile LONG g_vpSeq = 0;
-    static ULONGLONG     g_viewStamp = 0;
 
-    // TTL da matriz publicada. Depois disso ela e' considerada velha (troca de
-    // cena / camera destruida). 500 ms cobre com folga qualquer hitch.
-    static const ULONGLONG kViewTtlMs = 500;
+    // [D] contadores de rejeicao do WorldToScreen
+    std::atomic<uint32_t> g_w2sOk{ 0 }, g_w2sSemMatriz{ 0 }, g_w2sAtras{ 0 }, g_w2sFora{ 0 };
+    // [D] falhas do renderer
+    std::atomic<uint32_t> g_glErrTotal{ 0 };
+
+    // [E] snapshot de frame
+    FrameData g_fd[2];
+    std::atomic<uint32_t> g_fdSeq{ 0 };
+    std::atomic<uint32_t> g_fdPublish{ 0 };
+    std::atomic<uint32_t> g_fdTorn{ 0 };
+
+    // [F] fonte unica de tamanho
+    std::atomic<int> g_vpW{ 0 }, g_vpH{ 0 };
 
     uint32_t O_health = 0, O_alive = 0, O_team = 0, O_isLocal = 0, O_name = 0, O_weapon = 0;
     uint32_t O_vel = 0, O_speed = 0, O_rot = 0, O_rotation = 0, O_cam = 0, O_camTf = 0;
@@ -604,13 +579,108 @@ namespace SDK {
     static bool         g_dumpTarget = false;
     static bool         g_inited = false;
 
+    // [D3] statics do cursor no escopo do arquivo (resetaveis no reload)
+    static Il2CppClass* g_cursorCls = nullptr;
+    static MethodInfo* g_cursorVisibleM = nullptr;
+    static MethodInfo* g_cursorLockM = nullptr;
+    static bool         g_cursorLogged = false;
+
     static void ResolveOffsets();
     static void ResolveMethods();
+    static bool ResolveAll();            // [D2] forward decl
     bool Init();
 
-    // >>> [FIX F5] fachadas publicas — chamam as globais renomeadas.
     bool         ValidInstance(Il2CppObject* o) { return ValidInstance_((const void*)o); }
     Il2CppClass* SafeClass(Il2CppObject* o) { return SafeClass_(o); }
+
+    // ======================= [F] fonte unica de tamanho =======================
+    void SetViewport(int w, int h) {
+        if (w > 0) g_vpW.store(w, std::memory_order_relaxed);
+        if (h > 0) g_vpH.store(h, std::memory_order_relaxed);
+    }
+
+    int ScreenW() {
+        const int v = g_vpW.load(std::memory_order_relaxed);
+        return v > 0 ? v : Hooks::g_viewW.load(std::memory_order_relaxed);
+    }
+    int ScreenH() {
+        const int v = g_vpH.load(std::memory_order_relaxed);
+        return v > 0 ? v : Hooks::g_viewH.load(std::memory_order_relaxed);
+    }
+
+    // ======================= [E] snapshot de frame =======================
+    void PublishFrame() {
+        const uint32_t s = g_fdSeq.load(std::memory_order_relaxed);
+        g_fdSeq.store(s + 1, std::memory_order_release);      // impar: escrevendo
+
+        FrameData& d = g_fd[(s + 1) & 1];
+        memcpy(d.viewProj, g_viewProj, sizeof(d.viewProj));
+        d.viewProjOk = g_viewProjOk;
+        d.localPos = g_localPos;
+        d.localPlayer = g_localPlayer;
+        d.aimTarget = g_aimTarget;
+        d.viewW = ScreenW();
+        d.viewH = ScreenH();
+        d.frame = g_frameId;
+
+        g_fdSeq.store(s + 2, std::memory_order_release);      // par: pronto
+        g_fdPublish.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    bool ReadFrame(FrameData& out) {
+        for (int g = 0; g < 64; ++g) {
+            const uint32_t s1 = g_fdSeq.load(std::memory_order_acquire);
+            if (s1 & 1) { YieldProcessor(); continue; }
+            out = g_fd[s1 & 1];
+            if (g_fdSeq.load(std::memory_order_acquire) == s1) return true;
+            g_fdTorn.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    }
+
+    bool WorldToScreenF(const FrameData& f, Vec3 w, Vec2& out) {
+        out = Vec2{ -1.f, -1.f };
+        if (!f.viewProjOk || f.viewW <= 0 || f.viewH <= 0) return false;
+
+        const float* m = f.viewProj;
+        const float x = m[0] * w.x + m[4] * w.y + m[8] * w.z + m[12];
+        const float y = m[1] * w.x + m[5] * w.y + m[9] * w.z + m[13];
+        const float ww = m[3] * w.x + m[7] * w.y + m[11] * w.z + m[15];
+        if (!(ww > 0.0001f)) return false;
+
+        const float inv = 1.f / ww;
+        out.x = ((x * inv) * 0.5f + 0.5f) * (float)f.viewW;
+        out.y = (1.f - ((y * inv) * 0.5f + 0.5f)) * (float)f.viewH;
+        return out.x == out.x && out.y == out.y;
+    }
+
+    // ======================= cursor do JOGO =======================
+    void RefreshCursorState() {
+        if (!g_cursorCls) {
+            g_cursorCls = FindClass("Cursor", "UnityEngine");
+            if (g_cursorCls) {
+                g_cursorVisibleM = se_class_get_method_from_name(g_cursorCls, "get_visible", 0);
+                g_cursorLockM = se_class_get_method_from_name(g_cursorCls, "get_lockState", 0);
+            }
+            if (!g_cursorLogged) {
+                g_cursorLogged = true;
+                Log("[cursor] UnityEngine.Cursor=%p visible=%p lockState=%p",
+                    g_cursorCls, g_cursorVisibleM, g_cursorLockM);
+            }
+            if (!g_cursorCls) { g_cursorState.store(-1, std::memory_order_relaxed); return; }
+        }
+
+        int st = 0;
+        if (g_cursorVisibleM) {
+            Il2CppObject* r = se_runtime_invoke(g_cursorVisibleM, nullptr, nullptr);
+            if (r) { void* p = se_object_unbox(r); if (p && *(unsigned char*)p) st |= 1; }
+        }
+        if (g_cursorLockM) {
+            Il2CppObject* r = se_runtime_invoke(g_cursorLockM, nullptr, nullptr);
+            if (r) { void* p = se_object_unbox(r); if (p) st |= ((*(int*)p) & 3) << 1; }
+        }
+        g_cursorState.store(st, std::memory_order_relaxed);
+    }
 
     // ======================= pick de campo =======================
     static uint32_t FindTypedField(Il2CppClass* k, std::initializer_list<const char*> names,
@@ -848,9 +918,6 @@ namespace SDK {
         Log("[cls] ---- %d classes contendo \"%s\" ----", n, sub);
     }
 
-    int ScreenW() { return Hooks::g_viewW; }
-    int ScreenH() { return Hooks::g_viewH; }
-
     Il2CppObject* SafeReadObjPub(void* base, unsigned int off) {
         return SafeObjField(base, off);
     }
@@ -894,30 +961,26 @@ namespace SDK {
 
     static Il2CppObject* CachedTransform(Il2CppObject* e) {
         if (!e) return nullptr;
-        // >>> FIX [2]: __finally (caminho quentissimo: por alvo, por frame).
-        LOCKED(g_tfMx)
-            auto it = g_tfCache.find(e);
+        std::lock_guard<std::mutex> lk(g_tfMx);
+        auto it = g_tfCache.find(e);
         if (it != g_tfCache.end()) return it->second;
         Il2CppObject* tr = ResolveGetTransform(e);
         g_tfCache[e] = tr;
         return tr;
-        ENDLOCK(g_tfMx)
     }
 
     void ClearTfCache() {
-        LOCKED(g_tfMx)
-            g_tfCache.clear();
-        ENDLOCK(g_tfMx)
+        std::lock_guard<std::mutex> lk(g_tfMx);
+        g_tfCache.clear();
     }
 
     void PruneTfCache() {
-        LOCKED(g_tfMx)
-            for (auto it = g_tfCache.begin(); it != g_tfCache.end(); ) {
-                Il2CppObject* o = it->first;
-                if (!o || !PlausibleObj(o)) it = g_tfCache.erase(it);
-                else ++it;
-            }
-        ENDLOCK(g_tfMx)
+        std::lock_guard<std::mutex> lk(g_tfMx);
+        for (auto it = g_tfCache.begin(); it != g_tfCache.end(); ) {
+            Il2CppObject* o = it->first;
+            if (!o || !PlausibleObj(o)) it = g_tfCache.erase(it);
+            else ++it;
+        }
     }
 
     void ClearBoneCache() {
@@ -934,22 +997,10 @@ namespace SDK {
         return false;
     }
 
-    // >>> FIX [1]: TODO unbox validado + leitura protegida. Era o unico
-    //     memcpy CRU do caminho de UpdateTargets — e o [veh] do log apontava
-    //     leitura em 0xFFFFFFFFFFFFFFFF dentro do ucrtbased.
-    static bool UnboxRead(Il2CppObject* boxed, void* out, size_t n) {
-        if (!boxed || !out || !n) return false;
-        if (!PlausibleObj(boxed)) return false;
-        void* p = se_object_unbox(boxed);
-        if (!p) return false;
-        return se_read_bytes(p, out, n);      // protegido por __try
-    }
-
     Vec3 GetPos(Il2CppObject* obj) {
         Vec3 out{ 0.f, 0.f, 0.f };
         if (!obj || !PlausibleObj(obj)) return out;
 
-        PHASE("getpos");
         Il2CppClass* k = SafeClass(obj);
         if (!k) return out;
 
@@ -965,7 +1016,9 @@ namespace SDK {
         if (!m) return out;
 
         Il2CppObject* boxed = se_runtime_invoke(m, node, nullptr);
-        UnboxRead(boxed, &out, sizeof(Vec3));
+        if (!boxed) return out;
+        void* p = se_object_unbox(boxed);
+        if (p) memcpy(&out, p, sizeof(Vec3));
         return out;
     }
 
@@ -1004,23 +1057,27 @@ namespace SDK {
         if (!M_lookRot) M_lookRot = se_class_get_method_from_name(kQuaternion, "LookRotation", 1);
         if (!M_lookRot) return out;
 
-        PHASE("lookrot");
         Vec3 d = dir;
         void* a[1]; a[0] = &d;
         Il2CppObject* r = se_runtime_invoke(M_lookRot, nullptr, a);
-        UnboxRead(r, &out, sizeof(Quat));
+        if (!r) return out;
+        void* p = se_object_unbox(r);
+        if (p) memcpy(&out, p, sizeof(Quat));
         return out;
     }
 
     bool GetRot(Il2CppObject* tf, Quat& out) {
         if (!tf) return false;
-        PHASE("getrot");
         Il2CppClass* k = SafeClass(tf);
         if (!k) return false;
         MethodInfo* gr = MethodCached(k, "get_rotation", 0);
         if (!gr) return false;
         Il2CppObject* b = se_runtime_invoke(gr, tf, nullptr);
-        return UnboxRead(b, &out, sizeof(Quat));
+        if (!b) return false;
+        void* p = se_object_unbox(b);
+        if (!p) return false;
+        memcpy(&out, p, sizeof(Quat));
+        return true;
     }
 
     bool SetRot(Il2CppObject* tf, Quat q) {
@@ -1061,6 +1118,8 @@ namespace SDK {
         return v;
     }
 
+    Vec3 GetBonePos(void* bone) { return GetPos((Il2CppObject*)bone); }
+
     Vec3 MuzzlePos() {
         Il2CppObject* camTf = CamTfObj();
         if (camTf) {
@@ -1083,14 +1142,28 @@ namespace SDK {
 
     float GetHealth(Il2CppObject* o) { return ReadHealth(o); }
 
-    bool IsEnemy(Il2CppObject* o) {
-        if (!o) return false;
-        if (!O_team) return true;
-        int t = -1;
-        if (!ReadTeamEx(o, t)) return true;
-        if (t < 0 || g_localTeam < 0) return true;
-        return t != g_localTeam;
+    // ======================= time =======================
+    // 0 = mesmo time, 1 = inimigo, -1 = indefinido
+    int TeamRelation(Il2CppObject* o) {
+        if (!o || !g_localPlayer) return -1;
+        if (o == g_localPlayer) return 0;
+
+        __try {
+            if (!ValidInstance_(o) || !ValidInstance_(g_localPlayer)) return -1;
+            if (!O_team) return -1;
+
+            int ta = -1, tb = -1;
+            if (!ReadTeamEx(o, ta)) return -1;
+            if (!ReadTeamEx(g_localPlayer, tb)) return -1;
+            if (ta < 0 || tb < 0) return -1;
+
+            return (ta == tb) ? 0 : 1;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
     }
+
+    // -1 (indefinido) deixa de contar como inimigo por acidente.
+    bool IsEnemy(Il2CppObject* o) { return TeamRelation(o) == 1; }
 
     // ======================= nome =======================
     static void BuildStringOffsets() {
@@ -1140,7 +1213,14 @@ namespace SDK {
         }
     }
 
+    std::string GetName(Il2CppObject* o) {
+        char buf[64]{};
+        GetNameBuf(o, buf, sizeof(buf));
+        return std::string(buf);
+    }
+
     Il2CppObject* GetGunStats(Il2CppObject* p) { return (p && O_gunStats) ? SafeObjField(p, O_gunStats) : nullptr; }
+    Il2CppObject* GetWeapon(Il2CppObject* p) { return (p && O_weapon) ? SafeObjField(p, O_weapon) : nullptr; }
 
     // ======================= diag =======================
     static void DumpStringFields(Il2CppObject* inst) {
@@ -1287,7 +1367,6 @@ namespace SDK {
     }
 
     static void ResolveBones(Target& t, Il2CppObject* e) {
-        PHASE("resolvebones");
         BoneCacheEnt* bc = BoneCacheFind(e);
         if (!bc) {
             bc = BoneCacheInsert(e);
@@ -1372,16 +1451,17 @@ namespace SDK {
 
     static bool ReadMatrix(Il2CppObject* obj, MethodInfo* m, float out[16]) {
         if (!obj || !m) return false;
-        PHASE("readmatrix");
         Il2CppObject* boxed = se_runtime_invoke(m, obj, nullptr);
-        return UnboxRead(boxed, out, 16 * sizeof(float));
+        if (!boxed) return false;
+        void* p = se_object_unbox(boxed);
+        if (!p) return false;
+        return se_read_bytes(p, out, 16 * sizeof(float));
     }
 
+    // [P4] a matriz so' e' publicada se veio inteira. Se falhou, g_viewProjOk
+    // vai a false e o WorldToScreen REJEITA em vez de usar a matriz antiga.
     void UpdateView() {
-        // STICKY: so' troca a camera quando a resolucao devolve algo. Zerar
-        // aqui por um frame ruim derrubava o W2S de todos os alvos.
-        Il2CppObject* cam = CameraObj();
-        if (cam) g_camera = cam;
+        g_camera = CameraObj();
 
         bool ok = false;
         float vp[16] = {};
@@ -1405,24 +1485,18 @@ namespace SDK {
             }
         }
 
-        // Publica SO' quando conseguiu. Uma falha de camera num frame NAO
-        // invalida a matriz do frame anterior.
-        if (ok) {
-            InterlockedIncrement(&g_vpSeq);
-            memcpy(g_viewProj, vp, sizeof(vp));
-            InterlockedIncrement(&g_vpSeq);
-            g_viewStamp = GetTickCount64();
-            g_viewValid.store(true, std::memory_order_release);
-        }
+        InterlockedIncrement(&g_vpSeq);
+        if (ok) memcpy(g_viewProj, vp, sizeof(vp));
+        g_viewProjOk = ok;
+        InterlockedIncrement(&g_vpSeq);
 
-        // A matriz vale kViewTtlMs. Depois disso assume invalida — evita
-        // projetar com a matriz de outro mapa indefinidamente.
-        const bool fresh = g_viewValid.load(std::memory_order_relaxed) &&
-            (GetTickCount64() - g_viewStamp < kViewTtlMs);
-        g_viewProjOk = fresh;
+        if (!ok) g_w2sSemMatriz.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // [P1] CONTRATO: falhou => out vira SENTINELA (-1,-1) e retorna false.
     bool WorldToScreen(Vec3 w, Vec2& out) {
+        out = Vec2{ -1.f, -1.f };
+
         float m[16] = {};
         bool ok = false;
         for (int guard = 0; guard < 64; ++guard) {
@@ -1432,17 +1506,41 @@ namespace SDK {
             ok = g_viewProjOk;
             if (g_vpSeq == s1) break;
         }
-        if (!ok) return false;
+        if (!ok) { g_w2sSemMatriz.fetch_add(1, std::memory_order_relaxed); return false; }
 
-        float x = m[0] * w.x + m[4] * w.y + m[8] * w.z + m[12];
-        float y = m[1] * w.x + m[5] * w.y + m[9] * w.z + m[13];
-        float ww = m[3] * w.x + m[7] * w.y + m[11] * w.z + m[15];
-        if (ww <= 0.0001f) return false;
+        const float x = m[0] * w.x + m[4] * w.y + m[8] * w.z + m[12];
+        const float y = m[1] * w.x + m[5] * w.y + m[9] * w.z + m[13];
+        const float ww = m[3] * w.x + m[7] * w.y + m[11] * w.z + m[15];
+        if (!(ww > 0.0001f)) { g_w2sAtras.fetch_add(1, std::memory_order_relaxed); return false; }
 
-        float inv = 1.f / ww;
-        out.x = ((x * inv) * 0.5f + 0.5f) * (float)Hooks::g_viewW;
-        out.y = (1.f - ((y * inv) * 0.5f + 0.5f)) * (float)Hooks::g_viewH;
-        return out.x == out.x && out.y == out.y;
+        const float inv = 1.f / ww;
+        const float sx = ((x * inv) * 0.5f + 0.5f) * (float)ScreenW();
+        const float sy = (1.f - ((y * inv) * 0.5f + 0.5f)) * (float)ScreenH();
+        if (!(sx == sx && sy == sy)) { g_w2sFora.fetch_add(1, std::memory_order_relaxed); return false; }
+
+        out.x = sx;
+        out.y = sy;
+        g_w2sOk.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    bool VisibleLine(Vec3 a, Vec3 b) {
+        Vec2 sb;
+        if (!WorldToScreen(b, sb)) return false;
+
+        Vec3 a2 = a + (b - a) * 0.01f;
+        Vec2 sa;
+        if (!WorldToScreen(a2, sa)) {
+            sa.x = (float)ScreenW() * 0.5f;
+            sa.y = (float)ScreenH() * 0.5f;
+        }
+
+        const float W = (float)ScreenW();
+        const float H = (float)ScreenH();
+        auto inside = [&](const Vec2& p) {
+            return p.x > -W * 0.25f && p.x < W * 1.25f && p.y > -H * 0.25f && p.y < H * 1.25f;
+            };
+        return inside(sa) && inside(sb);
     }
 
     // ======================= LINE OF SIGHT =======================
@@ -1833,6 +1931,29 @@ namespace SDK {
         return vis;
     }
 
+    bool RaycastTest(Vec3 from, Vec3 to, float& outHitDist) {
+        outHitDist = -1.f;
+        if (!M_raycast) ResolveRaycast();
+        if (!M_raycast) return false;
+        if (!O_hitDist) HitDistOffset();
+
+        Vec3 d = to - from;
+        float len = d.len();
+        if (len < 0.01f) return false;
+        Vec3 dir{ d.x / len, d.y / len, d.z / len };
+
+        alignas(16) unsigned char hitBuf[160];
+        memset(hitBuf, 0, sizeof(hitBuf));
+        if (!ShootRay(from, dir, len, hitBuf)) return false;
+
+        Vec3 hitPoint{ 0.f, 0.f, 0.f };
+        se_read_bytes(hitBuf, &hitPoint, sizeof(Vec3));
+        outHitDist = (hitPoint - from).len();
+        if (outHitDist < 0.01f)
+            se_read_bytes(hitBuf + O_hitDist, &outHitDist, sizeof(float));
+        return true;
+    }
+
     float CameraCotHalfFovY() {
         if (!g_camera) return 1.732f;
         Il2CppClass* ck = SafeClass(g_camera);
@@ -1869,23 +1990,18 @@ namespace SDK {
         }
     }
 
-    // >>> FIX [2]: __finally no lock. Esta funcao e' chamada do hook de tiro
-    //     (thread do jogo) e do aimbot; um AV aqui vazava g_targetCs e o
-    //     ESP::Draw travava em LockTargets().
     Vec3 TargetAimPos(Il2CppObject* p, int boneMode) {
         if (!p) return Vec3();
-        PHASE("targetaimpos");
         EnterCriticalSection(&g_targetCs);
-        __try {
-            for (int i = 0; i < g_targetCount; ++i) {
-                if (g_targets[i].player != p) continue;
-                Target& t = g_targets[i];
-                Vec3 h = t.headBone ? GetPos(t.headBone) : t.head;
-                Vec3 f = t.footBone ? GetPos(t.footBone) : t.feet;
-                return BonePoint(h, f, boneMode);
-            }
+        for (int i = 0; i < g_targetCount; ++i) {
+            if (g_targets[i].player != p) continue;
+            Target& t = g_targets[i];
+            Vec3 h = t.headBone ? GetPos(t.headBone) : t.head;
+            Vec3 f = t.footBone ? GetPos(t.footBone) : t.feet;
+            LeaveCriticalSection(&g_targetCs);
+            return BonePoint(h, f, boneMode);
         }
-        __finally { LeaveCriticalSection(&g_targetCs); }
+        LeaveCriticalSection(&g_targetCs);
         return Vec3();
     }
 
@@ -2140,7 +2256,6 @@ namespace SDK {
 
     // ======================= local player =======================
     static Il2CppObject* FindLocalPlayer() {
-        PHASE("findlocal");
         static const char* classes[] = { "PlayerScript", "Entity", "GameManager", "Game", "HUD" };
         static const char* fields[] = { "localPlayer", "LocalPlayer", "localEntity", "myPlayer",
                                         "myEntity", "local", "player" };
@@ -2170,6 +2285,8 @@ namespace SDK {
     // ======================= alvos =======================
     static void SyncAliases(Target& t) {
         t.obj = t.player;
+        t.hp = t.health;
+        t.enemy = (O_team == 0) ? true : (g_localTeam < 0 || t.team < 0 || t.team != g_localTeam);
         t.lastSeen = GetTickCount64();
     }
 
@@ -2228,53 +2345,7 @@ namespace SDK {
 
     struct FoundEnt { int slot; Il2CppObject* e; };
 
-    // >>> FIX [5]: publicacao extraida de RefreshTargets para um frame
-    //     POD-only (sem std::vector), o que permite __try/__finally no lock.
-    static void PublishFound(const FoundEnt* found, int nFound) {
-        PHASE("scan.publish");
-        EnterCriticalSection(&g_targetCs);
-        __try {
-            int c = 0;
-            for (int i = 0; i < nFound; ++i) {
-                const FoundEnt& f = found[i];
-                if (c >= kMaxTargets || f.slot < 0) break;
-
-                Target& tgt = g_targets[c];
-                if (tgt.player != f.e) {
-                    memset(&tgt, 0, sizeof(Target));
-                    tgt.player = f.e;
-                    tgt.obj = f.e;
-                    tgt.slot = (uint32_t)f.slot;
-                    tgt.team = ReadTeam(f.e);
-                    if (PlausibleObj(f.e)) tgt.pos = GetPos(f.e);
-                    GetNameBuf(f.e, tgt.name, sizeof(tgt.name));
-                    if (O_weapon) se_read_int(f.e, O_weapon, &tgt.weapon);
-
-                    Il2CppClass* ek = SafeClass(f.e);
-                    const char* en = ek ? se_class_name(ek) : nullptr;
-                    tgt.npc = (en && strstr(en, "NPC") != nullptr);
-
-                    if (PlausibleObj(f.e)) ResolveBones(tgt, f.e);
-                }
-
-                tgt.health = ReadHealth(f.e);
-                tgt.alive = (tgt.health > 0.5f);
-                ResolveHeadFeet(tgt);
-
-                // ATENCAO: isto ZERA onScreen. Quem recomputa e' UpdateTargets().
-                // Por isso UpdateTargets() NAO pode sair antes de recomputar.
-                tgt.onScreen = false;
-
-                SyncAliases(tgt);
-                ++c;
-            }
-            g_targetCount = c;
-        }
-        __finally { LeaveCriticalSection(&g_targetCs); }
-    }
-
     void RefreshTargets() {
-        PHASE("scan.begin");
         if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
         if (g_localPlayer) g_localTeam = ReadTeam(g_localPlayer);
 
@@ -2316,7 +2387,6 @@ namespace SDK {
         found.reserve(MAX_TARGETS);
         int totalObjs = 0;
 
-        PHASE("scan.find");
         for (int s = 0; s < nScan; ++s) {
             Il2CppClass* sc = scans[s];
             if (!sc) continue;
@@ -2362,7 +2432,38 @@ namespace SDK {
         std::sort(found.begin(), found.end(),
             [](const FoundEnt& a, const FoundEnt& b) { return a.slot < b.slot; });
 
-        PublishFound(found.empty() ? nullptr : &found[0], (int)found.size());
+        EnterCriticalSection(&g_targetCs);
+        int c = 0;
+        for (auto& f : found) {
+            if (c >= kMaxTargets || f.slot < 0) break;
+
+            Target& tgt = g_targets[c];
+            if (tgt.player != f.e) {
+                memset(&tgt, 0, sizeof(Target));
+                tgt.player = f.e;
+                tgt.obj = f.e;
+                tgt.slot = (uint32_t)f.slot;
+                tgt.team = ReadTeam(f.e);
+                tgt.pos = GetPos(f.e);
+                GetNameBuf(f.e, tgt.name, sizeof(tgt.name));
+                if (O_weapon) se_read_int(f.e, O_weapon, &tgt.weapon);
+
+                Il2CppClass* ek = SafeClass(f.e);
+                const char* en = ek ? se_class_name(ek) : nullptr;
+                tgt.npc = (en && strstr(en, "NPC") != nullptr);
+
+                ResolveBones(tgt, f.e);
+            }
+
+            tgt.health = ReadHealth(f.e);
+            tgt.alive = (tgt.health > 0.5f);
+            ResolveHeadFeet(tgt);
+            tgt.onScreen = false;
+            SyncAliases(tgt);
+            ++c;
+        }
+        g_targetCount = c;
+        LeaveCriticalSection(&g_targetCs);
 
         static ULONGLONG lastScan2 = 0;
         ULONGLONG nows = GetTickCount64();
@@ -2394,86 +2495,58 @@ namespace SDK {
         static ULONGLONG lastRefresh = 0;
         static ULONGLONG lastTfPrune = 0;
         ULONGLONG now = GetTickCount64();
-        if (now - lastRefresh > 200) { PHASE("upd.refresh"); lastRefresh = now; RefreshTargets(); }
+        if (now - lastRefresh > 200) { lastRefresh = now; RefreshTargets(); }
         if (now - lastTfPrune > 2000) { lastTfPrune = now; PruneTfCache(); }
 
-        // =================================================================
-        //  NENHUM return antes de recomputar o snapshot.
-        //
-        //  RefreshTargets() acabou de zerar 'onScreen' de TODOS os alvos.
-        //  O unico ponto que o recalcula esta no loop abaixo. Dois
-        //  early-returns (local nulo / SafeClass reprovando) saiam antes
-        //  disso e o snapshot inteiro ficava com onScreen=false -> o ESP
-        //  desenhava ZERO caixas com alvos perfeitamente validos.
-        //
-        //  g_localPlayer STICKY: nao e' zerado numa falha transitoria.
-        //  O local e' OPCIONAL aqui: alimenta dist/team/filtro.
-        // =================================================================
-        PHASE("upd.local");
-        if (!g_localPlayer) {
+        if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
+        if (!g_localPlayer) return;
+
+        if (!SafeClass(g_localPlayer)) {
+            Log("[sdk] localPlayer morto (%p), re-resolvendo", g_localPlayer);
             g_localPlayer = FindLocalPlayer();
             g_local = g_localPlayer;
+            if (!g_localPlayer) return;
         }
 
-        Il2CppClass* lk = g_localPlayer ? SafeClass(g_localPlayer) : nullptr;
-        if (g_localPlayer && !lk) {
-            Il2CppObject* re = FindLocalPlayer();
-            Log("[sdk] localPlayer invalido (%p) re-resolve=%p%s",
-                g_localPlayer, re, re ? "" : " (mantendo o anterior)");
-            if (re) { g_localPlayer = re; g_local = re; lk = SafeClass(re); }
-        }
-
-        const bool localOk = (g_localPlayer != nullptr) && (lk != nullptr);
-        g_localValid.store(localOk, std::memory_order_relaxed);
-
-        ++g_frameId;
+        // [P3] g_frameId NAO e' mais incrementado aqui: dono unico = swap hook.
         PlausibleBeginFrame(g_frameId);
+        g_localPos = GetPos(g_localPlayer);
+        g_localTeam = ReadTeam(g_localPlayer);
 
-        if (localOk) {
-            g_localPos = GetPos(g_localPlayer);
-            g_localTeam = ReadTeam(g_localPlayer);
-        }
-        // localOk == false -> g_localPos/g_localTeam mantem o ULTIMO valor bom.
-        // E' deliberado: um frame sem local nao pode zerar a distancia de
-        // todos os alvos.
-
-        Il2CppObject* camTf = localOk ? CamTfObj() : nullptr;
+        Il2CppObject* camTf = CamTfObj();
         Vec3 eye = camTf ? GetPos(camTf) : g_localPos;
         if (eye.zero()) eye = Vec3(g_localPos.x, g_localPos.y + 1.6f, g_localPos.z);
 
-        // ---------------- SEMPRE: atualiza o snapshot inteiro ----------------
-        PHASE("upd.loop");
         EnterCriticalSection(&g_targetCs);
-        __try {
-            for (int i = 0; i < g_targetCount; ++i) {
-                Target& t = g_targets[i];
-                if (!t.player) continue;
-                if (!PlausibleObj(t.player)) { t.player = nullptr; t.obj = nullptr; continue; }
+        for (int i = 0; i < g_targetCount; ++i) {
+            Target& t = g_targets[i];
+            if (!t.player) continue;
+            if (!PlausibleObj(t.player)) { t.player = nullptr; t.obj = nullptr; continue; }
 
-                t.health = ReadHealth(t.player);
-                t.alive = (t.health > 0.5f);
-                t.pos = GetPos(t.player);
-                ResolveHeadFeet(t);
+            t.health = ReadHealth(t.player);
+            t.alive = (t.health > 0.5f);
+            t.pos = GetPos(t.player);
+            ResolveHeadFeet(t);
 
-                if (localOk) {
-                    float dx = t.head.x - g_localPos.x, dy = t.head.y - g_localPos.y, dz = t.head.z - g_localPos.z;
-                    t.dist = sqrtf(dx * dx + dy * dy + dz * dz);
-                }
+            float dx = t.head.x - g_localPos.x, dy = t.head.y - g_localPos.y, dz = t.head.z - g_localPos.z;
+            t.dist = sqrtf(dx * dx + dy * dy + dz * dz);
 
-                bool okH = WorldToScreen(t.head, t.scrHead);
-                bool okF = WorldToScreen(t.feet, t.scrFeet);
-                float h = t.scrFeet.y - t.scrHead.y;
-                t.onScreen = okH && okF && (h > 1.f)
-                    && t.scrFeet.y > -64.f
-                    && t.scrHead.y < (float)ScreenH() + 64.f;
+            // [P2] okH/okF sao autoritativos. Sem coordenada valida,
+            // onScreen=false e o sentinela do WorldToScreen reprova o hgt.
+            const bool okH = WorldToScreen(t.head, t.scrHead);
+            const bool okF = WorldToScreen(t.feet, t.scrFeet);
 
-                SyncAliases(t);
-            }
+            const float h = (okH && okF) ? (t.scrFeet.y - t.scrHead.y) : 0.f;
+            t.onScreen = okH && okF
+                && (h > 1.f)
+                && t.scrFeet.y > -64.f
+                && t.scrHead.y < (float)ScreenH() + 64.f;
+
+            SyncAliases(t);
         }
-        __finally { LeaveCriticalSection(&g_targetCs); }
+        LeaveCriticalSection(&g_targetCs);
 
         if ((C.espVisCheck || C.aimVisCheck) && LosReady()) {
-            PHASE("upd.los");
             float cap = C.espMaxDist > C.aimMaxDist ? C.espMaxDist : C.aimMaxDist;
             if (cap < 50.f) cap = 300.f;
             cap += 50.f;
@@ -2481,43 +2554,42 @@ namespace SDK {
             Il2CppObject* localTf = g_localPlayer ? CachedTransform(g_localPlayer) : nullptr;
 
             EnterCriticalSection(&g_targetCs);
-            __try {
-                const int n = g_targetCount;
-                int budget = C.losPerFrame > 0 ? C.losPerFrame : 8;
-                if (budget > n) budget = n;
+            const int n = g_targetCount;
+            int budget = C.losPerFrame > 0 ? C.losPerFrame : 8;
+            if (budget > n) budget = n;
 
-                static int losCursor = 0;
-                if (n > 0) { losCursor %= n; if (losCursor < 0) losCursor = 0; }
+            static int losCursor = 0;
+            if (n > 0) { losCursor %= n; if (losCursor < 0) losCursor = 0; }
 
-                int done = 0;
-                for (int k = 0; k < n && done < budget; ++k) {
-                    int i = losCursor + k;
-                    if (i >= n) i -= n;
+            int done = 0;
+            for (int k = 0; k < n && done < budget; ++k) {
+                int i = losCursor + k;
+                if (i >= n) i -= n;
 
-                    Target& t = g_targets[i];
-                    if (!t.player || !t.alive) { t.visible = false; ++done; continue; }
-                    if (!t.onScreen) continue;
-                    if (t.dist > cap) { t.visible = false; ++done; continue; }
+                Target& t = g_targets[i];
+                if (!t.player || !t.alive) { t.visible = false; ++done; continue; }
+                if (!t.onScreen) continue;
+                if (t.dist > cap) { t.visible = false; ++done; continue; }
 
-                    Il2CppObject* ttf = CachedTransform(t.player);
-                    t.visible = HasLineOfSightEx(eye, t.head, localTf, ttf);
-                    ++done;
-                }
-                if (n > 0) losCursor = (losCursor + budget) % n;
+                Il2CppObject* ttf = CachedTransform(t.player);
+                t.visible = HasLineOfSightEx(eye, t.head, localTf, ttf);
+                ++done;
             }
-            __finally { LeaveCriticalSection(&g_targetCs); }
+            if (n > 0) losCursor = (losCursor + budget) % n;
+            LeaveCriticalSection(&g_targetCs);
         }
+
+        // [E] publica o frame inteiro para quem nao e' a thread do jogo
+        PublishFrame();
     }
 
     void SnapshotInto(std::vector<Target>& out) {
         EnterCriticalSection(&g_targetCs);
-        __try {
-            const int count = (g_targetCount < 0) ? 0 :
-                ((g_targetCount > MAX_TARGETS) ? MAX_TARGETS : g_targetCount);
-            out.resize((size_t)count);
-            if (count > 0) memcpy(out.data(), g_targets, (size_t)count * sizeof(Target));
-        }
-        __finally { LeaveCriticalSection(&g_targetCs); }
+        const int count = (g_targetCount < 0) ? 0 :
+            ((g_targetCount > MAX_TARGETS) ? MAX_TARGETS : g_targetCount);
+        out.resize((size_t)count);
+        if (count > 0) memcpy(out.data(), g_targets, (size_t)count * sizeof(Target));
+        LeaveCriticalSection(&g_targetCs);
     }
 
     std::vector<Target> Snapshot() {
@@ -2599,7 +2671,7 @@ namespace SDK {
 
         int vIndex = 0;
         for (uint32_t i = 0; i < np; ++i) {
-            const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
+            const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_fireBullet, i) : nullptr;
             const char* tn = TypeNameCached(t);
             if (strstr(tn, "Vector3")) {
                 vbuf[i] = (vIndex == dirVIndex) ? dir : muzzle;
@@ -2617,18 +2689,10 @@ namespace SDK {
 
     // ======================= invalidacao de runtime =======================
     static void ClearRuntimeCaches() {
-        PHASE("clear.caches");
-        LOCKED(g_methodMx)
-            g_methodCacheN = 0; g_methodEvict = 0;
-        ENDLOCK(g_methodMx)
-            LOCKED(g_typeMx)
-            g_typeCacheN = 0; g_typeEvict = 0;
-        ENDLOCK(g_typeMx)
-            LOCKED(g_tfMx)
-            g_tfCache.clear();
-        ENDLOCK(g_tfMx)
-
-            memset(g_boneCache, 0, sizeof(g_boneCache));
+        { std::lock_guard<std::mutex> lk(g_methodMx); g_methodCacheN = 0; g_methodEvict = 0; }
+        { std::lock_guard<std::mutex> lk(g_typeMx);   g_typeCacheN = 0;   g_typeEvict = 0; }
+        { std::lock_guard<std::mutex> lk(g_tfMx);     g_tfCache.clear(); }
+        memset(g_boneCache, 0, sizeof(g_boneCache));
         g_boneEvict = 0;
         memset(g_syncCache, 0, sizeof(g_syncCache));
         g_syncCacheN = 0;
@@ -2638,6 +2702,19 @@ namespace SDK {
         memset(g_slotOwner, 0, sizeof(g_slotOwner));
         memset(g_slotSeen, 0, sizeof(g_slotSeen));
 
+        // [D1] metadata: zera os ponteiros de CLASSE tambem (senao ficam velhos)
+        kEntity = kPlayerScript = kPlayer = kNPC = nullptr;
+        kTransform = kCamera = kObject = kRaycastHit = nullptr;
+        kGunStats = kVector3 = kQuaternion = nullptr;
+        kAntiHack = nullptr;
+        kPhysics = nullptr;
+        g_gsCls = nullptr;
+        sObjCls = nullptr; sFindObjs = nullptr; sOnlyEntity = -1;
+
+        // [D3] cursor
+        g_cursorCls = nullptr; g_cursorVisibleM = nullptr; g_cursorLockM = nullptr;
+        g_cursorLogged = false;
+
         M_raycast = nullptr; g_rayKind = 0; O_hitDist = 0; O_hitCollider = 0;
         g_losLogged = false;
         M_lookRot = nullptr; M_get_parent = nullptr; M_findFromId = nullptr;
@@ -2646,8 +2723,6 @@ namespace SDK {
         M_shoot = M_fireBullet = M_FireBullet = nullptr;
         M_set_position = M_set_forward = nullptr;
         M_get_fov = M_set_fov = nullptr;
-        g_gsCls = nullptr;
-        sObjCls = nullptr; sFindObjs = nullptr; sOnlyEntity = -1;
         g_hierDumped = false; g_dumpTarget = false;
 
         O_health = O_alive = O_team = O_isLocal = O_name = O_weapon = 0;
@@ -2662,26 +2737,29 @@ namespace SDK {
         g_localPlayer = nullptr; g_local = nullptr; g_camera = nullptr; g_aimTarget = nullptr;
         g_targetCount = 0;
         g_viewProjOk = false;
-        g_localValid.store(false, std::memory_order_relaxed);
-        g_viewValid.store(false, std::memory_order_relaxed);
-        g_viewStamp = 0;
 
         g_plausStamp = 0;
+
+        // [E] snapshot
+        g_fdSeq.store(0, std::memory_order_relaxed);
+        g_fdPublish.store(0, std::memory_order_relaxed);
+        g_fdTorn.store(0, std::memory_order_relaxed);
 
         LosInvalidate();
     }
 
-    void InvalidateRuntime() { ClearRuntimeCaches(); }
+    // [D2] re-resolve classes depois de limpar (metadata nova)
+    void InvalidateRuntime() {
+        ClearRuntimeCaches();
+        ResolveAll();
+    }
 
     bool OnDomainReload() {
         g_phase = "sdk.reload";
         if (!g_inited) return Init();
-        ClearRuntimeCaches();
-        BuildCache();
-        ResolveOffsets();
-        ResolveMethods();
-        BuildStringOffsets();
-        ResolveRaycast();
+        ClearRuntimeCaches();       // [D1] zera inclusive k*
+        BuildCache();               // g_classes aponta p/ metadata NOVA
+        ResolveAll();               // [D2] re-resolve classes + offsets + metodos
         g_phase = "sdk.done";
         Log("[sdk] OnDomainReload: metadata re-resolvida");
         return true;
@@ -2894,13 +2972,8 @@ namespace SDK {
         g_phase = "sdk.done";
         Log("[sdk] Init: CONCLUIDO");
         return true;
-
     }
 
-    // ===================================================================
-    //  [FIX LNK2019] GetTeamId / GetLocalTeam — implementacao
-    //  chamadas por Aimbot::IsSameTeam em aimbot.cpp
-    // ===================================================================
     int GetTeamId(Il2CppObject* o) {
         if (!o) return -1;
         int t = -1;
@@ -2911,18 +2984,4 @@ namespace SDK {
     int GetLocalTeam() {
         return g_localTeam;
     }
-
-    // ===================================================================
-    //  TeamRelation — declarado no sdk.h, usado pelo filtro do aimbot.
-    //  1 = inimigo, 0 = aliado, -1 = indeterminado
-    // ===================================================================
-    int TeamRelation(Il2CppObject* o) {
-        if (!o) return -1;
-        if (!O_team) return -1;
-        int t = -1;
-        if (!ReadTeamEx(o, t)) return -1;
-        if (t < 0 || g_localTeam < 0) return -1;
-        return (t == g_localTeam) ? 0 : 1;
-    }
 } // namespace SDK
-// ==== FIM DO ARQUIVO ====

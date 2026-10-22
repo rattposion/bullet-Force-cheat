@@ -1,213 +1,449 @@
 // ============================================================================
-//  esp.cpp — desenho do ESP (thread de render, sem chamada il2cpp)
-//  + visual check: verde = visivel, vermelho = parede (SDK::HasLineOfSight)
-//  + linha do centro da mira ate o inimigo (toggle C.espVisLine)
-//  + snapline da base da tela ate os pes (toggle C.espSnapline)
+//  esp.cpp — publicacao (Tick, thread do jogo) + desenho (Draw, thread render)
+//                                                                          v22
 //
-//  >>> FIX 1: o lock g_targetCs era segurado durante TODO o desenho do ImGui.
-//      Agora copia a lista sob o lock e solta ANTES de desenhar -> a thread do
-//      jogo nao fica esperando o overlay.
-//  >>> FIX 2: sem sprintf por alvo/frame. Formatador de inteiro na mao.
+//  FIX v22 (INSTRUMENTACAO COMPLETA — principio 6):
+//   - [esp] loga os contadores do WorldToScreen separados (ok/semMatriz/atras/
+//     fora): sem isso "fora" misturava camera, alvo atras e escala.
+//   - [esp-draw] loga proj (validade da matriz), frame, torn (leitura rasgada
+//     do snapshot) e glErr (falha do renderer) junto de scr x vp.
+//  FIX v22b: no caminho do hold, o frame do snap preservado era sobrescrito.
 //
-//  >>> FIX 3 (ESP piscando/sumindo): o local player NAO e' mais pre-requisito
-//      para desenhar. Ele so' serve para (a) excluir o proprio corpo e
-//      (b) o filtro de time — que ja' tem fallback. Com o gate antigo
-//      ("if (!g_localPlayer) return"), qualquer frame em que o tick nao
-//      conseguisse validar o local zerava o desenho inteiro, mesmo com a
-//      lista de alvos completa e valida.
-//  >>> FIX 4: o local e' lido UMA vez no inicio. Antes era lido tres vezes
-//      (gate + comparacao por alvo) e o tick pode troca-lo no meio do loop,
-//      misturando dois frames.
-//  >>> FIX 5: contadores por motivo de skip + log de 1 Hz com TODOS os gates
-//      (local / viewProj / ready). E' o que discrimina, em runtime, se o ESP
-//      esta vazio por dado invalido ou por gate.
+//  FIX v21 (PISCADA): s_buf tinha 2 slots -> 4 slots (o leitor fica seguro por
+//  3 escritas do Tick; com 2, o LateUpdate mais rapido que o present fazia o
+//  Draw ler um slot sendo reescrito).
+//
+//  FIX v20b: Draw nao da mais early-return por snap->w/h<=0 (usa DisplaySize).
+//  FIX v20c: Tick blinda o laco com __try e SEMPRE chama UnlockTargets.
+//
+//  (mantidas: s.count=out; latches de morte/visao; hold de frame vazio; Col())
 // ============================================================================
+
+#include <windows.h>
+#include <GL/gl.h>
+
+#include "common.h"
 #include "features.h"
 #include "sdk.h"
 #include "hooks.h"
-#include "common.h"
 
 #include <imgui.h>
-#include <cstring>
+
+#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
-namespace ESP {
+namespace ESP
+{
 
-    static inline ImU32 Col(const float c[4], float aMul = 1.f) {
-        return IM_COL32((int)(c[0] * 255.f), (int)(c[1] * 255.f),
-            (int)(c[2] * 255.f), (int)(c[3] * 255.f * aMul));
+    namespace
+    {
+        // ---------------------------------------------------------------- tuning
+        constexpr int      kDeadHold = 4;       // hp<=0 seguido antes de descartar
+        constexpr int      kVisHold = 3;       // "sem visao" seguido antes de trocar a cor
+        constexpr uint32_t kLogMs = 1000;    // throttle dos logs
+        constexpr uint32_t kLatchStale = 120;     // frames ate reciclar um latch orfao
+
+        // >>> 4 slots: leitor seguro por 3 escritas do Tick (era 2 -> piscava)
+        constexpr int      kSlots = 4;
+
+        // --------------------------------------------------------- estado interno
+        Snap             s_buf[kSlots];
+        std::atomic<int> s_active{ 0 };
+        std::atomic<uint32_t> s_seq{ 0 };
+
+        std::atomic<int> s_count{ 0 };
+        std::atomic<int> s_invis{ 0 };
+        std::atomic<int> s_fLocal{ 0 }, s_fMorto{ 0 }, s_fRange{ 0 };
+        std::atomic<int> s_fTime{ 0 }, s_fNpc{ 0 }, s_fCoord{ 0 };
+
+        int  s_emptyStreak = 0;
+        int  s_staleStreak = 0;
+
+        Snap s_hold;                     // ultimo snap que realmente desenhou
+        bool s_holdValid = false;
+
+        struct Latch
+        {
+            void* p = nullptr;
+            uint8_t  dead = 0;
+            uint8_t  blocked = 0;
+            bool     vis = false;
+            uint32_t used = 0;
+        };
+        Latch    s_latch[kMaxEspEnts];
+        uint32_t s_latchTick = 0;
+
+        uint32_t g_lastEspLog = 0;
+        uint32_t g_lastDrawLog = 0;
+
+        inline uint32_t NowMs() { return static_cast<uint32_t>(GetTickCount64()); }
+        inline bool     Fin(float v) { return std::isfinite(v); }
+
+        inline ImU32 Col(const float* c)
+        {
+            return ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], c[3]));
+        }
+
+        Latch& LatchFor(void* p)
+        {
+            ++s_latchTick;
+
+            int slot = -1;
+            for (int i = 0; i < kMaxEspEnts; ++i)
+            {
+                if (s_latch[i].p == p)
+                {
+                    s_latch[i].used = s_latchTick;
+                    return s_latch[i];
+                }
+                if (slot < 0 && (s_latch[i].p == nullptr ||
+                    s_latchTick - s_latch[i].used > kLatchStale))
+                    slot = i;
+            }
+
+            if (slot < 0) slot = static_cast<int>(s_latchTick % kMaxEspEnts);
+
+            Latch& L = s_latch[slot];
+            L = Latch{};
+            L.p = p;
+            L.used = s_latchTick;
+            return L;
+        }
+
+        inline bool RectOk(const Snap::Ent& e, float W, float H,
+            float& x0, float& y0, float& x1, float& y1)
+        {
+            if (!Fin(e.head.x) || !Fin(e.head.y) || !Fin(e.feet.x) || !Fin(e.feet.y))
+                return false;
+
+            const float hgt = e.feet.y - e.head.y;
+            if (!(hgt > 0.5f && hgt < 4000.0f))
+                return false;
+
+            float hw = hgt * 0.30f;
+            if (hw < 1.5f) hw = 1.5f;
+
+            const float cx = (e.head.x + e.feet.x) * 0.5f;
+
+            x0 = cx - hw; x1 = cx + hw;
+            y0 = e.head.y; y1 = e.feet.y;
+
+            if (x1 < 0.0f || y1 < 0.0f || x0 > W || y0 > H)
+                return false;
+
+            return true;
+        }
+
+        inline int Desenhaveis(const Snap* s, float W, float H)
+        {
+            int k = 0;
+            for (int i = 0; i < s->count; ++i)
+            {
+                float a, b, c, d;
+                if (RectOk(s->ents[i], W, H, a, b, c, d)) ++k;
+            }
+            return k;
+        }
+
+        // tamanho de tela para o DESENHO: DisplaySize e' autoritativo (o
+        // hooks.cpp seta a cada frame a partir da fonte unica). snap->w/h e'
+        // so' fallback.
+        inline void ScreenSize(const Snap* s, float& W, float& H)
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            W = io.DisplaySize.x;
+            H = io.DisplaySize.y;
+            if (W <= 1.0f || H <= 1.0f) { W = (float)s->w; H = (float)s->h; }
+            if (W <= 1.0f || H <= 1.0f) { W = (float)Hooks::ViewW(); H = (float)Hooks::ViewH(); }
+        }
     }
 
-    // inteiro -> string, sem sprintf
-    static inline int AppendInt(char* out, int v) {
-        char tmp[12]; int n = 0; int neg = 0;
-        if (v < 0) { neg = 1; v = -v; }
-        do { tmp[n++] = (char)('0' + v % 10); v /= 10; } while (v);
-        int p = 0;
-        if (neg) out[p++] = '-';
-        for (int i = 0; i < n; ++i) out[p + i] = tmp[n - 1 - i];
-        out[p + n] = 0;
-        return p + n;
-    }
+    // ============================================================================
+    //  Tick — thread do jogo
+    // ============================================================================
+    void Tick()
+    {
+        const int cur = s_active.load(std::memory_order_relaxed);
+        const int dst = (cur + 1) % kSlots;      // >>> 4 slots
 
-    void Draw() {
-        SDK::dbg_drawn = 0;
+        Snap& s = s_buf[dst];
+        const Snap& lastGood = s_buf[cur];
 
-        if (!C.esp) return;
+        s.frame = s_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        s.w = SDK::ScreenW();
+        s.h = SDK::ScreenH();
+        s.count = 0;
 
-        // >>> FIX 3/4: o local player nao e' mais pre-requisito. Lido UMA vez.
-        Il2CppObject* local = SDK::g_localPlayer;
+        if (!C.esp)
+        {
+            s_count.store(0, std::memory_order_relaxed);
+            s_invis.store(0, std::memory_order_relaxed);
+            s_active.store(dst, std::memory_order_release);
+            return;
+        }
 
-        // >>> FIX 1: snapshot sob o lock, desenho fora dele.
-        static Target snap[MAX_TARGETS];
-        int n = 0;
+        static int failStreak = 0;
+        if (!SDK::g_localPlayer)
+        {
+            if (++failStreak <= kGraceFrames && lastGood.count > 0)
+            {
+                const uint32_t keepFrame = s.frame;
+                s = lastGood;
+                s.frame = keepFrame;
+                s_active.store(dst, std::memory_order_release);
+                return;
+            }
+            s.count = 0;
+            s_count.store(0, std::memory_order_relaxed);
+            s_active.store(dst, std::memory_order_release);
+            return;
+        }
+        failStreak = 0;
+
+        const Il2CppObject* local = SDK::g_localPlayer;
+        const Il2CppObject* aimTarget = SDK::g_aimTarget;
+        const int           localTeam = SDK::g_localTeam;
+
+        int total = 0, out = 0, invis = 0;
+        int fLocal = 0, fMorto = 0, fRange = 0, fTime = 0, fNpc = 0, fCoord = 0;
+
+        // __try no laco: um AV no meio nao pode vazar o LockTargets.
         SDK::LockTargets();
-        n = SDK::g_targetCount;
-        if (n > MAX_TARGETS) n = MAX_TARGETS;
-        if (n > 0) memcpy(snap, SDK::g_targets, sizeof(Target) * (size_t)n);
+        __try
+        {
+            const int n = SDK::g_targetCount;
+
+            for (int i = 0; i < n && out < kMaxEspEnts; ++i)
+            {
+                const auto& t = SDK::g_targets[i];
+                if (t.player == nullptr) continue;
+                ++total;
+
+                if (t.player == local) { ++fLocal; continue; }
+                if (C.teamCheck && t.team == localTeam) { ++fTime;  continue; }
+                if (t.dist > C.espMaxDist) { ++fRange; continue; }
+                if (t.npc && !C.espNpc) { ++fNpc;   continue; }
+                if (!PtrOk_(t.player)) { ++fCoord; continue; }
+
+                // o WorldToScreen escreve SENTINELA (-1,-1) quando falha, entao
+                // isto reprova sozinho a coordenada herdada do frame anterior.
+                const float hgt = t.scrFeet.y - t.scrHead.y;
+                if (!Fin(t.scrHead.x) || !Fin(t.scrHead.y) ||
+                    !Fin(t.scrFeet.x) || !Fin(t.scrFeet.y) ||
+                    !(hgt > 0.5f && hgt < 4000.0f)) {
+                    ++fCoord; continue;
+                }
+
+                Latch& L = LatchFor(static_cast<void*>(t.player));
+
+                if (t.health > 0.0f)
+                    L.dead = 0;
+                else if (L.dead < 0xFF)
+                    ++L.dead;
+
+                if (t.health <= 0.0f && L.dead >= kDeadHold) { ++fMorto; continue; }
+
+                if (t.visible)
+                {
+                    L.blocked = 0;
+                    L.vis = true;
+                }
+                else if (L.vis)
+                {
+                    if (L.blocked < 0xFF) ++L.blocked;
+                    if (L.blocked >= kVisHold) L.vis = false;
+                }
+
+                Snap::Ent& e = s.ents[out];
+
+                e.head = t.scrHead;
+                e.feet = t.scrFeet;
+                e.dist = t.dist;
+                e.health = t.health;
+                e.team = t.team;
+                e.weapon = t.weapon;
+                e.visible = L.vis;
+                e.aim = (aimTarget != nullptr && t.player == aimTarget);
+                e.npc = t.npc;
+                strncpy_s(e.name, t.name ? t.name : "?", _TRUNCATE);
+
+                if (!e.visible) ++invis;
+                ++out;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] ESP::Tick loop"); }
         SDK::UnlockTargets();
 
+        s.count = out;   // >>> o fix que fazia o ESP nao desenhar nada
+
+        if (out == 0 && lastGood.count > 0 && ++s_emptyStreak <= kGraceFrames) {
+            const uint32_t keepFrame = s.frame;
+            s = lastGood;
+            s.frame = keepFrame;
+        }
+        else if (out > 0)
+            s_emptyStreak = 0;
+
+        s_count.store(s.count, std::memory_order_relaxed);
+        s_invis.store(invis, std::memory_order_relaxed);
+        s_fLocal.store(fLocal, std::memory_order_relaxed);
+        s_fMorto.store(fMorto, std::memory_order_relaxed);
+        s_fRange.store(fRange, std::memory_order_relaxed);
+        s_fTime.store(fTime, std::memory_order_relaxed);
+        s_fNpc.store(fNpc, std::memory_order_relaxed);
+        s_fCoord.store(fCoord, std::memory_order_relaxed);
+
+        s_active.store(dst, std::memory_order_release);
+
+        if (C.beatLog)
+        {
+            const uint32_t now = NowMs();
+            if (now - g_lastEspLog >= kLogMs)
+            {
+                g_lastEspLog = now;
+                Log("[esp] total=%d publicados=%d invis=%d | local=%d morto=%d range=%d time=%d npc=%d coord=%d "
+                    "| w2s ok=%u semMat=%u atras=%u fora=%u | maxDist=%.0f teamCheck=%d npcCheck=%d",
+                    total, s.count, invis, fLocal, fMorto, fRange, fTime, fNpc, fCoord,
+                    SDK::g_w2sOk.load(std::memory_order_relaxed),
+                    SDK::g_w2sSemMatriz.load(std::memory_order_relaxed),
+                    SDK::g_w2sAtras.load(std::memory_order_relaxed),
+                    SDK::g_w2sFora.load(std::memory_order_relaxed),
+                    static_cast<double>(C.espMaxDist),
+                    C.teamCheck ? 1 : 0, C.espNpc ? 1 : 0);
+            }
+        }
+    }
+
+    // ============================================================================
+    //  Draw — thread do render
+    // ============================================================================
+    void Draw()
+    {
+        if (!C.esp) { s_holdValid = false; return; }
+
+        const Snap* snap = Latest();
+        if (!snap) return;
+
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        if (!dl) return;
 
-        ImVec2 disp = ImGui::GetIO().DisplaySize;
-        float scrW = disp.x > 1.f ? disp.x : (float)SDK::ScreenW();
-        float scrH = disp.y > 1.f ? disp.y : (float)SDK::ScreenH();
+        float W, H;
+        ScreenSize(snap, W, H);          // >>> nunca bails por tamanho
 
-        ImU32 colBox = Col(C.espBoxColor);
-        ImU32 colText = Col(C.espTextColor);
-        ImU32 colSkel = Col(C.espSkelColor);
-        ImU32 colVis = Col(C.visColor);
-        ImU32 colNoVis = Col(C.noVisColor);
-        float th = C.espThickness;
-        if (th < 1.f) th = 1.f;
+        const Snap* use = snap;
+        bool holding = false;
 
-        int drawn = 0, visCount = 0, snapCount = 0;
-        int skSelf = 0, skDead = 0, skNpc = 0, skTeam = 0, skOff = 0, skDist = 0;
-        float cx = scrW * 0.5f;
-        float cyMid = scrH * 0.5f;
-        float cyBot = scrH;
-
-        for (int i = 0; i < n; ++i) {
-            Target& t = snap[i];
-
-            if (!t.player) continue;
-            if (local && t.player == local) { ++skSelf; continue; }
-            if (!t.alive) { ++skDead; continue; }
-            if (C.espNpc && t.npc) { ++skNpc; continue; }
-            if ((C.teamCheck || C.aimTeam) && SDK::g_localTeam >= 0 &&
-                t.team == SDK::g_localTeam) {
-                ++skTeam; continue;
+        if (snap->count == 0)
+        {
+            if (s_holdValid && s_staleStreak < kGraceFrames) {
+                use = &s_hold; holding = true;
+                s_hold.frame = snap->frame;      // >>> preserva o frame corrente
             }
-            if (!t.onScreen) { ++skOff; continue; }
-            if (C.espMaxDist > 1.f && t.dist > C.espMaxDist) { ++skDist; continue; }
-
-            float top = t.scrHead.y + C.espOffY;
-            float h = (t.scrFeet.y - top) * C.espScaleY;
-            if (h < 4.f || h > 2000.f) continue;
-
-            float w = h * 0.5f * (C.espBodyH / 1.8f);
-            float x0 = t.scrHead.x - w * 0.5f;
-            float y0 = top;
-            float x1 = t.scrHead.x + w * 0.5f;
-            float y1 = top + h;
-
-            const bool vis = t.visible;
-            if (vis) ++visCount;
-            ImU32 colState = vis ? colVis : colNoVis;
-
-            // ---- visual check: marcador + linha da mira ----
-            if (C.espVisCheck) {
-                dl->AddCircleFilled(ImVec2(t.scrHead.x, t.scrHead.y), 3.f, colState, 12);
-                if (C.espVisLine)
-                    dl->AddLine(ImVec2(cx, cyMid), ImVec2(t.scrHead.x, t.scrHead.y), colState, th);
+            ++s_staleStreak;
+        }
+        else if (Desenhaveis(snap, W, H) > 0)
+        {
+            s_hold = *snap;
+            s_holdValid = true;
+            s_staleStreak = 0;
+        }
+        else
+        {
+            if (s_holdValid && s_staleStreak < kGraceFrames) {
+                use = &s_hold; holding = true;
+                s_hold.frame = snap->frame;
             }
+            ++s_staleStreak;
+        }
 
-            // ---- snapline: SEMPRE da base da tela ate os pes ----
-            if (C.espSnapline) {
-                dl->AddLine(ImVec2(cx, cyBot), ImVec2(t.scrFeet.x, t.scrFeet.y),
-                    C.espVisCheck ? colState : colBox, th);
-                ++snapCount;
-            }
+        int desenhados = 0, fora = 0;
 
-            ImU32 boxCol = C.espVisCheck ? colState : colBox;
+        __try
+        {
+            for (int i = 0; i < use->count; ++i)
+            {
+                const Snap::Ent& e = use->ents[i];
 
-            if (C.espFill)
-                dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), Col(C.espBoxColor, 0.20f));
+                float x0, y0, x1, y1;
+                if (!RectOk(e, W, H, x0, y0, x1, y1)) { ++fora; continue; }
 
-            if (C.espBox)
-                dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), boxCol, 0.f, 0, th);
+                const ImU32 boxCol = e.aim ? IM_COL32(255, 255, 60, 255)
+                    : (e.visible ? Col(C.espBoxColor) : Col(C.noVisColor));
+                const ImU32 txtCol = e.visible ? Col(C.visColor) : Col(C.noVisColor);
 
-            if (t.player == SDK::g_aimTarget)
-                dl->AddRect(ImVec2(x0 - 2.f, y0 - 2.f), ImVec2(x1 + 2.f, y1 + 2.f),
-                    colState, 0.f, 0, th + 1.f);
+                dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), boxCol, 0.0f, 0, 1.6f);
 
-            if (C.espHealth) {
-                float hp = t.health * 0.01f;
-                if (!(hp >= 0.f && hp <= 1.f)) hp = 1.f;
+                const float cx = (x0 + x1) * 0.5f;
+                dl->AddLine(ImVec2(W * 0.5f, H - 2.0f), ImVec2(cx, y1), boxCol, 1.0f);
 
-                float bw = 4.f;
-                float bx = x0 - bw - 2.f;
-                dl->AddRectFilled(ImVec2(bx, y0), ImVec2(bx + bw, y1), IM_COL32(0, 0, 0, 180));
-                dl->AddRectFilled(ImVec2(bx, y1 - h * hp), ImVec2(bx + bw, y1),
-                    IM_COL32((int)(255.f * (1.f - hp)), (int)(255.f * hp), 0, 255));
+                dl->AddText(ImVec2(x0, y0 - 13.0f), txtCol, e.name);
 
-                if (C.espHealthNum) {
-                    // >>> FIX 2: sem sprintf
-                    char hpBuf[16];
-                    AppendInt(hpBuf, (int)(t.health + 0.5f));
-                    dl->AddText(ImVec2(bx - 22.f, y0), colText, hpBuf);
+                char buf[24];
+                sprintf_s(buf, "%.0fm", static_cast<double>(e.dist));
+                dl->AddText(ImVec2(x0, y1 + 2.0f), txtCol, buf);
+
+                if (e.health > 0.0f)
+                {
+                    float frac = e.health / 100.0f;
+                    if (frac < 0.0f) frac = 0.0f;
+                    if (frac > 1.0f) frac = 1.0f;
+
+                    const float bh = y1 - y0;
+                    dl->AddRectFilled(ImVec2(x0 - 5.0f, y0), ImVec2(x0 - 2.0f, y1),
+                        IM_COL32(0, 0, 0, 140));
+                    dl->AddRectFilled(ImVec2(x0 - 5.0f, y1 - bh * frac), ImVec2(x0 - 2.0f, y1),
+                        ImColor::HSV(frac * 0.33f, 0.85f, 1.0f));
                 }
-            }
 
-            if (C.espSkeleton) {
-                dl->AddLine(ImVec2(t.scrHead.x, y0), ImVec2(t.scrHead.x, y1), colSkel, th);
-                float sy = y0 + h * 0.22f;
-                dl->AddLine(ImVec2(x0, sy), ImVec2(x1, sy), colSkel, th);
-                dl->AddLine(ImVec2(x0, sy), ImVec2(t.scrHead.x, y0 + h * 0.06f), colSkel, th);
-                dl->AddLine(ImVec2(x1, sy), ImVec2(t.scrHead.x, y0 + h * 0.06f), colSkel, th);
+                ++desenhados;
             }
-
-            if (C.espName && t.name[0]) {
-                float tw = (float)strlen(t.name) * (C.espFontSize * 0.55f);
-                dl->AddText(ImVec2(t.scrHead.x - tw * 0.5f, y0 - C.espFontSize - 2.f), colText, t.name);
-            }
-
-            if (C.espWeapon) {
-                char wbuf[32];
-                int wn = AppendInt(wbuf, t.weapon);
-                wbuf[wn] = 0;
-                dl->AddText(ImVec2(t.scrHead.x - 20.f, y1 + 2.f), colText, wbuf);
-            }
-
-            if (C.espDistance) {
-                // >>> FIX 2: sem sprintf
-                char dbuf[16];
-                int dn = AppendInt(dbuf, (int)(t.dist + 0.5f));
-                dbuf[dn++] = 'm'; dbuf[dn] = 0;
-                dl->AddText(ImVec2(t.scrHead.x - 16.f, y1 + C.espFontSize + 2.f), colText, dbuf);
-            }
-
-            drawn++;
         }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] ESP::Draw loop"); }
 
-        SDK::dbg_drawn = drawn;
+        if (C.beatLog)
+        {
+            const uint32_t now = NowMs();
+            if (now - g_lastDrawLog >= kLogMs)
+            {
+                g_lastDrawLog = now;
 
-        static ULONGLONG lastLog = 0;
-        ULONGLONG now = GetTickCount64();
-        if (now - lastLog >= 1000) {
-            lastLog = now;
-            // >>> FIX 5: todos os gates no mesmo lugar. Se 'desenhados' cai a
-            //     zero, o motivo esta' explicito: local/viewProj/ready, ou a
-            //     distribuicao dos 'skip'.
-            Log("[esp] alvos=%d desenhados=%d visiveis=%d snap=%d/%d visCheck=%d los=%s "
-                "| skip eu=%d morto=%d npc=%d time=%d fora=%d dist=%d "
-                "| local=%d viewProj=%d ready=%d",
-                n, drawn, visCount, snapCount, C.espSnapline ? 1 : 0,
-                C.espVisCheck ? 1 : 0, SDK::LosReady() ? "OK" : "OFF",
-                skSelf, skDead, skNpc, skTeam, skOff, skDist,
-                local ? 1 : 0, (int)SDK::g_viewProjOk, (int)Hooks::g_sdkReady);
+                // scr x vp: se divergirem, e' ESCALA, nao camera.
+                GLint vp[4] = { 0, 0, 0, 0 };
+                glGetIntegerv(GL_VIEWPORT, vp);
+
+                Log("[esp-draw] pub=%d dr=%d fora=%d scr=%.0fx%.0f vp=%dx%d hold=%d "
+                    "| proj=%d frame=%llu torn=%u glErr=%u",
+                    use->count, desenhados, fora, W, H, vp[2], vp[3], holding ? 1 : 0,
+                    (int)SDK::g_viewProjOk,
+                    (unsigned long long)SDK::g_frameId,
+                    SDK::g_fdTorn.load(std::memory_order_relaxed),
+                    SDK::g_glErrTotal.load(std::memory_order_relaxed));
+            }
         }
+    }
+
+    // ============================================================================
+    const Snap* Latest()
+    {
+        int i = s_active.load(std::memory_order_acquire);
+        if (i < 0 || i >= kSlots) i = 0;
+        return &s_buf[i];
+    }
+
+    int Count() { return s_count.load(std::memory_order_relaxed); }
+    int Invisiveis() { return s_invis.load(std::memory_order_relaxed); }
+
+    void Reset()
+    {
+        s_holdValid = false;
+        s_emptyStreak = 0;
+        s_staleStreak = 0;
+        for (auto& L : s_latch) L = Latch{};
+        for (auto& b : s_buf) { b.count = 0; b.w = 0; b.h = 0; }
+        s_count.store(0, std::memory_order_relaxed);
+        s_invis.store(0, std::memory_order_relaxed);
     }
 
 } // namespace ESP

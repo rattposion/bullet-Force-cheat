@@ -24,6 +24,7 @@
     <ClInclude Include="config.h" />
     <ClInclude Include="deps.h" />
     <ClInclude Include="dupe.h" />
+    <ClInclude Include="esp.h" />
     <ClInclude Include="features.h" />
     <ClInclude Include="globals.h" />
     <ClInclude Include="hooks.h" />

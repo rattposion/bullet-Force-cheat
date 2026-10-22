@@ -7,6 +7,9 @@
 #include "common.h"
 #include "il2cpp.h"
 
+#include <cstdint>
+#include <cstring>
+
 // Capacidade do buffer de nome. Se mudar, mude junto com quem escreve.
 inline constexpr int kTargetNameLen = 40;
 
@@ -14,6 +17,9 @@ inline constexpr int kTargetNameLen = 40;
 #ifndef MAX_TARGETS
 #define MAX_TARGETS 128
 #endif
+
+static_assert(MAX_TARGETS > 0, "MAX_TARGETS precisa ser positivo");
+static_assert(MAX_TARGETS <= 4096, "MAX_TARGETS grande demais para o tick");
 
 // ============================================================================
 //  Target
@@ -32,12 +38,15 @@ inline constexpr int kTargetNameLen = 40;
 //    - g_targets[] e' reescrito in-place pelo thread do jogo. Para usar fora
 //      do lock, copie (Snapshot()).
 //
-//  >>> onScreen
-//    Quem escreve e' UpdateTargets(), e ele precisa SEMPRE rodar — inclusive
-//    quando o local player nao existe naquele frame. RefreshTargets() zera
-//    'onScreen' de todo mundo; se UpdateTargets() saisse antes de recomputar
-//    (era o caso), o ESP ficava vazio com os alvos perfeitamente validos.
-//    O esp.cpp trata 'onScreen == false' como "nao desenha este alvo".
+//  CONTRATO DE COPIA
+//    - Target e' POD trivial: copia por valor, memcpy e realocacao sao seguros.
+//      Se voce adicionar membro com ctor/dtor (string, vector), o
+//      static_assert abaixo quebra e o Snapshot precisa ser revisto.
+//
+//  health x hp
+//    Mesmo conceito. 'health' e' o campo autoritativo; 'hp' e' um espelho
+//    legado mantido para nao quebrar call site. Sao escritos SEMPRE juntos —
+//    se divergirem, e' bug de quem escreveu. Codigo novo usa 'health'.
 // ============================================================================
 struct Target {
     Il2CppObject* obj = nullptr;        // emprestado
@@ -53,12 +62,14 @@ struct Target {
 
     bool   onScreen = false;
     bool   alive = false;
+    bool   enemy = true;
     bool   npc = false;
     bool   visible = false;
 
     int    team = 0;
     int    weapon = 0;
     float  health = 100.f;
+    float  hp = 100.f;                  // espelho legado de health
     float  dist = 0.f;
 
     uint32_t slot = 0;                  // estavel enquanto o player existir
@@ -79,3 +90,6 @@ struct Target {
 
     bool HasName() const { return name[0] != '\0'; }
 };
+
+static_assert(std::is_trivially_copyable<Target>::value,
+    "Target deixou de ser trivialmente copiavel — revise Snapshot()");

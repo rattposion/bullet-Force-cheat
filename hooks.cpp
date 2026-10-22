@@ -1,28 +1,27 @@
 // ============================================================================
-//  hooks.cpp  (v5 — alinhado com o hooks.h novo)
+//  hooks.cpp  (v26)  — render (wglSwapBuffers), hooks de thread, wndproc, cursor
 //
-//  >>> MUDANCAS DESTA VERSAO (correcao do ESP piscando/sumindo):
-//  F) RENDER GATE: 'if (g_sdkReady) ESP::Draw()' -> 'if (AtLeast(Stage::Hooks))'.
-//     g_sdkReady e' reescrito a cada frame por Combat::Tick() e pisca; usa-lo
-//     como gate de render acoplava o overlay a camada de dados. O gate
-//     correto e' o ESTAGIO DE VIDA.
-//  G) AtLeast(): durante Tearing, Down devolvia false (o early-return
-//     mascarava 0 >= 0). Agora Down e' sempre alcancado.
-//  H) GetViewSize(): spin com teto (poderia girar indefinidamente se o
-//     writer fosse preemptado entre os dois stores).
-//  I) hk_SetCursorPos(): usava so' C.menuOpen e engolia TODO reposicionamento
-//     de cursor com o menu aberto — o jogo nao conseguia recentrar a mira.
-//     Agora consulta Menu_WantsMouse() (que existia e nunca era chamada).
-//  J) Removidos (sem chamador): g_hooksLive, FrameNow, FontCount, SafeFont.
+//  >>> FIX v26  (principio 5: tamanho e escala; principio 6: instrumentacao)
+//   1) O VIEWPORT do GL passa a ser a UNICA fonte de tamanho. GetClientRect e'
+//      so' fallback, e a divergencia e' logada uma vez. W2S, DisplaySize e
+//      glViewport usam o mesmo par por construcao.
+//   2) DrainGlErrors(): falha do renderer vira contador, nao silencio.
 //
-//  >>> CONTEUDO FUNCIONAL DA v4/v3 (preservado):
-//  A) g_frameCounter: uint64_t. B) g_viewW/g_viewH atomicos.
-//  D) Shutdown: bool. E) Ciclo de vida por Stage.
-//  23) hk_lateUpdate SEM early-return por instancia.
-//  24) WATCHDOG: swap assume o tick se o LateUpdate sumir por >250 ms.
-//  25) ClassOf valida com Plausible/PlausibleObj.
-//  26) Shutdown reseta g_lastTickMs.
-//  16-22, 1-15: mantidos.
+//  >>> FIX v25  (bala nao acerta nada + AV write em fase=hk_fire)
+//   1) slot da direcao DETECTADO (|v| ~ 1); muzzle real; PHASE por etapa.
+//   2) Writable(): checagem de gravabilidade em ApplyNoRecoil.
+//   3) Direcao final renormalizada.
+//
+//  >>> FIX v24: silent aim SEGURO (restaura o original se falhar) + sonda.
+//  >>> FIX v23: fwd decl de hk_wndProc (C2065); (LPCSTR)IDC_ARROW (C2664).
+//  >>> FIX v22: HandleKeys incondicional; INPUT_TEST_LEVEL 7; dono unico do
+//      toggle; cursor auto-curavel; injecao de mouse so' como fallback.
+//  >>> FIX v21: SetStage nao escreve g_sdkReady (dono: Combat::Tick).
+//  >>> FIX v20: anti-blink via WithinFrameScope; hk_fire7 leve.
+//  >>> FIX v19: hk_fire7 blindado por etapa; Override(p2,p3).
+//  >>> FIX v18: bool Init(); VEH proprio.
+//  >>> FIX v17: sem enum Stage local; g_frameOpen atomico; SDK::SetRot.
+//  >>> FIX v16: cada desenho com seu __try e ImGui::Render() incondicional.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -34,6 +33,7 @@
 
 #include "MinHook.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_opengl3.h"
 
@@ -45,39 +45,89 @@
 #include "sdk.h"
 #include "hooks.h"
 #include "features.h"
+#include "aimbot.h"
 
 #pragma comment(lib, "opengl32.lib")
 
 #define WATCH_MAX_LINES   12
 #define PROBE_DIFF_MAX    8
 #define TICK_WATCHDOG_MS  250
+#define WND_REAPPLY_MS    500     // reaplica o wndproc se o jogo restaurar o dele
+#define MOUSE_FALLBACK_MS 120     // injeta mouse so' se o wndproc ficou mudo
+
+// escada de isolamento: 0 = so' menu do cheat, 7 = tudo
+#define INPUT_TEST_LEVEL  7
+
+// g_phase e' DEFINIDO em UM .cpp (sdk.cpp). Aqui so' usamos via PHASE.
+extern const char* g_phase;
+#ifndef PHASE
+#define PHASE(x) (g_phase = (x))
+#endif
 
 namespace Hooks {
 
     // -----------------------------------------------------------------------
-    //  Estado global
+    //  Globais DECLARADAS no hooks.h (por isso nao sao static)
     // -----------------------------------------------------------------------
+    std::atomic<bool>     g_hooksLive{ false };
     std::atomic<bool>     g_imguiReady{ false };
-    std::atomic<bool>     g_sdkReady{ false };
+    std::atomic<bool>     g_sdkReady{ false };       // dono: Combat::Tick
     std::atomic<uint64_t> g_frameCounter{ 0 };
-
-    // Espelhos do viewport. Escritos SO' por SetViewSize().
-    std::atomic<int> g_viewW{ 1920 };
-    std::atomic<int> g_viewH{ 1080 };
+    std::atomic<uint32_t> g_imguiGeneration{ 0 };
+    std::atomic<int>      g_viewW{ 1920 };
+    std::atomic<int>      g_viewH{ 1080 };
 
     // -----------------------------------------------------------------------
-    //  Ciclo de vida — fonte unica
+    //  Internos
     // -----------------------------------------------------------------------
     static std::atomic<int> g_stage{ (int)Stage::Down };
 
+    static std::atomic<uint32_t> g_frameDrops{ 0 };
+    static std::atomic<uint32_t> g_wndProcCalls{ 0 };
+    static std::atomic<uint32_t> g_cwpCalls{ 0 };
+    static std::atomic<uint32_t> g_avCount{ 0 };
+    static std::atomic<uint32_t> g_vehCount{ 0 };
+
+    static std::atomic<uint32_t> g_abortPre{ 0 };
+    static std::atomic<uint32_t> g_abortMenu{ 0 };
+    static std::atomic<uint32_t> g_abortEsp{ 0 };
+    static std::atomic<uint32_t> g_abortMisc{ 0 };
+    static std::atomic<uint32_t> g_abortRender{ 0 };
+    static std::atomic<uint32_t> g_abortDraw{ 0 };
+
+    // ultimo instante em que o hk_wndProc viu algo (fallbacks)
+    static std::atomic<ULONGLONG> g_lastWndMsg{ 0 };
+    static std::atomic<ULONGLONG> g_lastMouseMsg{ 0 };
+
+    // slot do parametro que e' a DIRECAO no FireBullet (-1 = nao detectado)
+    static std::atomic<int> s_dirSlot{ -1 };
+
+    uint32_t FrameId() { return (uint32_t)g_frameCounter.load(std::memory_order_relaxed); }
+
+    // -----------------------------------------------------------------------
+    //  Escada INPUT_TEST_LEVEL  (NAO confundir com AtLeast(Stage))
+    // -----------------------------------------------------------------------
+    namespace Lvl {
+        constexpr int Menu = 0;
+        constexpr int Esp = 1;
+        constexpr int Tick = 2;
+        constexpr int Scp = 3;
+        constexpr int CursorFn = 4;
+        constexpr int Subclass = 5;
+        constexpr int BlockKeys = 6;
+        constexpr int Watchdog = 7;
+    }
+    inline bool AtLvl(int l) { return INPUT_TEST_LEVEL >= l; }
+
+    // -----------------------------------------------------------------------
+    //  Ciclo de vida — Stage vem do hooks.h
+    // -----------------------------------------------------------------------
     Stage StageNow() { return (Stage)g_stage.load(std::memory_order_acquire); }
     bool  IsLive() { return StageNow() == Stage::Live; }
 
     bool AtLeast(Stage s) {
         const Stage cur = StageNow();
-        // >>> FIX [G]: 'Down' e' SEMPRE alcancado (0 >= 0). Antes o early-return
-        //     de Tearing devolvia false ate' para Down.
-        if (cur == Stage::Tearing) return s == Stage::Down;
+        if (cur == Stage::Tearing) return false;
         return (int)cur >= (int)s;
     }
 
@@ -94,76 +144,62 @@ namespace Hooks {
         return "?";
     }
 
-    // UNICO lugar que escreve os espelhos. Por isso nao podem divergir.
+    // >>> [FIX v21] g_sdkReady NAO aqui: o dono e' Combat::Tick (latch).
     void SetStage(Stage s) {
         const int v = (int)s;
         g_stage.store(v, std::memory_order_release);
-
-        // g_sdkReady e' TELEMETRIA: Combat::Tick() reescreve a cada frame.
-        // g_imguiReady e' gate REAL (menu + Menu_WantsMouse).
-        g_sdkReady.store(v >= (int)Stage::Sdk, std::memory_order_release);
+        g_hooksLive.store(v >= (int)Stage::Hooks, std::memory_order_release);
         g_imguiReady.store(v >= (int)Stage::ImGui, std::memory_order_release);
     }
 
-    // Avanca sem regredir. Usado pelo fluxo normal (Init/InitImGui/Rebind).
-    // Nao mexe durante Tearing: quem manda no teardown e' o Shutdown().
-    static void Advance(Stage s) {
-        const int cur = (int)g_stage.load(std::memory_order_relaxed);
+    void Advance(Stage s) {
+        const int cur = (int)g_stage.load(std::memory_order_acquire);
         if (cur == (int)Stage::Tearing) return;
         if ((int)s > cur) SetStage(s);
     }
 
     // -----------------------------------------------------------------------
-    //  Viewport — par publicado por um unico writer
+    //  Viewport
     // -----------------------------------------------------------------------
     void SetViewSize(int w, int h) {
-        g_viewH.store(h, std::memory_order_release);
-        g_viewW.store(w, std::memory_order_release);
+        if (w > 0) g_viewW.store(w, std::memory_order_relaxed);
+        if (h > 0) g_viewH.store(h, std::memory_order_relaxed);
     }
-
     ViewSize GetViewSize() {
-        // Re-tenta enquanto a largura estiver mudando. O writer publica
-        // altura antes de largura, entao largura estavel => par coerente.
-        // >>> FIX [H]: com teto. Sem ele, um preempt entre os dois stores
-        //     do writer podia girar sem limite.
-        for (int guard = 0; guard < 64; ++guard) {
-            const int w1 = g_viewW.load(std::memory_order_acquire);
-            const int h = g_viewH.load(std::memory_order_acquire);
-            if (w1 == g_viewW.load(std::memory_order_acquire))
-                return ViewSize{ w1, h };
-            YieldProcessor();
-        }
         return ViewSize{ g_viewW.load(std::memory_order_relaxed),
                          g_viewH.load(std::memory_order_relaxed) };
     }
+    int ViewW() { return g_viewW.load(std::memory_order_relaxed); }
+    int ViewH() { return g_viewH.load(std::memory_order_relaxed); }
 
-    static bool g_mhInit = false;
-    static std::atomic<uint64_t> g_lastTickFrame{ ~0ull };
-    static std::atomic<uint64_t> g_lastTickMs{ 0 };
+    // -----------------------------------------------------------------------
+    //  Handles / estado
+    // -----------------------------------------------------------------------
+    static HWND   g_hwnd = nullptr;
+    static bool   g_imguiInit = false;
+    static bool   g_win32Backend = false;
+    static CRITICAL_SECTION g_imCs;
+    static bool   g_imCsInit = false;
+    static HHOOK  g_cwp = nullptr;
+    static PVOID  g_veh = nullptr;
 
-    static std::atomic<bool> g_mainIsPlayerClass{ false };
+    typedef BOOL(WINAPI* tSwapBuffers)(HDC);
+    typedef BOOL(WINAPI* tSetCursorPos)(int, int);
+    typedef void(__fastcall* tLateUpdate)(void*, void*);
+    typedef bool(__fastcall* tFireBullet)(void*, void*, int, float, Vec3, Vec3, bool, double, int);
 
-    // ---- anti-recoil ----
-    static ::Quat   g_pendingCam{ 0.f, 0.f, 0.f, 1.f };
-    static std::atomic<uint64_t> g_lastShotMs{ 0 };
-    static int      g_watchLines = 0;
+    static tSwapBuffers  o_swap = nullptr;
+    static tSetCursorPos o_setCursorPos = nullptr;
+    static tLateUpdate   o_lateUpdate = nullptr;
+    static tFireBullet   o_fire7 = nullptr;
+    static WNDPROC       o_wndProc = nullptr;
 
-    static bool KeyDown(int vk) { return vk ? (GetAsyncKeyState(vk) & 0x8000) != 0 : false; }
+    static std::atomic<uint64_t>  g_lastTickFrame{ ~0ull };
+    static std::atomic<ULONGLONG> g_lastLuMs{ 0 };
 
-    static bool Edge(int vk) {
-        static bool prev[256] = {};
-        if (!vk) return false;
-        bool cur = KeyDown(vk);
-        bool r = cur && !prev[vk & 0xFF];
-        prev[vk & 0xFF] = cur;
-        return r;
-    }
-
-    static int WatchMax() {
-        int v = C.watchMaxLines;
-        return (v > 0 && v < 4096) ? v : WATCH_MAX_LINES;
-    }
-
+    // -----------------------------------------------------------------------
+    //  Helpers
+    // -----------------------------------------------------------------------
     static bool Plausible(const void* p) {
         uintptr_t a = (uintptr_t)p;
         if (a < 0x10000 || a > 0x00007FFFFFFFFFFFULL) return false;
@@ -179,6 +215,34 @@ namespace Hooks {
         return Plausible(*(const void**)p);
     }
 
+    static inline float Len(const Vec3& v) {
+        return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+    }
+
+    // a pagina aceita ESCRITA? (Plausible so' checa leitura)
+    static bool Writable(const void* p) {
+        uintptr_t a = (uintptr_t)p;
+        if (a < 0x10000 || a > 0x00007FFFFFFFFFFFULL) return false;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        const DWORD ruim = PAGE_NOACCESS | PAGE_GUARD | PAGE_READONLY |
+            PAGE_EXECUTE | PAGE_EXECUTE_READ;
+        return (mbi.Protect & ruim) == 0;
+    }
+
+    // >>> [FIX v26] falha do renderer vira contador (principio 6)
+    static uint32_t DrainGlErrors(const char* tag) {
+        uint32_t n = 0;
+        GLenum e;
+        while ((e = glGetError()) != GL_NO_ERROR && n < 8) {
+            Log("[gl] %s erro=0x%X", tag, (unsigned)e);
+            ++n;
+        }
+        if (n) SDK::g_glErrTotal.fetch_add(n, std::memory_order_relaxed);
+        return n;
+    }
+
     static MethodInfo* FindMethodByArity(Il2CppClass* k, const char* name, uint32_t argc) {
         if (!k || !name) return nullptr;
         void* iter = nullptr;
@@ -191,18 +255,6 @@ namespace Hooks {
         }
         return nullptr;
     }
-
-    static MethodInfo* FindMethodAny(Il2CppClass* k, const char* name) {
-        if (!k || !name) return nullptr;
-        void* iter = nullptr;
-        for (;;) {
-            const MethodInfo* m = il2cpp_class_get_methods(k, &iter);
-            if (!m) break;
-            if (strcmp(il2cpp_method_get_name(m), name) == 0) return (MethodInfo*)m;
-        }
-        return nullptr;
-    }
-
     static Il2CppClass* FindClassNamed(const char* name) {
         if (!name) return nullptr;
         Il2CppClass* k = SDK::FindClass(name);
@@ -211,86 +263,132 @@ namespace Hooks {
         if (!n || strcmp(n, name) != 0) return nullptr;
         return k;
     }
-
     static void* FindMethodPtr(const char* klass, const char* method, uint32_t argc) {
         Il2CppClass* k = FindClassNamed(klass);
         if (!k) return nullptr;
         MethodInfo* m = FindMethodByArity(k, method, argc);
         return m ? SDK::MethodPtr(m) : nullptr;
     }
-
     static Il2CppClass* ClassOf(void* o) {
         if (!il2cpp_object_get_class || !PlausibleObj(o)) return nullptr;
         return il2cpp_object_get_class((const Il2CppObject*)o);
     }
 
+    static bool KeyDown(int vk) {
+        if (vk <= 0 || vk > 255) return false;
+        return (GetAsyncKeyState(vk) & 0x8000) != 0;
+    }
+    static bool Edge(int vk) {
+        static bool prev[256] = {};
+        if (vk <= 0 || vk > 255) return false;
+        const bool now = KeyDown(vk);
+        const bool was = prev[vk];
+        prev[vk] = now;
+        return now && !was;
+    }
+
+    // o menu quer o mouse? (fonte unica de verdade)
+    static inline bool MenuWantsMouse() {
+        return C.menuOpen && g_imguiReady.load(std::memory_order_relaxed);
+    }
+
     // -----------------------------------------------------------------------
-    //  NO-RECOIL
+    //  VEH — conta e reporta
+    // -----------------------------------------------------------------------
+    static LONG CALLBACK VehHandler(EXCEPTION_POINTERS* ep) {
+        if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+        if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+            g_vehCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // -----------------------------------------------------------------------
+    //  Fontes
+    // -----------------------------------------------------------------------
+    int FontCount() {
+        if (!g_imguiReady.load() || !ImGui::GetCurrentContext()) return 0;
+        ImGuiIO& io = ImGui::GetIO();
+        return io.Fonts ? io.Fonts->Fonts.Size : 0;
+    }
+    ImFont& SafeFont(int idx) {
+        if (g_imguiReady.load() && ImGui::GetCurrentContext()) {
+            ImGuiIO& io = ImGui::GetIO();
+            const int n = io.Fonts ? io.Fonts->Fonts.Size : 0;
+            if (n > 0) {
+                if (idx < 0) idx = 0;
+                if (idx >= n) idx = n - 1;
+                if (ImFont* f = io.Fonts->Fonts[idx]) return *f;
+            }
+            if (ImFont* f = ImGui::GetFont()) return *f;
+        }
+        static ImFont s_dummy;
+        return s_dummy;
+    }
+
+    // -----------------------------------------------------------------------
+    //  NO-RECOIL — valida objeto E destino antes de escrever
     // -----------------------------------------------------------------------
     static void ApplyNoRecoil() {
         if (!C.noRecoil || !SDK::g_localPlayer) return;
         __try {
             Il2CppObject* ct = SDK::CamTfObj();
-            if (!ct) return;
+            if (!ct || !Writable(ct)) return;
+
+            void* dst = (uint8_t*)ct + SDK::O_rotation;
+            if (!Writable(dst)) {
+                Log("[fire] no-recoil: destino NAO gravavel (%p) ct=%p", dst, ct);
+                return;
+            }
             ::Quat pr = SDK::GetPlayerRot(SDK::g_localPlayer);
             SDK::SetRot(ct, pr);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    static void ApplyNoRecoilFrame(uint64_t f) {
-        static std::atomic<uint64_t> last{ ~0ull };
-        uint64_t prev = last.exchange(f);
-        if (prev == f) return;
-        ApplyNoRecoil();
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_avCount.fetch_add(1, std::memory_order_relaxed); }
     }
 
     // -----------------------------------------------------------------------
-    //  UM unico ponto de entrada do tick. 1x por frame, sem filtro de
-    //  instancia, com watchdog. Locais POD -> pode rodar dentro de __try.
+    //  CURSOR — auto-curavel, sem contador
     // -----------------------------------------------------------------------
-    static void RunTickOnce() {
-        const uint64_t f = g_frameCounter.load(std::memory_order_relaxed);
-        uint64_t previous = g_lastTickFrame.load(std::memory_order_relaxed);
-        for (;;) {
-            if (previous == f) return;
-            if (g_lastTickFrame.compare_exchange_weak(
-                previous, f,
-                std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-                break;
+    static bool g_cursorFreed = false;
+    static bool g_cursorWasShowing = true;
+
+    static bool IsCursorShowing() {
+        CURSORINFO ci{};
+        ci.cbSize = sizeof(ci);
+        if (!GetCursorInfo(&ci)) return true;
+        return (ci.flags & CURSOR_SHOWING) != 0;
+    }
+
+    // idempotente: so' chama ShowCursor se o estado real divergir
+    static void ForceCursor(bool show) {
+        if (IsCursorShowing() == show) return;
+        int guard = 0;
+        if (show) { while (!IsCursorShowing() && ++guard < 64) ShowCursor(TRUE); }
+        else { while (IsCursorShowing() && ++guard < 64) ShowCursor(FALSE); }
+    }
+
+    static void ApplyCursorOwnership() {
+        const bool want = MenuWantsMouse();
+
+        if (want) {
+            if (!g_cursorFreed) {
+                g_cursorWasShowing = IsCursorShowing();
+                g_cursorFreed = true;
+                Log("[cursor] menu aberto: cursor LIVRE (wasShowing=%d)", (int)g_cursorWasShowing);
             }
+            ForceCursor(true);        // reafirma todo frame: o jogo re-esconde
+            ClipCursor(nullptr);      // reafirma: o jogo re-clipa
         }
-
-        g_lastTickMs.store(GetTickCount64(), std::memory_order_relaxed);
-        SDK::g_frameId = (uint32_t)f;
-        Combat::Tick();
+        else if (g_cursorFreed) {
+            g_cursorFreed = false;
+            ForceCursor(g_cursorWasShowing);
+            Log("[cursor] menu fechado: cursor devolvido (showing=%d)", (int)g_cursorWasShowing);
+        }
     }
-
-    // -----------------------------------------------------------------------
-    //  teclas
-    // -----------------------------------------------------------------------
-    void HandleKeys() {
-        if (Edge(C.menuKey)) C.menuOpen = !C.menuOpen;
-        if (Edge(C.panicKey)) Misc::Panic();
-        if (Edge(C.saveKey)) ConfigIO::Save();
-        if (Edge(C.unloadKey)) { ConfigIO::Save(); g_unload = true; }
-        if (C.aimKey) C.aimKeyDown = KeyDown(C.aimKey);
-    }
-
-    // -----------------------------------------------------------------------
-    //  cursor
-    // -----------------------------------------------------------------------
-    typedef BOOL(WINAPI* tSetCursorPos)(int, int);
-    static tSetCursorPos o_setCursorPos = nullptr;
 
     static BOOL WINAPI hk_SetCursorPos(int x, int y) {
-        // >>> FIX [I]: antes era 'if (C.menuOpen) return TRUE', que engolia
-        //     TODO reposicionamento de cursor enquanto o menu estivesse
-        //     aberto — o jogo nao conseguia recentrar a mira. Menu_WantsMouse()
-        //     (definida em features.cpp) e' quem sabe se o mouse e' do ImGui,
-        //     e nunca era chamada.
-        if (Menu_WantsMouse()) return TRUE;
+        // menu aberto: o jogo recentraliza o cursor a cada frame -> engole o warp
+        if (MenuWantsMouse()) return TRUE;
         return o_setCursorPos ? o_setCursorPos(x, y) : TRUE;
     }
 
@@ -301,133 +399,163 @@ namespace Hooks {
         if (!p) return false;
         if (MH_CreateHook(p, &hk_SetCursorPos, (void**)&o_setCursorPos) != MH_OK) return false;
         MH_EnableHook(p);
-        Log("[hooks] cursor hook OK");
+        Log("[cursor] hook SetCursorPos OK");
         return true;
     }
 
     // -----------------------------------------------------------------------
-    //  WNDPROC + render
+    //  WNDPROC
     // -----------------------------------------------------------------------
-    static HWND    g_hwnd = nullptr;
-    static WNDPROC o_wndProc = nullptr;
-    static bool    g_imguiInit = false;
-    static bool    g_imguiCtx = false;
-    static bool    g_win32Backend = false;
-    static bool    g_glBackend = false;
+    static LRESULT CALLBACK hk_wndProc(HWND, UINT, WPARAM, LPARAM);
 
-    static CRITICAL_SECTION  g_imCs;
-    static bool              g_imCsInit = false;
-    static std::atomic<bool> g_frameOpen{ false };
-
-    struct ImLock {
-        ImLock() { if (g_imCsInit) EnterCriticalSection(&g_imCs); }
-        ~ImLock() { if (g_imCsInit) LeaveCriticalSection(&g_imCs); }
-    };
+    void LogWndProcInfo() {
+        if (!g_hwnd) { Log("[wndproc] hwnd=null"); return; }
+        LONG_PTR cur = GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
+        MEMORY_BASIC_INFORMATION mbi{};
+        VirtualQuery((void*)cur, &mbi, sizeof(mbi));
+        Log("[wndproc] hwnd=%p cur=%p state=0x%X protect=0x%X orig=%p ours=%p",
+            (void*)g_hwnd, (void*)cur, (unsigned)mbi.State, (unsigned)mbi.Protect,
+            (void*)o_wndProc, (void*)hk_wndProc);
+    }
 
     static thread_local int t_wndDepth = 0;
 
-    static LRESULT CALLBACK hk_wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-        if (t_wndDepth > 0) {
-            return o_wndProc ? CallWindowProcA(o_wndProc, h, msg, wp, lp)
-                : DefWindowProcA(h, msg, wp, lp);
+    static bool IsMouseMsg(UINT m) {
+        switch (m) {
+        case WM_MOUSEMOVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK: case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+        case WM_RBUTTONDBLCLK: case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+        case WM_MBUTTONDBLCLK: case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+            return true;
         }
+        return false;
+    }
+
+    static LRESULT CALLBACK hk_wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+        g_wndProcCalls.fetch_add(1, std::memory_order_relaxed);
+        const ULONGLONG now = GetTickCount64();
+        g_lastWndMsg.store(now, std::memory_order_relaxed);
+        if (IsMouseMsg(msg)) g_lastMouseMsg.store(now, std::memory_order_relaxed);
+
+        if (t_wndDepth > 0)
+            return o_wndProc ? CallWindowProcA(o_wndProc, h, msg, wp, lp)
+            : DefWindowProcA(h, msg, wp, lp);
 
         ++t_wndDepth;
-        LRESULT r;
 
-        if (g_imguiInit && g_imCsInit) {
-            EnterCriticalSection(&g_imCs);
-            ImGui_ImplWin32_WndProcHandler(h, msg, wp, lp);
-            if (C.menuOpen) {
-                ImGuiIO& io = ImGui::GetIO();
-                if (io.WantCaptureMouse || io.WantCaptureKeyboard) {
-                    LeaveCriticalSection(&g_imCs);
-                    --t_wndDepth;
-                    return TRUE;
-                }
-            }
-            LeaveCriticalSection(&g_imCs);
+        // menu aberto: nao deixa o jogo esconder o cursor
+        if (C.menuOpen && msg == WM_SETCURSOR) {
+            SetCursor(LoadCursorA(nullptr, (LPCSTR)IDC_ARROW));
+            --t_wndDepth;
+            return TRUE;
         }
 
-        r = o_wndProc ? CallWindowProcA(o_wndProc, h, msg, wp, lp)
+        bool ate = false;
+        if (g_imguiInit && g_imCsInit && C.menuOpen) {
+            EnterCriticalSection(&g_imCs);
+            ImGui_ImplWin32_WndProcHandler(h, msg, wp, lp);
+            ImGuiIO& io = ImGui::GetIO();
+            ate = io.WantCaptureMouse || io.WantCaptureKeyboard;
+            LeaveCriticalSection(&g_imCs);
+
+            if (ate && IsMouseMsg(msg)) {
+                --t_wndDepth;
+                return TRUE;            // clique nao chega no jogo
+            }
+        }
+
+        LRESULT r = o_wndProc ? CallWindowProcA(o_wndProc, h, msg, wp, lp)
             : DefWindowProcA(h, msg, wp, lp);
         --t_wndDepth;
         return r;
     }
 
-    typedef BOOL(WINAPI* tSwapBuffers)(HDC);
-    static tSwapBuffers o_swap = nullptr;
+    // fallback: so' alimenta se o hk_wndProc estiver mudo
+    static LRESULT CALLBACK CwpProc(int code, WPARAM wp, LPARAM lp) {
+        if (code == HC_ACTION && lp) {
+            const CWPSTRUCT* c = (const CWPSTRUCT*)lp;
+            g_cwpCalls.fetch_add(1, std::memory_order_relaxed);
+            const ULONGLONG now = GetTickCount64();
+            const bool wndAlive = (now - g_lastWndMsg.load(std::memory_order_relaxed)) < 50;
+            if (!wndAlive && g_imguiInit && g_imCsInit && c->hwnd == g_hwnd) {
+                EnterCriticalSection(&g_imCs);
+                ImGui_ImplWin32_WndProcHandler(c->hwnd, c->message, c->wParam, c->lParam);
+                LeaveCriticalSection(&g_imCs);
+            }
+        }
+        return CallNextHookEx(nullptr, code, wp, lp);
+    }
+
+    // -----------------------------------------------------------------------
+    //  ImGui — ciclo de vida
+    // -----------------------------------------------------------------------
+    static void ShutdownImGui() {
+        if (!g_imguiInit) return;
+        ImGui_ImplOpenGL3_Shutdown();
+        if (g_win32Backend) { ImGui_ImplWin32_Shutdown(); g_win32Backend = false; }
+        ImGui::DestroyContext();
+        g_imguiGeneration.fetch_add(1, std::memory_order_acq_rel);
+        g_imguiInit = false;
+        Advance(Stage::Hooks);
+    }
 
     static bool InitImGui(HWND hwnd) {
         if (g_imguiInit) return true;
         if (!hwnd) return false;
-        if (!g_imCsInit) { InitializeCriticalSection(&g_imCs); g_imCsInit = true; }
 
-        if (!g_imguiCtx) {
-            ImGui::CreateContext();
-            ImGuiIO& io = ImGui::GetIO();
-            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-            io.IniFilename = nullptr;
-            ImGui::StyleColorsDark();
-            g_imguiCtx = true;
-        }
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        g_imguiGeneration.fetch_add(1, std::memory_order_acq_rel);
 
-        if (!g_win32Backend) {
-            if (!ImGui_ImplWin32_Init(hwnd)) {
-                Log("[hooks] ImGui_ImplWin32_Init FALHOU");
-                return false;
-            }
-            g_win32Backend = true;
-        }
+        ImGui::GetIO().IniFilename = nullptr;
+        ImGui::StyleColorsDark();
+        Menu::ApplyStyle();
 
-        if (!g_glBackend) {
-            if (!ImGui_ImplOpenGL3_Init("#version 130")) {
-                Log("[hooks] ImGui_ImplOpenGL3_Init FALHOU");
-                ImGui_ImplWin32_Shutdown();
-                g_win32Backend = false;
-                return false;
-            }
-            g_glBackend = true;
+        if (!ImGui_ImplWin32_Init(hwnd)) { Log("[imgui] Win32 init FALHOU"); return false; }
+        g_win32Backend = true;
+
+        if (!ImGui_ImplOpenGL3_Init()) {
+            Log("[imgui] OpenGL3 init FALHOU");
+            ImGui_ImplWin32_Shutdown();
+            g_win32Backend = false;
+            return false;
         }
 
         g_imguiInit = true;
-        Advance(Stage::ImGui);          // publica o espelho pelo caminho unico
-        Log("[hooks] ImGui inicializado (hwnd=%p)", hwnd);
+        Log("[imgui] contexto criado");
+        Advance(Stage::ImGui);
         return true;
     }
 
+    // -----------------------------------------------------------------------
+    //  Janela
+    // -----------------------------------------------------------------------
     static HWND ResolveWindow(HDC hdc) {
-        HWND h = WindowFromDC(hdc);
-        if (h) h = GetAncestor(h, GA_ROOT);
-        if (!h) {
-            HWND fg = GetForegroundWindow();
-            RECT r;
-            if (fg && GetClientRect(fg, &r) && (r.right - r.left) > 0 && (r.bottom - r.top) > 0)
-                h = fg;
-        }
-        if (!h) return nullptr;
-
-        RECT r;
-        if (!GetClientRect(h, &r)) return nullptr;
-        if ((r.right - r.left) <= 0 || (r.bottom - r.top) <= 0) return nullptr;
-        return h;
+        HWND h = hdc ? WindowFromDC(hdc) : nullptr;
+        if (h && h != GetDesktopWindow()) return h;
+        if (g_hwnd && IsWindow(g_hwnd)) return g_hwnd;
+        HWND fg = GetForegroundWindow();
+        if (fg && fg != GetDesktopWindow()) return fg;
+        return FindWindowA("UnityWndClass", nullptr);
     }
 
     static void RebindWindow(HWND hwnd) {
-        if (!hwnd) return;
-        HWND oldWnd = g_hwnd;
-        if (oldWnd == hwnd) return;
-
+        if (!hwnd || hwnd == GetDesktopWindow()) return;
         if (g_imCsInit) EnterCriticalSection(&g_imCs);
 
-        if (oldWnd && o_wndProc)
-            SetWindowLongPtrA(oldWnd, GWLP_WNDPROC, (LONG_PTR)o_wndProc);
+        HWND oldWnd = g_hwnd;
+        LONG_PTR prev = GetWindowLongPtrA(hwnd, GWLP_WNDPROC);
 
-        WNDPROC prev = (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
-        if (prev && prev != hk_wndProc) o_wndProc = prev;
+        if (prev == (LONG_PTR)hk_wndProc && hwnd == g_hwnd) {
+            if (g_imCsInit) LeaveCriticalSection(&g_imCs);
+            return;
+        }
+
+        SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
+        if (prev && prev != (LONG_PTR)hk_wndProc) o_wndProc = (WNDPROC)prev;
 
         g_hwnd = hwnd;
-        Log("[hooks] janela = %p (anterior=%p)", hwnd, oldWnd);
+        Log("[hooks] janela = %p (anterior=%p) orig=%p", (void*)hwnd, (void*)oldWnd, (void*)o_wndProc);
 
         if (!g_imguiInit) {
             InitImGui(hwnd);
@@ -437,8 +565,6 @@ namespace Hooks {
             g_win32Backend = false;
             if (!ImGui_ImplWin32_Init(hwnd)) {
                 Log("[hooks] ImGui_ImplWin32_Init FALHOU (rebind)");
-                // Falha PARCIAL, nao e' mudanca de estagio: ajusta o espelho
-                // direto. E' a unica excecao a regra do SetStage.
                 g_imguiReady.store(false, std::memory_order_release);
             }
             else {
@@ -451,18 +577,137 @@ namespace Hooks {
         if (g_imCsInit) LeaveCriticalSection(&g_imCs);
     }
 
+    // -----------------------------------------------------------------------
+    //  TICK — 1x por frame, dedupe por frame id, com watchdog
+    // -----------------------------------------------------------------------
+    static void RunTickOnce() {
+        const uint64_t f = g_frameCounter.load(std::memory_order_relaxed);
+        uint64_t previous = g_lastTickFrame.load(std::memory_order_relaxed);
+        for (;;) {
+            if (previous == f) return;
+            if (g_lastTickFrame.compare_exchange_weak(
+                previous, f, std::memory_order_acq_rel, std::memory_order_relaxed))
+                break;
+        }
+        SDK::g_frameId = (uint32_t)f;
+        __try { Combat::Tick(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] Combat::Tick"); }
+    }
+
+    static void __fastcall hk_lateUpdate(void* self, void* method) {
+        PHASE("hk_lateUpdate");
+        if (AtLvl(Lvl::Tick)) {
+            g_lastLuMs.store(GetTickCount64(), std::memory_order_relaxed);
+            RunTickOnce();
+        }
+        if (o_lateUpdate) o_lateUpdate(self, method);
+    }
+
+    static void Watchdog() {
+        if (!AtLvl(Lvl::Watchdog)) return;
+        if (!g_sdkReady.load(std::memory_order_acquire)) return;
+        const ULONGLONG now = GetTickCount64();
+        if (now - g_lastLuMs.load(std::memory_order_relaxed) < TICK_WATCHDOG_MS) return;
+        g_lastLuMs.store(now, std::memory_order_relaxed);
+        RunTickOnce();
+    }
+
+    // -----------------------------------------------------------------------
+    //  FIRE — blindado + silent aim com slot DETECTADO
+    // -----------------------------------------------------------------------
+    static bool __fastcall hk_fire7(void* self, void* method, int p0, float p1,
+        Vec3 p2, Vec3 p3, bool p4, double p5, int p6) {
+        PHASE("hk_fire");
+        if (!o_fire7) return false;
+
+        if (StageNow() < Stage::Live || !self || !g_sdkReady.load(std::memory_order_relaxed))
+            return o_fire7(self, method, p0, p1, p2, p3, p4, p5, p6);
+
+        // ---- sonda + deteccao automatica do slot da direcao (|v| ~ 1) ----
+        static int probe = 0;
+        if (probe < 8) {
+            ++probe;
+            const float l2 = Len(p2), l3 = Len(p3);
+            Log("[fire-probe] p2=(%.2f,%.2f,%.2f)|%.3f| p3=(%.2f,%.2f,%.2f)|%.3f| local=(%.1f,%.1f,%.1f)",
+                p2.x, p2.y, p2.z, l2, p3.x, p3.y, p3.z, l3,
+                SDK::g_localPos.x, SDK::g_localPos.y, SDK::g_localPos.z);
+
+            if (s_dirSlot.load() < 0) {
+                const float d2 = fabsf(l2 - 1.f), d3 = fabsf(l3 - 1.f);
+                int slot = (d2 <= d3) ? 0 : 1;
+                if (d2 > 0.25f && d3 > 0.25f) {
+                    Log("[fire-probe] nenhum param e' unitario — assumindo slot 0");
+                    slot = 0;
+                }
+                s_dirSlot.store(slot);
+                SDK::g_fireDirSlot.store(slot);
+                Log("[fire] dirSlot auto = %d (|p2|=%.3f |p3|=%.3f)", slot, l2, l3);
+            }
+        }
+        const int slot = s_dirSlot.load();
+
+        const Vec3 keep2 = p2;
+        const Vec3 keep3 = p3;
+
+        // ---- silent aim ----
+        if (C.aimKey) {
+            __try {
+                Vec3& dir = (slot == 0) ? p2 : p3;
+                const Vec3 keepDir = dir;
+
+                // muzzle: usa o parametro irmao SO' se ele parecer uma posicao
+                Vec3 muz = (slot == 0) ? p3 : p2;
+                const float lm = Len(muz);
+                const float lp = Len(SDK::g_localPos);
+                if (!(lm > 1.f && lm < 5000.f) || fabsf(lm - lp) > lp)
+                    muz = SDK::g_localPos;
+
+                PHASE("fire:aim");
+                const bool ok = Aimbot::Silent::Override(muz, dir);
+
+                if (!ok) dir = keepDir;
+                else {
+                    const float L = Len(dir);           // mantem unitario
+                    if (L > 1e-4f) { dir.x /= L; dir.y /= L; dir.z /= L; }
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                p2 = keep2; p3 = keep3;
+                Log("[fire] AV no silent aim");
+            }
+        }
+
+        // ---- no-recoil ----
+        if (C.noRecoil) {
+            __try { PHASE("fire:recoil"); ApplyNoRecoil(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { Log("[fire] AV no no-recoil"); }
+        }
+
+        __try {
+            PHASE("fire:orig");
+            const bool r = o_fire7(self, method, p0, p1, p2, p3, p4, p5, p6);
+            PHASE("fire:post");                 // sobreviveu ao original
+            return r;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[fire] AV no original"); return false; }
+    }
+
+    // -----------------------------------------------------------------------
+    //  SWAP — orquestracao do frame
+    // -----------------------------------------------------------------------
+    static bool ImGuiInFrame() {
+        ImGuiContext* g = ImGui::GetCurrentContext();
+        return g && g->WithinFrameScope;
+    }
+
     static BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
         PHASE("hk_swap");
         g_frameCounter.fetch_add(1, std::memory_order_relaxed);
-
-        // o cache de LOS nao pode congelar com o jogo pausado
         SDK::g_frameId = (uint32_t)g_frameCounter.load(std::memory_order_relaxed);
 
         if (!o_swap) return TRUE;
 
-        // ---------------------------------------------------------------
-        // bloco 1: janela / wndproc / teclas / beat / WATCHDOG  (so POD)
-        // ---------------------------------------------------------------
+        // ---------------- bloco 1: janela / teclas / cursor / beat ----------------
         __try {
             static int winPoll = 0;
             if (!g_hwnd || ++winPoll >= 8) {
@@ -471,93 +716,165 @@ namespace Hooks {
                 if (hwnd && hwnd != g_hwnd) RebindWindow(hwnd);
             }
 
+            // reaplicador SEMPRE ligado: o Unity restaura o GWLP_WNDPROC dele
             if (g_hwnd && o_wndProc) {
                 static ULONGLONG lastWndCheck = 0;
-                ULONGLONG nowc = GetTickCount64();
-                if (nowc - lastWndCheck > 500) {
+                const ULONGLONG nowc = GetTickCount64();
+                if (nowc - lastWndCheck > WND_REAPPLY_MS) {
                     lastWndCheck = nowc;
-                    WNDPROC cur = (WNDPROC)GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
-                    if (cur && cur != hk_wndProc) {
-                        WNDPROC prev = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
-                        if (prev && prev != hk_wndProc) o_wndProc = prev;
-                        Log("[hooks] wndproc reinstalado (estava %p)", cur);
+                    LONG_PTR cur = GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
+                    if (cur != (LONG_PTR)hk_wndProc) {
+                        Log("[hooks] wndproc restaurado (cur=%p) — reaplicando", (void*)cur);
+                        SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
                     }
                 }
             }
 
-            ApplyNoRecoilFrame(g_frameCounter.load(std::memory_order_relaxed));
+            if (AtLvl(Lvl::CursorFn)) ApplyCursorOwnership();
 
-            if (C.beatLog) {
-                static ULONGLONG lastBeat = 0;
-                ULONGLONG nb = GetTickCount64();
-                if (nb - lastBeat > 2000) {
-                    lastBeat = nb;
-                    Log("[hooks] beat: menu=%d stage=%s alvos=%d local=%p localValid=%d fase=%s",
-                        (int)C.menuOpen, StageName(StageNow()), SDK::g_targetCount,
-                        SDK::g_localPlayer, (int)SDK::g_localValid.load(),
-                        g_phase ? g_phase : "?");
-                }
-            }
-
+            // HandleKeys INCONDICIONAL: e' ele que faz o toggle do menu.
             HandleKeys();
 
-            // WATCHDOG: se o LateUpdate nao rodou o tick nos ultimos 250 ms
-            // (troca de instancia / cena / hook morto), o swap assume.
-            if (GetTickCount64() - g_lastTickMs.load(std::memory_order_relaxed) > TICK_WATCHDOG_MS) {
-                PHASE("swap-watchdog");
-                RunTickOnce();
+            Watchdog();
+
+            static ULONGLONG lastBeat = 0;
+            const ULONGLONG nowb = GetTickCount64();
+            if (nowb - lastBeat >= 250) {
+                lastBeat = nowb;
+                Log("[beat] alvos=%d invis=%d wndCall=%u cwpCall=%u av=%u veh=%u abort=%u menu=%d",
+                    SDK::g_targetCount, ESP::Invisiveis(),
+                    g_wndProcCalls.load(), g_cwpCalls.load(),
+                    g_avCount.load(), g_vehCount.load(),
+                    g_abortPre.load() + g_abortMenu.load() + g_abortEsp.load() +
+                    g_abortMisc.load() + g_abortRender.load() + g_abortDraw.load(),
+                    (int)C.menuOpen);
             }
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] swap pre-ImGui"); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] bloco1 swap (AV)"); }
 
         if (!g_imguiInit || !g_hwnd) return o_swap(hdc);
 
-        RECT rc;
-        if (!GetClientRect(g_hwnd, &rc)) return o_swap(hdc);
-        int w = rc.right - rc.left, h = rc.bottom - rc.top;
-        if (w <= 0 || h <= 0) return o_swap(hdc);
-        SetViewSize(w, h);                       // writer unico do viewport
+        // >>> [FIX v26] FONTE UNICA: o VIEWPORT do GL e' a verdade; GetClientRect
+        // e' so' fallback. W2S, DisplaySize e glViewport usam o MESMO par.
+        GLint vp[4] = { 0, 0, 0, 0 };
+        glGetIntegerv(GL_VIEWPORT, vp);          // estado a restaurar
+
+        int w = 0, h = 0;
+        {
+            if (vp[2] > 0 && vp[3] > 0) { w = vp[2]; h = vp[3]; }
+            else {
+                RECT rc{};
+                if (GetClientRect(g_hwnd, &rc)) { w = rc.right - rc.left; h = rc.bottom - rc.top; }
+            }
+            if (w <= 0 || h <= 0) return o_swap(hdc);
+
+            RECT rc{};
+            if (GetClientRect(g_hwnd, &rc) && (rc.right != w || rc.bottom != h)) {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    Log("[vp] DIVERGENCIA cliente=%dx%d viewport=%dx%d -> usando o viewport",
+                        (int)rc.right, (int)rc.bottom, w, h);
+                }
+            }
+            SDK::SetViewport(w, h);
+            SetViewSize(w, h);
+        }
 
         if (g_imCsInit) EnterCriticalSection(&g_imCs);
+
+        // ---------------- bloco 2: frame ----------------
+        // ANTI-BLINK: usa o estado do ImGui. Se um frame ficou aberto, fecha.
+        bool frameOk = false;
         __try {
-            if (g_frameOpen.exchange(true)) ImGui::EndFrame();
+            if (ImGuiInFrame()) ImGui::EndFrame();
 
             ImGui_ImplOpenGL3_NewFrame();
             ImGui_ImplWin32_NewFrame();
 
             ImGuiIO& io = ImGui::GetIO();
-            if (io.DisplaySize.x <= 0.f || io.DisplaySize.y <= 0.f)
-                io.DisplaySize = ImVec2((float)w, (float)h);
+            io.DisplaySize = ImVec2((float)SDK::ScreenW(), (float)SDK::ScreenH());
+
+            // injeccao manual so' como FALLBACK (wndproc mudo).
+            if (C.menuOpen) {
+                const bool wndMute =
+                    (GetTickCount64() - g_lastMouseMsg.load(std::memory_order_relaxed))
+                    > MOUSE_FALLBACK_MS;
+                    if (wndMute) {
+                        POINT pt{};
+                        if (GetCursorPos(&pt) && ScreenToClient(g_hwnd, &pt))
+                            io.AddMousePosEvent((float)pt.x, (float)pt.y);
+                        io.AddMouseButtonEvent(0, (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
+                        io.AddMouseButtonEvent(1, (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0);
+                        io.AddMouseButtonEvent(2, (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0);
+                    }
+            }
 
             ImGui::NewFrame();
+            frameOk = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_abortPre.fetch_add(1, std::memory_order_relaxed); }
 
-            Menu::Render();
+        if (frameOk) {
+            __try { Menu::Render(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { g_abortMenu.fetch_add(1, std::memory_order_relaxed); }
 
-            // >>> FIX [F]: gate por ESTAGIO DE VIDA, nao pelo flag VOLATIL de
-            //     prontidao. g_sdkReady e' reescrito todo frame por
-            //     Combat::Tick() e pisca; usa-lo aqui acoplava o overlay a
-            //     camada de dados. Quem decide se ha o que desenhar e' o
-            //     snapshot (g_targetCount / onScreen).
-            if (AtLeast(Stage::Hooks)) { ESP::Draw(); Misc::Draw(); }
+            if (AtLeast(Stage::Live) && AtLvl(Lvl::Esp)) {
+                __try { ESP::Draw(); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { g_abortEsp.fetch_add(1, std::memory_order_relaxed); }
 
-            ImGui::Render();
-            g_frameOpen = false;
+                __try { Misc::Draw(); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { g_abortMisc.fetch_add(1, std::memory_order_relaxed); }
+            }
+
+            // SEMPRE fecha o frame (Render = EndFrame + build draw data)
+            __try { ImGui::Render(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { g_abortRender.fetch_add(1, std::memory_order_relaxed); }
+
+            DrainGlErrors("antes");
 
             ImDrawData* dd = ImGui::GetDrawData();
             if (dd && dd->Valid && dd->CmdListsCount > 0) {
-                glViewport(0, 0, ViewW(), ViewH());
-                ImGui_ImplOpenGL3_RenderDrawData(dd);
+                glViewport(0, 0, SDK::ScreenW(), SDK::ScreenH());
+                __try { ImGui_ImplOpenGL3_RenderDrawData(dd); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { g_abortDraw.fetch_add(1, std::memory_order_relaxed); }
+            }
+
+            DrainGlErrors("depois");
+
+            static uint32_t lastSum = 0;
+            static ULONGLONG lastAbLog = 0;
+            const uint32_t sum = g_abortPre + g_abortMenu + g_abortEsp +
+                g_abortMisc + g_abortRender + g_abortDraw;
+            if (sum != lastSum && GetTickCount64() - lastAbLog >= 1000) {
+                lastSum = sum;
+                lastAbLog = GetTickCount64();
+                Log("[crash] aborts: pre=%u menu=%u esp=%u misc=%u render=%u draw=%u",
+                    g_abortPre.load(), g_abortMenu.load(), g_abortEsp.load(),
+                    g_abortMisc.load(), g_abortRender.load(), g_abortDraw.load());
             }
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            g_frameOpen = false;
-            Log("[crash] frame ImGui (AV)");
-        }
+
+        glViewport(vp[0], vp[1], vp[2], vp[3]);
         if (g_imCsInit) LeaveCriticalSection(&g_imCs);
 
         return o_swap(hdc);
     }
 
+    // -----------------------------------------------------------------------
+    //  Teclas — DONO UNICO do toggle do menu
+    // -----------------------------------------------------------------------
+    void HandleKeys() {
+        if (Edge(C.menuKey))   C.menuOpen = !C.menuOpen;   // unico lugar que flipa
+        if (Edge(C.panicKey))  Misc::Panic();
+        if (Edge(C.saveKey))   ConfigIO::Save();
+        if (Edge(C.unloadKey)) { ConfigIO::Save(); g_unload = true; }
+        if (C.aimKey)          C.aimKeyDown = KeyDown(C.aimKey);
+    }
+
+    // -----------------------------------------------------------------------
+    //  Instalacao
+    // -----------------------------------------------------------------------
     bool InstallSwap() {
         HMODULE gl = GetModuleHandleA("opengl32.dll");
         if (!gl) { Log("[hooks] opengl32.dll nao carregada"); return false; }
@@ -572,450 +889,114 @@ namespace Hooks {
         return true;
     }
 
-    // -----------------------------------------------------------------------
-    //  PROBE  (tudo gateado por C.probeLog)
-    // -----------------------------------------------------------------------
-    struct FloatProbe { uint32_t off; char name[40]; };
-    static FloatProbe g_probe[512];
-    static int        g_probeN = -1;
-    static float      g_probeBefore[512];
-    static int        g_probeShots = 0;
-    static float      g_frameBefore[512];
-    static int        g_frameProbeFrames = 0;
-
-    static void CollectProbeFields(Il2CppClass* k) {
-        g_probeN = 0;
-        if (!k) return;
-        __try {
-            for (Il2CppClass* c = k; c && g_probeN < 512; c = il2cpp_class_get_parent(c)) {
-                void* it = nullptr;
-                for (;;) {
-                    FieldInfo* f = il2cpp_class_get_fields(c, &it);
-                    if (!f || g_probeN >= 512) break;
-                    const Il2CppType* t = il2cpp_field_get_type(f);
-                    const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-                    if (!tn || !strstr(tn, "Single")) continue;
-                    uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
-                    if (!off) continue;
-                    g_probe[g_probeN].off = off;
-                    const char* fn = il2cpp_field_get_name(f);
-                    strncpy_s(g_probe[g_probeN].name, fn ? fn : "?", _TRUNCATE);
-                    ++g_probeN;
-                }
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        Log("[probe] campos float em PlayerScript: %d", g_probeN);
-    }
-
-    static void ProbeSnapshot(float* dst) {
-        for (int i = 0; i < g_probeN; ++i)
-            dst[i] = SafeRead<float>((uintptr_t)SDK::g_localPlayer + g_probe[i].off, 0.f);
-    }
-
-    static void ProbeDiff(const float* ref, const char* tag) {
-        if (!SDK::g_localPlayer || g_probeN <= 0) return;
-        int lines = 0;
-        for (int i = 0; i < g_probeN && lines < PROBE_DIFF_MAX; ++i) {
-            float now = SafeRead<float>((uintptr_t)SDK::g_localPlayer + g_probe[i].off, 0.f);
-            if (now != ref[i]) {
-                Log("[%s] float %s @0x%X %.4f -> %.4f",
-                    tag, g_probe[i].name, g_probe[i].off, ref[i], now);
-                ++lines;
-            }
-        }
-        if (lines == 0) Log("[%s] nenhum float mudou", tag);
-    }
-
-    // -----------------------------------------------------------------------
-    //  main thread
-    // -----------------------------------------------------------------------
-    typedef void(__fastcall* tLateUpdate)(void* self, void* method);
-    static tLateUpdate o_lateUpdate = nullptr;
-
-    static void __fastcall hk_lateUpdate(void* self, void* method) {
-        PHASE("hk_lateUpdate");
-
-        const bool isLocalInst = (!g_mainIsPlayerClass.load() ||
-            !SDK::g_localPlayer || self == SDK::g_localPlayer);
-
-        const bool wantWatch = isLocalInst && C.probeLog && g_lastShotMs.load() &&
-            (GetTickCount64() - g_lastShotMs.load() < 150) &&
-            g_frameProbeFrames < 6 && g_watchLines < WatchMax();
-
-        if (o_lateUpdate) {
-            __try { o_lateUpdate(self, method); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] LateUpdate original AV"); }
-        }
-
-        if (isLocalInst) ApplyNoRecoilFrame(g_frameCounter.load(std::memory_order_relaxed));
-
-        ::Quat r1{ 0.f, 0.f, 0.f, 1.f }, p1{ 0.f, 0.f, 0.f, 1.f };
-        Il2CppObject* camTf = nullptr;
-
-        __try {
-            if (wantWatch) {
-                if (g_probeN < 0) CollectProbeFields(ClassOf(SDK::g_localPlayer));
-                camTf = SDK::CamTfObj();
-                if (camTf) SDK::GetRot(camTf, r1);
-                if (SDK::g_localPlayer) p1 = SDK::GetPlayerRot(SDK::g_localPlayer);
-
-                ++g_frameProbeFrames;
-                ++g_watchLines;
-
-                Log("[watch] f%d camTf (%.4f,%.4f,%.4f,%.4f) playerRot (%.4f,%.4f,%.4f,%.4f) preTiroCam (%.4f,%.4f,%.4f,%.4f)",
-                    g_frameProbeFrames,
-                    r1.x, r1.y, r1.z, r1.w,
-                    p1.x, p1.y, p1.z, p1.w,
-                    g_pendingCam.x, g_pendingCam.y, g_pendingCam.z, g_pendingCam.w);
-
-                ProbeSnapshot(g_frameBefore);
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] watch/probe"); }
-
-        // SEM early-return por instancia: o throttle por frame dentro do
-        // RunTickOnce ja evita trabalho repetido.
-        RunTickOnce();
-    }
-
     bool InstallMainThread() {
-        static const char* classes[] = { "PlayerScript", "GameManager", "Game", "HUD", "UIManager",
-                                         "GameController", "Main", "ClientInstance" };
-        static const char* methods[] = { "LateUpdate", "Update", "FixedUpdate" };
-
-        for (size_t c = 0; c < sizeof(classes) / sizeof(classes[0]); ++c) {
-            Il2CppClass* k = FindClassNamed(classes[c]);
-            if (!k) continue;
-            for (size_t m = 0; m < sizeof(methods) / sizeof(methods[0]); ++m) {
-                void* ptr = FindMethodPtr(classes[c], methods[m], 0);
-                if (!ptr) continue;
-                if (MH_CreateHook(ptr, &hk_lateUpdate, (void**)&o_lateUpdate) == MH_OK) {
-                    MH_EnableHook(ptr);
-
-                    bool isPlayer = (strcmp(classes[c], "PlayerScript") == 0 ||
-                        strcmp(classes[c], "Entity") == 0 ||
-                        strcmp(classes[c], "Player") == 0);
-                    g_mainIsPlayerClass = isPlayer;
-
-                    Log("[hooks] MAIN THREAD = %s::%s (%p) filtroPorInstancia=%d",
-                        classes[c], methods[m], ptr, (int)isPlayer);
-                    return true;
-                }
-            }
+        void* p = FindMethodPtr("PlayerScript", "LateUpdate", 0);
+        if (!p) { Log("[hooks] PlayerScript::LateUpdate NAO encontrado"); return false; }
+        if (MH_CreateHook(p, &hk_lateUpdate, (void**)&o_lateUpdate) != MH_OK) {
+            Log("[hooks] MH_CreateHook(LateUpdate) FALHOU");
+            return false;
         }
-        Log("[hooks] main thread: NENHUM alvo encontrado");
-        return false;
-    }
-
-    // =======================================================================
-    //  FIRE BULLET
-    // =======================================================================
-    typedef bool(__fastcall* tFire7)(void* self, int32_t a1, float a2, Vec3 a3, Vec3 a4,
-        bool a5, double a6, int32_t a7);
-    static tFire7 o_fire7 = nullptr;
-
-    static std::atomic<uint32_t> g_fireCalls{ 0 };
-    static int g_fireLogged = 0;
-
-    static bool __fastcall hk_fire7(void* self, int32_t a1, float a2, Vec3 a3, Vec3 a4,
-        bool a5, double a6, int32_t a7) {
-        PHASE("hk_fire7");
-        g_fireCalls.fetch_add(1, std::memory_order_relaxed);
-
-        const bool isLocal = (SDK::g_localPlayer && self == SDK::g_localPlayer);
-        Il2CppObject* camTf = isLocal ? SDK::CamTfObj() : nullptr;
-
-        ::Quat camBefore{ 0.f, 0.f, 0.f, 1.f };
-        bool haveRot = false;
-        const bool aiming = (C.aimbot && C.aimKeyDown && SDK::g_aimTarget);
-
-        __try {
-            const int fireLogMax = C.probeLog ? 3 : 1;
-            if (g_fireLogged < fireLogMax) {
-                ++g_fireLogged;
-                Log("[fire7] self=%p a1=%d(%p) a2=%.3f a3=(%.1f,%.1f,%.1f)|a3|=%.2f a4=(%.1f,%.1f,%.1f)|a4|=%.2f a5=%d a6=%.3f a7=%d",
-                    self, a1, (void*)(intptr_t)a1, (double)a2,
-                    a3.x, a3.y, a3.z, (double)a3.len(),
-                    a4.x, a4.y, a4.z, (double)a4.len(),
-                    (int)a5, a6, a7);
-            }
-
-            if (isLocal && camTf) {
-                haveRot = SDK::GetRot(camTf, camBefore);
-
-                if (aiming && haveRot) {
-                    Vec3 me = SDK::GetPos(camTf);
-                    Vec3 tp = SDK::TargetAimPos(SDK::g_aimTarget, C.aimBone);
-                    if (!tp.isSane() || tp.zero()) tp = SDK::GetPos(SDK::g_aimTarget);
-                    Vec3 d = tp - me;
-                    float L = d.len();
-                    if (L > 0.0001f) {
-                        ::Quat q = SDK::LookRot(d * (1.f / L));
-                        SDK::SetRot(camTf, q);
-                        SDK::SetPlayerRot(SDK::g_localPlayer, q);
-                    }
-                }
-
-                if (C.noRecoil) g_pendingCam = camBefore;
-            }
-
-            if (isLocal && (C.silentAim || C.magicBullets)) {
-                float d3 = fabsf(a3.len() - 1.f);
-                float d4 = fabsf(a4.len() - 1.f);
-                bool dirIsA4 = (d4 <= d3);
-                if ((dirIsA4 ? d4 : d3) < 0.30f) {
-                    int slot = dirIsA4 ? 1 : 0;
-                    if (SDK::g_fireDirSlot.load() != slot) {
-                        SDK::g_fireDirSlot.store(slot);
-                        Log("[fire7] direcao = param%d", slot + 3);
-                    }
-                    if (dirIsA4) Aimbot::Silent::Override(a3, a4);
-                    else         Aimbot::Silent::Override(a4, a3);
-                }
-            }
-
-            if (isLocal && C.probeLog && g_probeShots < 2) {
-                if (g_probeN < 0) CollectProbeFields(ClassOf(self));
-                ProbeSnapshot(g_probeBefore);
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] hk_fire7 pre"); }
-
-        bool ret = false;
-        __try { ret = o_fire7 ? o_fire7(self, a1, a2, a3, a4, a5, a6, a7) : false; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] hk_fire7 original AV"); }
-
-        if (isLocal) {
-            ApplyNoRecoil();
-
-            g_lastShotMs.store(GetTickCount64());
-            g_frameProbeFrames = 0;
-            g_watchLines = 0;
-
-            if (C.probeLog && g_probeShots < 2 && camTf) {
-                ::Quat r1{ 0.f, 0.f, 0.f, 1.f };
-                __try { SDK::GetRot(camTf, r1); }
-                __except (EXCEPTION_EXECUTE_HANDLER) {}
-                Log("[probe] camTf rot (%.4f,%.4f,%.4f,%.4f) -> (%.4f,%.4f,%.4f,%.4f)",
-                    camBefore.x, camBefore.y, camBefore.z, camBefore.w, r1.x, r1.y, r1.z, r1.w);
-                ProbeDiff(g_probeBefore, "probe");
-                Log("[probe] ---- fim diff tiro %d ----", ++g_probeShots);
-            }
-        }
-
-        return ret;
-    }
-
-    // =======================================================================
-    //  FIRE ONE SHOT
-    // =======================================================================
-    typedef bool(__fastcall* tFireOne)(void* self, int32_t a1, float a2, Vec3 a3, Vec3 a4,
-        uint8_t a5, uint8_t a6, double a7, int32_t a8, int64_t a9);
-    static tFireOne o_fireOne = nullptr;
-    static int      g_fireOneLogged = 0;
-
-    static bool __fastcall hk_fireOne(void* self, int32_t a1, float a2, Vec3 a3, Vec3 a4,
-        uint8_t a5, uint8_t a6, double a7, int32_t a8, int64_t a9) {
-        PHASE("hk_fireOne");
-
-        const int logMax = C.probeLog ? 3 : 1;
-        if (g_fireOneLogged < logMax) {
-            ++g_fireOneLogged;
-            Log("[fireOne] self=%p a1=%d(%p) a2=%.3f |a3|=%.2f |a4|=%.2f a5=%d a6=%d a7=%.2f a8=%d a9=%lld",
-                self, a1, (void*)(intptr_t)a1, (double)a2,
-                (double)a3.len(), (double)a4.len(), (int)a5, (int)a6, a7, a8, (long long)a9);
-        }
-
-        bool ret = false;
-        __try { ret = o_fireOne ? o_fireOne(self, a1, a2, a3, a4, a5, a6, a7, a8, a9) : false; }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-        if (SDK::g_localPlayer && self == SDK::g_localPlayer)
-            ApplyNoRecoil();
-
-        return ret;
-    }
-
-    // -----------------------------------------------------------------------
-    //  shoot (passthroughs)
-    // -----------------------------------------------------------------------
-    typedef void(__fastcall* tShoot)(void* self, void* method);
-    static tShoot o_shoot1 = nullptr, o_shoot2 = nullptr, o_shoot3 = nullptr, o_shoot4 = nullptr;
-
-    static void __fastcall hk_shoot1(void* s, void* m) {
-        if (s == SDK::g_localPlayer) ApplyNoRecoil();
-        if (o_shoot1) o_shoot1(s, m);
-    }
-    static void __fastcall hk_shoot2(void* s, void* m) {
-        if (s == SDK::g_localPlayer) ApplyNoRecoil();
-        if (o_shoot2) o_shoot2(s, m);
-    }
-    static void __fastcall hk_shoot3(void* s, void* m) {
-        if (s == SDK::g_localPlayer) ApplyNoRecoil();
-        if (o_shoot3) o_shoot3(s, m);
-    }
-    static void __fastcall hk_shoot4(void* s, void* m) {
-        if (s == SDK::g_localPlayer) ApplyNoRecoil();
-        if (o_shoot4) o_shoot4(s, m);
+        MH_EnableHook(p);
+        Log("[hooks] main thread: PlayerScript::LateUpdate");
+        return true;
     }
 
     bool InstallCombat() {
-        PHASE("InstallCombat");
-        bool ok = false;
-
-        Il2CppClass* ps = FindClassNamed("PlayerScript");
-        if (ps) {
-            static const char* names[] = { "SemiAutoShoot", "Shoot", "AutoShoot", "FullAutoShoot" };
-            static void* detours[] = { (void*)&hk_shoot1, (void*)&hk_shoot2,
-                                       (void*)&hk_shoot3, (void*)&hk_shoot4 };
-            static tShoot* tramps[] = { &o_shoot1, &o_shoot2, &o_shoot3, &o_shoot4 };
-
-            int n = 0;
-            for (size_t i = 0; i < 4; ++i) {
-                MethodInfo* m = FindMethodByArity(ps, names[i], 0);
-                if (!m) { Log("[hooks] %s nao encontrado", names[i]); continue; }
-                void* p = SDK::MethodPtr(m);
-                if (!p) { Log("[hooks] %s sem ptr", names[i]); continue; }
-                if (MH_CreateHook(p, detours[n], (void**)tramps[n]) == MH_OK) {
-                    MH_EnableHook(p);
-                    Log("[hooks] hook shoot OK: %s (%p)", names[i], p);
-                    if (!SDK::M_shoot) SDK::M_shoot = m;
-                    ok = true;
-                    if (++n >= 4) break;
-                }
-            }
-
-            MethodInfo* fos = FindMethodByArity(ps, "FireOneShot", 9);
-            if (fos) {
-                void* p = SDK::MethodPtr(fos);
-                Log("[hooks] FireOneShot: ret=%s ptr=%p", SDK::MethodReturnName(fos), p);
-                if (p && MH_CreateHook(p, &hk_fireOne, (void**)&o_fireOne) == MH_OK) {
-                    MH_EnableHook(p);
-                    ok = true;
-                    Log("[hooks] hook FireOneShot OK (anti-recoil)");
-                }
-            }
-            else Log("[hooks] FireOneShot/9 nao encontrado");
+        Il2CppClass* k = FindClassNamed("PlayerScript");
+        MethodInfo* m = k ? FindMethodByArity(k, "FireBullet", 7) : nullptr;
+        if (m) {
+            Log("[fire] FireBullet(7) return=%s", SDK::MethodReturnName(m));
         }
-        else Log("[hooks] PlayerScript nulo");
+        if (!m) { Log("[hooks] FireBullet(7) NAO encontrado"); return false; }
 
-        if (SDK::M_FireBullet) {
-            uint32_t pc = il2cpp_method_get_param_count(SDK::M_FireBullet);
-            void* p = SDK::MethodPtr(SDK::M_FireBullet);
-            Log("[hooks] FireBullet: params=%u ret=%s ptr=%p", pc,
-                SDK::MethodReturnName(SDK::M_FireBullet), p);
-            if (p && pc == 7 && MH_CreateHook(p, &hk_fire7, (void**)&o_fire7) == MH_OK) {
-                MH_EnableHook(p);
-                ok = true;
-                Log("[hooks] hook FireBullet OK (7 params, ret bool)");
-            }
+        void* p = SDK::MethodPtr(m);
+        if (!p) { Log("[hooks] FireBullet(7) sem ponteiro"); return false; }
+        if (MH_CreateHook(p, &hk_fire7, (void**)&o_fire7) != MH_OK) {
+            Log("[hooks] MH_CreateHook(FireBullet) FALHOU");
+            return false;
         }
-        else Log("[hooks] M_FireBullet nulo");
+        MH_EnableHook(p);
+        Log("[hooks] FireBullet(7) hook OK (%p)", p);
+        return true;
+    }
 
-        return ok;
+    bool InstallCwp() {
+        g_cwp = SetWindowsHookExA(WH_CALLWNDPROC, CwpProc, nullptr, GetCurrentThreadId());
+        if (!g_cwp) { Log("[input] SetWindowsHookEx(CALLWNDPROC) FALHOU"); return false; }
+        Log("[input] cwp=%p tid=%u lvl=%d (fallback)", (void*)g_cwp, GetCurrentThreadId(), INPUT_TEST_LEVEL);
+        return true;
     }
 
     // -----------------------------------------------------------------------
-    void ApplyFeatures() {
-        Log("[hooks] ApplyFeatures: noRecoil=%d noSpread=%d infAmmo=%d rapidFire=%d noReload=%d silent=%d probeLog=%d",
-            (int)C.noRecoil, (int)C.noSpread, (int)C.infAmmo, (int)C.rapidFire,
-            (int)C.noReload, (int)C.silentAim, (int)C.probeLog);
-    }
-
-    // -----------------------------------------------------------------------
-    //  CICLO DE VIDA
+    //  Init / Reinstall / Shutdown
     // -----------------------------------------------------------------------
     bool Init() {
-        if (IsLive()) return true;                 // idempotente
-
-        Advance(Stage::Init);
-
-        if (!g_mhInit) {
-            if (MH_Initialize() != MH_OK) {
-                Log("[hooks] MH_Initialize FALHOU");
-                return false;                      // fica em Init; Shutdown limpa
-            }
-            g_mhInit = true;
-        }
-
         if (!g_imCsInit) { InitializeCriticalSection(&g_imCs); g_imCsInit = true; }
+        if (MH_Initialize() != MH_OK) { Log("[hooks] MH_Initialize FALHOU"); return false; }
 
-        g_lastTickMs.store(GetTickCount64(), std::memory_order_relaxed);
+        SetStage(Stage::Init);
+        Log("[input] INPUT_TEST_LEVEL=%d", INPUT_TEST_LEVEL);
 
-        bool ok = false;
-        ok |= InstallSwap();
-        ok |= InstallMainThread();
-        ok |= InstallCursor();
-        ok |= InstallCombat();
+        if (!g_veh) g_veh = AddVectoredExceptionHandler(1, VehHandler);
 
+        if (AtLvl(Lvl::CursorFn)) InstallCursor();
+        InstallCwp();
+
+        if (!InstallSwap()) return false;
         Advance(Stage::Hooks);
 
-        Aimbot::Install();
-        Triggerbot::Install();
-        AntiCheat::Install();
+        if (!InstallMainThread()) Log("[hooks] LateUpdate falhou — watchdog assume");
+        if (!InstallCombat())     Log("[hooks] FireBullet falhou (aimbot ok)");
 
-        ApplyFeatures();
+        g_lastLuMs.store(GetTickCount64(), std::memory_order_relaxed);
+        SetStage(Stage::Live);
+        Log("[hooks] init ok stage=%s veh=%p menuKey=0x%X", StageName(StageNow()), g_veh, C.menuKey);
+        return true;
+    }
 
-        Advance(Stage::Live);
-        Log("[hooks] instalados (sucesso=%d) stage=%s", (int)ok, StageName(StageNow()));
-        return ok;
+    bool Reinstall() {
+        if (g_hwnd) {
+            LONG_PTR prev = GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
+            if (prev != (LONG_PTR)hk_wndProc) {
+                o_wndProc = (WNDPROC)prev;
+                SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
+            }
+        }
+        MH_DisableHook(MH_ALL_HOOKS);
+        MH_EnableHook(MH_ALL_HOOKS);
+        Log("[hooks] Reinstall ok");
+        return true;
     }
 
     bool Shutdown() {
-        if (!g_mhInit && StageNow() == Stage::Down) {
-            Log("[hooks] Shutdown: ja' estava em Down");
-            return true;
-        }
-
+        if (StageNow() == Stage::Down) { Log("[hooks] Shutdown: ja' em Down"); return true; }
         SetStage(Stage::Tearing);
 
-        // Durante o teardown nada e' garantido: derruba os espelhos na mao
-        // (SetStage(Tearing) os deixaria em true, porque Tearing > Live).
-        g_sdkReady.store(false, std::memory_order_release);
+        g_hooksLive.store(false, std::memory_order_release);
         g_imguiReady.store(false, std::memory_order_release);
 
         SDK::g_recoilHookActive = false;
-        g_frameOpen = false;
+
+        if (g_cursorFreed) { g_cursorFreed = false; ForceCursor(g_cursorWasShowing); }
 
         if (o_wndProc && g_hwnd)
             SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)o_wndProc);
         o_wndProc = nullptr;
 
+        if (g_cwp) { UnhookWindowsHookEx(g_cwp); g_cwp = nullptr; }
+        if (g_veh) { RemoveVectoredExceptionHandler(g_veh); g_veh = nullptr; }
+
         MH_DisableHook(MH_ALL_HOOKS);
         Sleep(120);
 
-        {
-            ImLock lk;
-            if (g_glBackend) { ImGui_ImplOpenGL3_Shutdown(); g_glBackend = false; }
-            if (g_win32Backend) { ImGui_ImplWin32_Shutdown(); g_win32Backend = false; }
-            if (g_imguiCtx) { ImGui::DestroyContext(); g_imguiCtx = false; }
-            g_imguiInit = false;
-        }
+        if (g_imCsInit) EnterCriticalSection(&g_imCs);
+        ShutdownImGui();
+        if (g_imCsInit) LeaveCriticalSection(&g_imCs);
 
         MH_Uninitialize();
-        g_mhInit = false;
-
-        g_hwnd = nullptr;
-        o_swap = nullptr;
-        o_setCursorPos = nullptr;
-        o_lateUpdate = nullptr;
-        o_fire7 = nullptr;
-        o_fireOne = nullptr;
-        o_shoot1 = o_shoot2 = o_shoot3 = o_shoot4 = nullptr;
-
-        g_lastTickFrame.store(~0ull, std::memory_order_relaxed);
-        g_lastTickMs.store(0);
-        g_lastShotMs.store(0);
-        g_frameProbeFrames = 0;
-        g_watchLines = 0;
-        g_probeShots = 0;
-        g_fireLogged = 0;
-        g_fireOneLogged = 0;
-        g_probeN = -1;
-
+        g_lastLuMs.store(0, std::memory_order_relaxed);
         SetStage(Stage::Down);
-        Log("[hooks] Shutdown");
+        Log("[hooks] Shutdown concluido");
         return true;
     }
 

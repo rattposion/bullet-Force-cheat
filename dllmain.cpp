@@ -1,17 +1,17 @@
 // ============================================================================
-//  dllmain.cpp — bfi (v3)
+//  dllmain.cpp — bfi (v2)
 //
 //  Mudancas desta versao:
-//   1) TEARDOWN COMPLETO DO HANDLER: RemoveVectoredExceptionHandler + restaura
-//      do filtro anterior. Antes, ambos ficavam registrados apontando para
-//      codigo da DLL depois do FreeLibraryAndExitThread -> falha silenciosa
-//      no unload (e o crash report do jogo podia ser perdido).
-//   2) CrashFilter identifica MODULO + OFFSET do endereco que estourou, o tipo
-//      de acesso (read/write) e faz CHAIN com o filtro anterior (o da Unity).
-//   3) VEH de primeira chance (BFI_LOG_FIRST_CHANCE). Loga o AV ANTES do SEH.
-//   4) Teardown() idempotente: UnloadWatch e DLL_PROCESS_DETACH nao chamam
+//   1) CrashFilter agora identifica MODULO + OFFSET do endereco que estourou,
+//      o tipo de acesso (read/write) e faz CHAIN com o filtro anterior (o da
+//      Unity). Resultado: voce recebe o nosso log E o crash report do jogo,
+//      em vez de o jogo simplesmente sumir.
+//   2) VEH de primeira chance (BFI_LOG_FIRST_CHANCE). Ele loga o AV ANTES do
+//      SEH — e o que mostra o local exato mesmo quando um __try contem a
+//      falha. Sem isso, "conter" o AV esconde o bug.
+//   3) Teardown() idempotente: UnloadWatch e DLL_PROCESS_DETACH nao chamam
 //      Shutdown() duas vezes.
-//   5) Cada etapa do Main e logada.
+//   4) Cada etapa do Main e logada; nada mais de "return 0" silencioso.
 //
 //  Dica: para desligar o ruido do VEH, troque BFI_LOG_FIRST_CHANCE para 0.
 // ============================================================================
@@ -39,7 +39,6 @@ void LogInit();
 static std::atomic<bool> g_tornDown{ false };
 static bool                      g_inFilter = false;
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = nullptr;
-static PVOID                     g_veh = nullptr;
 static int                       g_crashLogs = 0;
 
 // ---------------------------------------------------------------------------
@@ -144,18 +143,8 @@ static LONG WINAPI FirstChanceVEH(EXCEPTION_POINTERS* ep)
 static void Teardown()
 {
     if (g_tornDown.exchange(true)) return;
-
     Hooks::Shutdown();
     SDK::Shutdown();
-
-    // >>> FIX: desfaz os handlers ANTES de a DLL sair da memoria. Sem isto,
-    //     o VEH e o filtro continuavam registrados apontando para codigo
-    //     descarregado, e o crash report do jogo era perdido no unload.
-    if (g_veh) { RemoveVectoredExceptionHandler(g_veh); g_veh = nullptr; }
-    if (g_prevFilter) {
-        SetUnhandledExceptionFilter(g_prevFilter);
-        g_prevFilter = nullptr;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +176,7 @@ static DWORD WINAPI Main(LPVOID)
 
     g_prevFilter = SetUnhandledExceptionFilter(CrashFilter);
 #if BFI_LOG_FIRST_CHANCE
-    g_veh = AddVectoredExceptionHandler(1, FirstChanceVEH);
+    AddVectoredExceptionHandler(1, FirstChanceVEH);
 #endif
 
     while (!GetModuleHandleA("GameAssembly.dll")) {

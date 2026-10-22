@@ -1,12 +1,4 @@
-// ============================================================================
-//  visuals.cpp — watermark / fps / profiler / crosshair / hitmarker
-//
-//  >>> FIX: o profiler lia Combat::g_stats[] e Combat::g_statsN DIRETO, sem
-//      lock, enquanto Combat::Stat() escreve sob SRWLOCK. Era leitura rasgada
-//      (e o bound do loop podia mudar no meio). Agora usa Combat::CopyStats(),
-//      que existe exatamente para isso e nunca era chamada — a declaracao
-//      faltava no features.h.
-// ============================================================================
+
 #include "features.h"
 #include "sdk.h"
 #include "hooks.h"
@@ -16,7 +8,6 @@
 #include <imgui.h>
 #include <cmath>
 #include <cstdio>
-#include <cstring>
 #include <algorithm>
 
 namespace Misc {
@@ -41,7 +32,9 @@ namespace Misc {
                 };
 
             return IM_COL32(
-                channel(color[0]), channel(color[1]), channel(color[2]),
+                channel(color[0]),
+                channel(color[1]),
+                channel(color[2]),
                 channel(color[3] * std::clamp(alphaMultiplier, 0.0f, 1.0f))
             );
         }
@@ -150,14 +143,16 @@ namespace Misc {
 
             y += 16.0f;
 
-            // Snapshot sob o lock compartilhado. O buffer e' estatico para nao
-            // alocar por frame; o overlay roda so' na thread de render.
-            static Combat::StepStat statSnap[Combat::kMaxSteps];
-            const int count = Combat::CopyStats(statSnap, Combat::kMaxSteps);
+            // Limita a quantidade de linhas exibidas.
+            const int count = std::clamp(
+                Combat::g_statsN,
+                0,
+                Combat::kMaxSteps
+            );
 
             for (int i = 0; i < count; ++i)
             {
-                const auto& stat = statSnap[i];
+                const auto& stat = Combat::g_stats[i];
 
                 char name[24]{};
                 std::memcpy(name, stat.name, sizeof(name) - 1);
