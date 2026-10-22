@@ -45,7 +45,7 @@ struct Config {
     bool  fps = false;
 
     // ---- PERFORMANCE ----
-    int   losPerFrame = 4;
+    int   losPerFrame = 4;              // [B2] era 8
 
     // ---- AIMBOT ----
     bool  aimbot = false;
@@ -56,10 +56,7 @@ struct Config {
     int   aimMode = 0;              // 0=Camera(screen) 1=Angulo(3D) 2=Mouse(->Camera)
     bool  aimVisible = true;
 
-    // Checar visao (LOS): MARCADO -> mira SOMENTE em quem esta visivel.
     bool  aimVisCheck = true;
-
-    // Nao mirar atras do muro: true = descarta invisivel (padrao).
     bool  aimStrictVis = true;
 
     bool  aimTeam = false;
@@ -72,11 +69,11 @@ struct Config {
     bool  magicBullets = false;
 
     // =======================================================================
-    //  ALIASES / CAMPOS NOVOS  (nome exato usado pelo aimbot.cpp)
+    //  ALIASES / CAMPOS NOVOS
     // =======================================================================
     bool  aimEnabled = true;
-    bool  aimTeamCheck = false;     // true = nao mira em companheiro de time
-    int   aimSelect = 0;            // 0=mais perto da mira  1=mais perto  2=hibrido
+    bool  aimTeamCheck = false;
+    int   aimSelect = 0;
     bool  aimToggle = false;
     bool  aimAutoFire = false;
     int   aimFireDelayMs = 50;
@@ -88,7 +85,7 @@ struct Config {
     float triggerRadius = 10.f;
 
     // ---- ARMA ----
-    bool  noRecoil = false;
+    bool  noRecoil = false;             // [B2] era true (dava solavanco/AV)
     bool  noSpread = false;
     bool  infAmmo = false;
     bool  noReload = false;
@@ -156,7 +153,7 @@ struct Config {
 
     // ---- LOG / DUMP ----
     bool  probeLog = false;
-    bool  beatLog = false;
+    bool  beatLog = false;              // [B2] era true (log a cada 250ms no swap)
     bool  verboseUnlock = true;
     int   watchMaxLines = 12;
 

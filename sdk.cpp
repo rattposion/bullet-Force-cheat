@@ -1,31 +1,21 @@
 // ============================================================================
 //  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, LOS via Physics.Raycast
 //
-//  v7.1 — PATCH B2 (stutter / travada na partida):
-//    [B2.a] UpdateTargets: re-scan de entidades 200ms -> 500ms (FindObjectsOfType
-//           aloca um array gerenciado e e' a maior fonte de pico de GC).
-//    [B2.b] Busca de ossos com orcamento 4096 -> 768 nos (cada no' faz um
-//           runtime_invoke de get_name; era o pico ao aparecer player novo).
-//    [B2.c] Dump da hierarquia 80 -> 40 nos por arvore.
+//  v7.2 — PATCH B3 (stutter):
+//    [B3] Cache de posicao por frame. GetPos() e' um runtime_invoke de
+//         get_position que ALOCA um Vector3 boxed a cada chamada; o mesmo
+//         objeto era pedido varias vezes por frame (osso da cabeca, osso do pe,
+//         player, camera) -> dezenas de alocacoes/frame -> GC -> hitch.
+//         Agora GetPosRaw() faz o invoke e GetPos() cacheia por g_frameId.
 //
-//  v7.0 — FONTE UNICA DE TAMANHO + SNAPSHOT DE FRAME:
-//    [F1] g_vpW/g_vpH: o viewport do GL vira a UNICA fonte de tamanho.
-//         ScreenW/ScreenH devolvem isso (com fallback no client rect). W2S,
-//         DisplaySize e glViewport passam a usar o mesmo par por construcao.
-//    [E1] FrameData publicado 1x por tick com seqlock (PublishFrame/ReadFrame).
-//         Quem nao e' a thread do jogo para de ler g_viewProj/g_localPos cru.
-//    [E2] WorldToScreenF(): W2S a partir do snapshot, para uso cross-thread.
+//  v7.1 — PATCH B2 (stutter):
+//    [B2a] UpdateTargets: RefreshTargets 200ms -> 500ms.
+//    [B2b] FindBoneAny: orcamento 4096 -> 768 nos.
+//    [B2c] LogHierarchy: 80 -> 40 nos.
 //
-//  v6.9 — FIX CONTRATO DE PROJECAO (piscada do ESP):
-//    [P1] WorldToScreen escreve SENTINELA (-1,-1) em TODA falha.
-//    [P2] UpdateTargets calcula 'h' so' quando okH && okF.
-//    [P3] g_frameId passa a ter DONO UNICO (hk_wglSwapBuffers).
-//    [P4] Contadores de rejeicao separados (g_w2s*).
-//    [P5] TeamRelation definido.
-//
-//  v6.8 — FIX DOMAIN RELOAD: ClearRuntimeCaches zera k*; OnDomainReload e
-//         InvalidateRuntime passam por ResolveAll(); statics do cursor no
-//         escopo do arquivo; <initializer_list>.
+//  v7.0 — [F1] fonte unica de tamanho (g_vpW/g_vpH); [E1] FrameData seqlock.
+//  v6.9 — [P1..P5] contrato de projecao / sentinela no W2S.
+//  v6.8 — ClearRuntimeCaches zera k*; ResolveAll().
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -483,18 +473,14 @@ namespace SDK {
     float g_viewProj[16] = { 0 };
     static volatile LONG g_vpSeq = 0;
 
-    // [D] contadores de rejeicao do WorldToScreen
     std::atomic<uint32_t> g_w2sOk{ 0 }, g_w2sSemMatriz{ 0 }, g_w2sAtras{ 0 }, g_w2sFora{ 0 };
-    // [D] falhas do renderer
     std::atomic<uint32_t> g_glErrTotal{ 0 };
 
-    // [E] snapshot de frame
     FrameData g_fd[2];
     std::atomic<uint32_t> g_fdSeq{ 0 };
     std::atomic<uint32_t> g_fdPublish{ 0 };
     std::atomic<uint32_t> g_fdTorn{ 0 };
 
-    // [F] fonte unica de tamanho
     std::atomic<int> g_vpW{ 0 }, g_vpH{ 0 };
 
     uint32_t O_health = 0, O_alive = 0, O_team = 0, O_isLocal = 0, O_name = 0, O_weapon = 0;
@@ -579,6 +565,10 @@ namespace SDK {
     static BoneCacheEnt g_boneCache[64] = {};
     static int          g_boneEvict = 0;
 
+    // [B3] cache de posicao por frame
+    struct PosEnt { Il2CppObject* o = nullptr; Vec3 p{}; uint64_t frame = ~0ull; };
+    static PosEnt g_posCache[512];
+
     static Il2CppClass* sObjCls = nullptr;
     static MethodInfo* sFindObjs = nullptr;
     static int          sOnlyEntity = -1;
@@ -586,7 +576,6 @@ namespace SDK {
     static bool         g_dumpTarget = false;
     static bool         g_inited = false;
 
-    // [D3] statics do cursor no escopo do arquivo (resetaveis no reload)
     static Il2CppClass* g_cursorCls = nullptr;
     static MethodInfo* g_cursorVisibleM = nullptr;
     static MethodInfo* g_cursorLockM = nullptr;
@@ -594,7 +583,7 @@ namespace SDK {
 
     static void ResolveOffsets();
     static void ResolveMethods();
-    static bool ResolveAll();            // [D2] forward decl
+    static bool ResolveAll();
     bool Init();
 
     bool         ValidInstance(Il2CppObject* o) { return ValidInstance_((const void*)o); }
@@ -618,7 +607,7 @@ namespace SDK {
     // ======================= [E] snapshot de frame =======================
     void PublishFrame() {
         const uint32_t s = g_fdSeq.load(std::memory_order_relaxed);
-        g_fdSeq.store(s + 1, std::memory_order_release);      // impar: escrevendo
+        g_fdSeq.store(s + 1, std::memory_order_release);
 
         FrameData& d = g_fd[(s + 1) & 1];
         memcpy(d.viewProj, g_viewProj, sizeof(d.viewProj));
@@ -630,7 +619,7 @@ namespace SDK {
         d.viewH = ScreenH();
         d.frame = g_frameId;
 
-        g_fdSeq.store(s + 2, std::memory_order_release);      // par: pronto
+        g_fdSeq.store(s + 2, std::memory_order_release);
         g_fdPublish.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -1004,7 +993,8 @@ namespace SDK {
         return false;
     }
 
-    Vec3 GetPos(Il2CppObject* obj) {
+    // [B3] sem cache: e' o que faz o runtime_invoke
+    static Vec3 GetPosRaw(Il2CppObject* obj) {
         Vec3 out{ 0.f, 0.f, 0.f };
         if (!obj || !PlausibleObj(obj)) return out;
 
@@ -1029,6 +1019,17 @@ namespace SDK {
         return out;
     }
 
+    // [B3] cache por frame: o mesmo objeto e' pedido varias vezes por frame
+    Vec3 GetPos(Il2CppObject* obj) {
+        if (!obj || !PlausibleObj(obj)) return Vec3();
+        const uint64_t f = g_frameId;
+        PosEnt& e = g_posCache[((uintptr_t)obj >> 4) & 511];
+        if (e.o == obj && e.frame == f) return e.p;
+        const Vec3 p = GetPosRaw(obj);
+        e.o = obj; e.p = p; e.frame = f;
+        return p;
+    }
+
     void SetPos(Il2CppObject* obj, Vec3 v) {
         if (!obj || !PlausibleObj(obj)) return;
         Il2CppObject* node = obj;
@@ -1046,6 +1047,9 @@ namespace SDK {
         Vec3 vv = v;
         void* args[1]; args[0] = &vv;
         se_runtime_invoke(sp, node, args);
+
+        PosEnt& e = g_posCache[((uintptr_t)obj >> 4) & 511];   // [B3]
+        if (e.o == obj) e.frame = ~0ull;
     }
 
     // ======================= rotacao =======================
@@ -1150,7 +1154,6 @@ namespace SDK {
     float GetHealth(Il2CppObject* o) { return ReadHealth(o); }
 
     // ======================= time =======================
-    // 0 = mesmo time, 1 = inimigo, -1 = indefinido
     int TeamRelation(Il2CppObject* o) {
         if (!o || !g_localPlayer) return -1;
         if (o == g_localPlayer) return 0;
@@ -1169,7 +1172,6 @@ namespace SDK {
         __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
     }
 
-    // -1 (indefinido) deixa de contar como inimigo por acidente.
     bool IsEnemy(Il2CppObject* o) { return TeamRelation(o) == 1; }
 
     // ======================= nome =======================
@@ -1304,10 +1306,6 @@ namespace SDK {
     static const char* kFeet[] = { "Foot", "foot", "Foot_L", "Bip01 L Foot",
                                    "mixamorig:LeftFoot", "toe", "Bone_Foot" };
 
-    // >>> [B2.b] era 4096: cada no' da busca faz um runtime_invoke de get_name.
-    // 768 e' folgado para um esqueleto humanoide e corta o pico de hitch.
-    static const int kBoneSearchBudget = 768;
-
     Il2CppObject* FindBoneContains(Il2CppObject* root, const char* sub, int budget) {
         if (!root || !sub) return nullptr;
 
@@ -1359,7 +1357,7 @@ namespace SDK {
     static Il2CppObject* FindBoneAny(Il2CppObject* root, const char** names, int count) {
         if (!root) return nullptr;
         for (int i = 0; i < count; ++i) {
-            Il2CppObject* b = FindBoneContains(root, names[i], kBoneSearchBudget);   // >>> [B2.b]
+            Il2CppObject* b = FindBoneContains(root, names[i], 768);   // [B2b] era 4096
             if (b) return b;
         }
         return nullptr;
@@ -1392,10 +1390,10 @@ namespace SDK {
                 if (!g_hierDumped) {
                     g_hierDumped = true;
                     Log("[hier] ---- player transform ----");
-                    LogHierarchy(playerTf, 40);                        // >>> [B2.c] era 80
+                    LogHierarchy(playerTf, 40);                       // [B2c] era 80
                     if (animTf && animTf != playerTf) {
                         Log("[hier] ---- animator transform ----");
-                        LogHierarchy(animTf, 40);                      // >>> [B2.c] era 80
+                        LogHierarchy(animTf, 40);                     // [B2c] era 80
                     }
                     Log("[hier] ---- fim ----");
                 }
@@ -1469,8 +1467,6 @@ namespace SDK {
         return se_read_bytes(p, out, 16 * sizeof(float));
     }
 
-    // [P4] a matriz so' e' publicada se veio inteira. Se falhou, g_viewProjOk
-    // vai a false e o WorldToScreen REJEITA em vez de usar a matriz antiga.
     void UpdateView() {
         g_camera = CameraObj();
 
@@ -1504,7 +1500,6 @@ namespace SDK {
         if (!ok) g_w2sSemMatriz.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // [P1] CONTRATO: falhou => out vira SENTINELA (-1,-1) e retorna false.
     bool WorldToScreen(Vec3 w, Vec2& out) {
         out = Vec2{ -1.f, -1.f };
 
@@ -2506,8 +2501,7 @@ namespace SDK {
         static ULONGLONG lastRefresh = 0;
         static ULONGLONG lastTfPrune = 0;
         ULONGLONG now = GetTickCount64();
-        // >>> [B2.a] era 200ms: FindObjectsOfType aloca um array gerenciado (pico de GC)
-        if (now - lastRefresh > 500) { lastRefresh = now; RefreshTargets(); }
+        if (now - lastRefresh > 500) { lastRefresh = now; RefreshTargets(); }   // [B2a] era 200
         if (now - lastTfPrune > 2000) { lastTfPrune = now; PruneTfCache(); }
 
         if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
@@ -2520,7 +2514,6 @@ namespace SDK {
             if (!g_localPlayer) return;
         }
 
-        // [P3] g_frameId NAO e' mais incrementado aqui: dono unico = swap hook.
         PlausibleBeginFrame(g_frameId);
         g_localPos = GetPos(g_localPlayer);
         g_localTeam = ReadTeam(g_localPlayer);
@@ -2543,8 +2536,6 @@ namespace SDK {
             float dx = t.head.x - g_localPos.x, dy = t.head.y - g_localPos.y, dz = t.head.z - g_localPos.z;
             t.dist = sqrtf(dx * dx + dy * dy + dz * dz);
 
-            // [P2] okH/okF sao autoritativos. Sem coordenada valida,
-            // onScreen=false e o sentinela do WorldToScreen reprova o hgt.
             const bool okH = WorldToScreen(t.head, t.scrHead);
             const bool okF = WorldToScreen(t.feet, t.scrFeet);
 
@@ -2591,7 +2582,6 @@ namespace SDK {
             LeaveCriticalSection(&g_targetCs);
         }
 
-        // [E] publica o frame inteiro para quem nao e' a thread do jogo
         PublishFrame();
     }
 
@@ -2706,6 +2696,7 @@ namespace SDK {
         { std::lock_guard<std::mutex> lk(g_tfMx);     g_tfCache.clear(); }
         memset(g_boneCache, 0, sizeof(g_boneCache));
         g_boneEvict = 0;
+        memset(g_posCache, 0, sizeof(g_posCache));            // [B3]
         memset(g_syncCache, 0, sizeof(g_syncCache));
         g_syncCacheN = 0;
         g_syncDumped = false;
@@ -2714,7 +2705,6 @@ namespace SDK {
         memset(g_slotOwner, 0, sizeof(g_slotOwner));
         memset(g_slotSeen, 0, sizeof(g_slotSeen));
 
-        // [D1] metadata: zera os ponteiros de CLASSE tambem (senao ficam velhos)
         kEntity = kPlayerScript = kPlayer = kNPC = nullptr;
         kTransform = kCamera = kObject = kRaycastHit = nullptr;
         kGunStats = kVector3 = kQuaternion = nullptr;
@@ -2723,7 +2713,6 @@ namespace SDK {
         g_gsCls = nullptr;
         sObjCls = nullptr; sFindObjs = nullptr; sOnlyEntity = -1;
 
-        // [D3] cursor
         g_cursorCls = nullptr; g_cursorVisibleM = nullptr; g_cursorLockM = nullptr;
         g_cursorLogged = false;
 
@@ -2752,7 +2741,6 @@ namespace SDK {
 
         g_plausStamp = 0;
 
-        // [E] snapshot
         g_fdSeq.store(0, std::memory_order_relaxed);
         g_fdPublish.store(0, std::memory_order_relaxed);
         g_fdTorn.store(0, std::memory_order_relaxed);
@@ -2760,7 +2748,6 @@ namespace SDK {
         LosInvalidate();
     }
 
-    // [D2] re-resolve classes depois de limpar (metadata nova)
     void InvalidateRuntime() {
         ClearRuntimeCaches();
         ResolveAll();
@@ -2769,9 +2756,9 @@ namespace SDK {
     bool OnDomainReload() {
         g_phase = "sdk.reload";
         if (!g_inited) return Init();
-        ClearRuntimeCaches();       // [D1] zera inclusive k*
-        BuildCache();               // g_classes aponta p/ metadata NOVA
-        ResolveAll();               // [D2] re-resolve classes + offsets + metodos
+        ClearRuntimeCaches();
+        BuildCache();
+        ResolveAll();
         g_phase = "sdk.done";
         Log("[sdk] OnDomainReload: metadata re-resolvida");
         return true;

@@ -1,16 +1,15 @@
 #pragma once
 // ============================================================================
-//  aimbot.h  —  v16
+//  aimbot.h  —  v17
 //
 //  FIXES:
 //   [H1] Declaracoes que matam os LNK2019 (Install/Tick/Best/AimPoint/Silent::Override).
 //   [H2] Silent::Override(Vec3 muzzle, Vec3& outDir)  <-- assinatura batendo com a
 //        chamada no hook do FireBullet (hooks.cpp). 2 argumentos, NAO 3.
-//        muzzle = posicao do cano (por valor)
-//        outDir = direcao do tiro (por REFERENCIA -> e' reescrita no lugar)
 //   [H3] <cstdint> incluido.
 //   [H4] v16: declaradas as helpers de math (definidas em aimbot.cpp).
-//        A versao de 1 argumento Dist3D(Vec3) e' inline e vive no features.h.
+//   [H5] v17 (PATCH A2): IsActive() — estado real (tecla segurada/toggle) usado
+//        pelo gate do silent aim no hooks.cpp.
 // ============================================================================
 
 #include <cstdint>
@@ -30,15 +29,17 @@ namespace Aimbot {
     void  Shutdown();
     void  OnDomainReload();
 
+    bool  IsActive();           // [H5] tecla segurada OU toggle ligado
+
     // -----------------------------------------------------------------------
     //  helpers usados por outros modulos
     // -----------------------------------------------------------------------
-    Il2CppObject* Best();                 // combat.cpp   -> melhor alvo
+    Il2CppObject* Best();                 // combat.cpp   -> melhor alvo (cache/frame)
     Vec3          AimPoint(void* target); // triggerbot.cpp -> ponto de mira
 
     // -----------------------------------------------------------------------
     //  silencioso — chamado no hook do FireBullet (hooks.cpp)
-    //  Override(p2, p3): p2 = origem/muzzle, p3 = direcao (reescrita por ref)
+    //  Override(muzzle, outDir): muzzle = origem do cano, outDir = direcao (ref)
     // -----------------------------------------------------------------------
     namespace Silent {
         bool Override(Vec3 muzzle, Vec3& outDir);

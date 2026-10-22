@@ -1,21 +1,13 @@
 // ============================================================================
-//  combat.cpp — UNICO orquestrador por frame. (v8)
+//  combat.cpp — UNICO orquestrador por frame. (v10)
 //
-//  FIX v8
-//   [O1] AimbotBest movido para ANTES do ESP -> o destaque de mira do ESP usa o
-//        alvo ATUAL, nao o do frame anterior.
-//   [O2] Comentario de dono: g_sdkReady e' escrito SO' aqui. O SetStage() do
-//        hooks.cpp NAO deve mais escrever nele (senao vira 2 donos e o latch
-//        e' derrubado no startup).
+//  FIX v10 (PATCH C2) — PROFILER, pra parar de adivinhar o stutter:
+//   * conta quantos passos rodaram no frame (passos=N/12)
+//   * loga os 3 passos MAIS CAROS do frame (top=)
+//   * se passos=12 em 100% das linhas, a cadencia NAO esta' ativa
 //
-//  [1] g_sdkReady e' LATCH. Falha transitoria nao derruba o sdkReady — era o
-//      que fazia o ESP sumir por 3 frames toda vez que a lista de alvos mexia.
-//  [2] Passo critico por FLAG na tabela, nao por indice. Unlock saiu.
-//  [3] Estado transitorio separado: g_dataOk.
-//  [4] StepMinMs/StepMaxMs leem g_statsN sob o lock.
-//  [5] Helpers de lock anotados com SAL (mata C26110).
-//  [6] Passo ESP: publica o snapshot no thread do jogo.
-//  [7] Passo Cursor: publica Cursor.visible/lockState do JOGO.
+//  FIX v9 (PATCH C1) — cadencia por passo (everyN).
+//  FIX v8 — [O1] AimbotBest antes do ESP; [O2] dono unico do g_sdkReady.
 // ============================================================================
 #include <windows.h>
 
@@ -41,7 +33,7 @@ namespace Combat {
 
     static std::atomic<bool> g_ticking{ false };
     static std::atomic<bool> g_unloaded{ false };
-    static bool              g_ready = false;      // LATCH: so' cai no Shutdown
+    static bool              g_ready = false;
 
     static const uint32_t kWarmupFrames = 3;
 
@@ -57,13 +49,10 @@ namespace Combat {
 
     _Acquires_lock_(g_statsLock)
         static void StatsLock() { AcquireSRWLockExclusive(&g_statsLock); }
-
     _Releases_lock_(g_statsLock)
         static void StatsUnlock() { ReleaseSRWLockExclusive(&g_statsLock); }
-
     _Acquires_lock_(g_statsLock)
         static void StatsLockShared() { AcquireSRWLockShared(&g_statsLock); }
-
     _Releases_lock_(g_statsLock)
         static void StatsUnlockShared() { ReleaseSRWLockShared(&g_statsLock); }
 
@@ -120,7 +109,6 @@ namespace Combat {
         StatsUnlockShared();
         return v;
     }
-
     float StepMaxMs(int i) {
         StatsLockShared();
         const float v = (i >= 0 && i < g_statsN) ? g_statMax[i] : 0.f;
@@ -145,9 +133,7 @@ namespace Combat {
         DWORD code = 0;
         void* addr = nullptr;
 
-        __try {
-            ok = fn();
-        }
+        __try { ok = fn(); }
         __except ((code = GetExceptionCode(),
             addr = GetExceptionInformation()->ExceptionRecord->ExceptionAddress,
             EXCEPTION_EXECUTE_HANDLER)) {
@@ -180,36 +166,32 @@ namespace Combat {
     static bool S_Movement() { Movement::Tick();     return true; }
     static bool S_AntiCheat() { AntiCheat::Tick();    return true; }
 
-    // 'critico' = a falha desse passo impede considerar o SDK pronto.
-    struct StepDef { const char* nome; bool (*fn)(); bool critico; };
+    struct StepDef { const char* nome; bool (*fn)(); bool critico; int everyN; };
 
-    // >>> [O1] AimbotBest ANTES do ESP: o ESP usa o g_aimTarget do frame ATUAL.
+    // >>> [O1] AimbotBest ANTES do ESP.
     static const StepDef kSteps[] = {
-        { "Unlock",        S_Unlock,        false },
-        { "UpdateTargets", S_UpdateTargets, true },   // unico critico
-        { "UpdateView",    S_UpdateView,    false },
-        { "AimbotBest",    S_AimbotBest,    false },
-        { "Cursor",        S_Cursor,        false },
-        { "ESP",           S_ESP,           false },
-        { "Misc",          S_Misc,          false },
-        { "Aimbot",        S_Aimbot,        false },
-        { "Triggerbot",    S_Triggerbot,    false },
-        { "Weapons",       S_Weapons,       false },
-        { "Movement",      S_Movement,      false },
-        { "AntiCheat",     S_AntiCheat,     false },
+        { "Unlock",        S_Unlock,        false, 4 },
+        { "UpdateTargets", S_UpdateTargets, true,  1 },   // unico critico
+        { "UpdateView",    S_UpdateView,    false, 1 },
+        { "AimbotBest",    S_AimbotBest,    false, 1 },
+        { "Cursor",        S_Cursor,        false, 4 },
+        { "ESP",           S_ESP,           false, 1 },
+        { "Misc",          S_Misc,          false, 2 },
+        { "Aimbot",        S_Aimbot,        false, 1 },
+        { "Triggerbot",    S_Triggerbot,    false, 1 },
+        { "Weapons",       S_Weapons,       false, 4 },
+        { "Movement",      S_Movement,      false, 1 },
+        { "AntiCheat",     S_AntiCheat,     false, 8 },
     };
     static const int kStepsN = (int)(sizeof(kSteps) / sizeof(kSteps[0]));
     static_assert(sizeof(kSteps) / sizeof(kSteps[0]) <= kMaxSteps,
         "kMaxSteps pequeno para a tabela de passos");
 
-    static bool ValidateCoreState() {
-        return SDK::g_localPlayer != nullptr;
-    }
+    static bool ValidateCoreState() { return SDK::g_localPlayer != nullptr; }
 
     // ------------------------------------------------------------ shutdown
     static void ShutdownOnce() {
         if (g_unloaded.exchange(true)) return;
-
         for (int i = 0; i < 500 && g_ticking.load(std::memory_order_acquire); ++i)
             Sleep(0);
 
@@ -228,14 +210,10 @@ namespace Combat {
 
     // ---------------------------------------------------------------- tick
     void Tick() {
-        if (g_unload.load(std::memory_order_acquire)) {
-            ShutdownOnce();
-            return;
-        }
+        if (g_unload.load(std::memory_order_acquire)) { ShutdownOnce(); return; }
 
         bool expected = false;
-        if (!g_ticking.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel)) {
+        if (!g_ticking.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
             ++g_skippedTicks;
             return;
         }
@@ -243,23 +221,34 @@ namespace Combat {
         const double t0 = QpcMs();
         PHASE("Combat::Tick");
 
+        // [C2] os 3 passos mais caros do frame (ordenados)
+        struct Hot { const char* n; double ms; } hot[3] = { { nullptr,0.0 },{ nullptr,0.0 },{ nullptr,0.0 } };
+        auto pushHot = [&](const char* n, double ms) {
+            if (ms <= hot[2].ms) return;
+            hot[2] = { n, ms };
+            if (hot[2].ms > hot[1].ms) { Hot t = hot[1]; hot[1] = hot[2]; hot[2] = t; }
+            if (hot[1].ms > hot[0].ms) { Hot t = hot[0]; hot[0] = hot[1]; hot[1] = t; }
+            };
+
+        int ran = 0;
         bool allCoreOk = true;
         for (int i = 0; i < kStepsN; ++i) {
+            const int n = kSteps[i].everyN;
+            if (n > 1 && ((g_frame + (uint32_t)i) % (uint32_t)n) != 0) continue;
+
+            ++ran;
             PHASE(kSteps[i].nome);
             double dt = 0.0;
             const bool ok = RunStep(kSteps[i].nome, kSteps[i].fn, &dt);
             Stat(kSteps[i].nome, dt);
+            pushHot(kSteps[i].nome, dt);
             if (kSteps[i].critico) allCoreOk &= ok;
         }
 
         const bool dadosOk = allCoreOk && ValidateCoreState();
-
-        // LATCH: o warmup so' AVANCA. Falha transitoria nao derruba o
-        // g_sdkReady — era o que fazia o ESP piscar jogando.
         if (dadosOk && g_okFrames < kWarmupFrames) ++g_okFrames;
         if (g_okFrames >= kWarmupFrames) g_ready = true;
 
-        // >>> [O2] UNICO dono do g_sdkReady. O SetStage() do hooks.cpp nao escreve mais.
         Hooks::g_sdkReady.store(g_ready, std::memory_order_release);
         g_dataOk.store(dadosOk, std::memory_order_release);
 
@@ -270,13 +259,15 @@ namespace Combat {
         const uint64_t now = GetTickCount64();
         if (now - g_lastDbg >= 1000) {
             g_lastDbg = now;
-            Log("dbg: alvos=%d local=%p team=%d viewProj=%d ready=%d data=%d cursor=%d "
-                "tick=%.2fms frame=%u skip=%u crash=%u fase=%s obj=[ac=%d wp=%d]",
+            Log("dbg: alvos=%d local=%p team=%d ready=%d data=%d cursor=%d "
+                "tick=%.2fms frame=%u passos=%d/%d skip=%u crash=%u top=%s:%.2f %s:%.2f %s:%.2f",
                 SDK::g_targetCount, SDK::g_localPlayer, SDK::g_localTeam,
-                (int)SDK::g_viewProjOk, (int)g_ready, (int)dadosOk,
+                (int)g_ready, (int)dadosOk,
                 SDK::g_cursorState.load(std::memory_order_relaxed),
-                (double)g_tickMs, g_frame, g_skippedTicks, g_crashCount,
-                g_phase ? g_phase : "?", bfi_anticheat_obj, bfi_weapons_obj);
+                (double)g_tickMs, g_frame, ran, kStepsN, g_skippedTicks, g_crashCount,
+                hot[0].n ? hot[0].n : "-", hot[0].ms,
+                hot[1].n ? hot[1].n : "-", hot[1].ms,
+                hot[2].n ? hot[2].n : "-", hot[2].ms);
         }
 
         g_ticking.store(false, std::memory_order_release);
