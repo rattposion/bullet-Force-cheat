@@ -3,6 +3,10 @@
 //  features.h — declaracoes publicas compartilhadas.
 //  Cada simbolo tem UM dono. Nada e' definido aqui (exceto inlines triviais).
 //
+//  >>> v4
+//    * Aimbot::IsActive() declarado (PATCH A3): o hook do FireBullet usa para
+//      so' aplicar silent aim com a tecla REALMENTE segurada.
+//
 //  >>> v3
 //    * Consistente com o hooks.cpp reconstruido (Reinstall, GetViewSize,
 //      LogWndProcInfo sem param, SafeFont/FontCount, ViewW/ViewH).
@@ -128,6 +132,11 @@ namespace Aimbot {
     void  Tick();
     void  Shutdown();
     void  Bone(Il2CppObject* p, Il2CppObject* target);
+
+    // [A3] true quando o aimbot esta ATIVO (tecla segurada / toggle ligado).
+    // O hook do FireBullet usa isto para so' aplicar silent aim quando voce
+    // esta realmente mirando — sem isso, toda bala era redirecionada.
+    bool  IsActive();
 
     Vec3  Sub(Vec3, Vec3);
     float Dot(Vec3, Vec3);

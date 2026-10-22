@@ -45,7 +45,7 @@ struct Config {
     bool  fps = false;
 
     // ---- PERFORMANCE ----
-    int   losPerFrame = 8;
+    int   losPerFrame = 4;
 
     // ---- AIMBOT ----
     bool  aimbot = false;
@@ -88,7 +88,7 @@ struct Config {
     float triggerRadius = 10.f;
 
     // ---- ARMA ----
-    bool  noRecoil = true;
+    bool  noRecoil = false;
     bool  noSpread = false;
     bool  infAmmo = false;
     bool  noReload = false;
@@ -156,7 +156,7 @@ struct Config {
 
     // ---- LOG / DUMP ----
     bool  probeLog = false;
-    bool  beatLog = true;
+    bool  beatLog = false;
     bool  verboseUnlock = true;
     int   watchMaxLines = 12;
 

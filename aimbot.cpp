@@ -1,18 +1,19 @@
 // ============================================================================
-//  aimbot.cpp — v18
+//  aimbot.cpp — v20
 //
-//  FIX v18 (LINK):
-//   [L1] Dist3D(Vec3,Vec3) agora casa com o features.h (extern, por valor).
-//        Antes era static inline com const& -> overload distinto, e a versao
-//        do header ficava SEM definicao (LNK2019 pra quem chamasse de fora).
-//   [L2] Definidos os simbolos que o features.h declara e nao existiam em
-//        lugar nenhum: Sub/Dot/Norm/LookRot/Slerp/LocalPos/CamForward.
-//        >>> SE algum deles JA estiver definido em outro .cpp, apague daqui
-//            (senao vira LNK2005).
-//   [L3] <string> incluido (s_weaponStats usa std::string).
-//   [L4] features.h incluido -> o compilador confere as assinaturas.
+//  PATCH B1 (stutter/travada na partida):
+//   [B1.1] EnsureScan(): UM scan por frame, compartilhado por
+//          Best() / CoreTick() / Silent::Override. Antes eram 2 scans por
+//          frame + 1 por tiro, cada um com varredura completa de alvos.
+//   [B1.2] ScanTargets usa SDK::SnapshotInto() num vector ESTATICO.
+//          Antes SDK::Snapshot() alocava um std::vector a CADA chamada.
 //
-//  (mantidas: v17 com os fixes de campo C.aimbot/C.aimTeam, vis, team, etc.)
+//  PATCH A3 (bala saindo para outro lugar):
+//   [A3.1] Aimbot::IsActive() -> gate do silent aim no hook do FireBullet.
+//   [A3.2] Silent::Override usa o MESMO alvo da mira da camera.
+//   [A3.3] FireBulletAt usa MuzzlePos() (fim da paralaxe).
+//
+//  FIX v18 (LINK): mantidos.
 // ============================================================================
 
 #include "aimbot.h"
@@ -68,8 +69,25 @@ namespace Aimbot {
 
     static std::vector<TargetSnap> s_snap;
 
+    // [B1.2] buffer de leitura reutilizado: zero heap por chamada
+    static std::vector<Target>     s_raw;
+
     // =======================================================================
-    //  math publica (casando com o features.h)   [L1][L2]
+    //  [B1.1] um scan por frame
+    // =======================================================================
+    static uint32_t s_scanFrame = 0xFFFFFFFFu;
+
+    static void ScanTargets();          // fwd decl
+
+    static void EnsureScan() {
+        const uint32_t f = (uint32_t)SDK::g_frameId;
+        if (f != 0u && s_scanFrame == f) return;   // ja' varreu neste frame
+        s_scanFrame = f;
+        ScanTargets();
+    }
+
+    // =======================================================================
+    //  math publica (casando com o features.h)
     // =======================================================================
     Vec3 Sub(Vec3 a, Vec3 b) { return Vec3(a.x - b.x, a.y - b.y, a.z - b.z); }
 
@@ -150,7 +168,7 @@ namespace Aimbot {
     }
 
     // =======================================================================
-    //  scan de alvos
+    //  scan de alvos   [B1.2] sem heap
     // =======================================================================
     static void ScanTargets() {
         s_snap.clear();
@@ -160,10 +178,10 @@ namespace Aimbot {
 
         Vec3 localPos = SDK::GetPos(local);
 
-        auto raw = SDK::Snapshot();
-        s_snap.reserve(raw.size());
+        SDK::SnapshotInto(s_raw);            // >>> [B1.2] reutiliza o buffer
+        s_snap.reserve(s_raw.size());
 
-        for (auto& t : raw) {
+        for (auto& t : s_raw) {
             if (!t.player) continue;
             if (!SDK::ValidInstance(t.player)) continue;
 
@@ -313,7 +331,7 @@ namespace Aimbot {
             if (!s_active) { RestoreAimIfNeeded(); return; }
         }
 
-        ScanTargets();
+        EnsureScan();                       // >>> [B1.1]
         TargetSnap* best = PickBest();
         ApplyAim(best);
     }
@@ -322,7 +340,7 @@ namespace Aimbot {
     void Update() { CoreTick(); }
 
     Il2CppObject* Best() {
-        ScanTargets();
+        EnsureScan();                       // >>> [B1.1] reaproveita o do frame
         TargetSnap* s = PickBest();
         return s ? s->player : nullptr;
     }
@@ -339,16 +357,20 @@ namespace Aimbot {
     }
 
     namespace Silent {
-        bool Override(Vec3 muzzle, Vec3& outDir) {
+        // [A3.2] origin = boca do cano (o param de origem REAL do FireBullet).
+        bool Override(Vec3 origin, Vec3& outDir) {
             if (!C.silentAim) return false;
 
-            Il2CppObject* tgt = Best();
+            // usa o MESMO alvo que a mira da camera esta segurando, quando o
+            // aimbot esta ativo; senao varre uma vez.
+            Il2CppObject* tgt = (s_curTarget && SDK::ValidInstance(s_curTarget))
+                ? s_curTarget : Best();
             if (!tgt) return false;
 
             Vec3 aim = AimPoint(tgt);
             if (aim.zero()) return false;
 
-            Vec3 d{ aim.x - muzzle.x, aim.y - muzzle.y, aim.z - muzzle.z };
+            Vec3 d{ aim.x - origin.x, aim.y - origin.y, aim.z - origin.z };
             float L = d.len();
             if (L < 0.0001f) return false;
 
@@ -364,6 +386,7 @@ namespace Aimbot {
         s_curTarget = nullptr;
         s_lastFire = 0;
         s_lastTargetSwitch = 0;
+        s_scanFrame = 0xFFFFFFFFu;
         Log("[aimbot] Install OK (bone=%d fov=%.1f vis=%d strict=%d team=%d)",
             C.aimBone, C.aimFov, (int)C.aimVisCheck, (int)C.aimStrictVis, (int)C.aimTeam);
         return true;
@@ -373,6 +396,8 @@ namespace Aimbot {
         SDK::ClearTfCache();
         SDK::ClearBoneCache();
         s_snap.clear();
+        s_raw.clear();
+        s_scanFrame = 0xFFFFFFFFu;
         s_curTarget = nullptr;
         s_hasTarget = false;
         s_active = false;
@@ -381,6 +406,8 @@ namespace Aimbot {
 
     void Shutdown() {
         s_snap.clear();
+        s_raw.clear();
+        s_scanFrame = 0xFFFFFFFFu;
         s_curTarget = nullptr;
         s_hasTarget = false;
         s_active = false;
@@ -400,5 +427,8 @@ namespace Aimbot {
 
     bool HasTarget() { return s_hasTarget && s_curTarget != nullptr; }
     Il2CppObject* CurrentTarget() { return s_curTarget; }
+
+    // [A3.1] usado pelo hk_fire7 para o gate do silent aim.
+    bool IsActive() { return s_active && C.aimbot; }
 
 } // namespace Aimbot

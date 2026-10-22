@@ -1,27 +1,24 @@
 // ============================================================================
-//  hooks.cpp  (v26)  — render (wglSwapBuffers), hooks de thread, wndproc, cursor
+//  hooks.cpp  (v28)  — render (wglSwapBuffers), hooks de thread, wndproc, cursor
 //
-//  >>> FIX v26  (principio 5: tamanho e escala; principio 6: instrumentacao)
-//   1) O VIEWPORT do GL passa a ser a UNICA fonte de tamanho. GetClientRect e'
-//      so' fallback, e a divergencia e' logada uma vez. W2S, DisplaySize e
-//      glViewport usam o mesmo par por construcao.
-//   2) DrainGlErrors(): falha do renderer vira contador, nao silencio.
+//  >>> PATCH B2  (stutter / travada na partida)
+//   1) TICK_WATCHDOG_MS 250 -> 400: menos disparos do tick INTEIRO dentro do
+//      wglSwapBuffers (thread de render).
+//   2) Menu::Render() so' roda com o menu ABERTO (antes: todo frame).
+//   3) DrainGlErrors() so' com C.probeLog (glGetError forca sync em varios
+//      drivers).
 //
-//  >>> FIX v25  (bala nao acerta nada + AV write em fase=hk_fire)
-//   1) slot da direcao DETECTADO (|v| ~ 1); muzzle real; PHASE por etapa.
-//   2) Writable(): checagem de gravabilidade em ApplyNoRecoil.
-//   3) Direcao final renormalizada.
+//  >>> PATCH A1  (bala saindo para outro lugar / nao acerta nem a parede)
+//   4) O slot da direcao DEIXA de ser um latch de 8 balas. PickDirSlot()
+//      decide POR TIRO: o param unitario e' a DIRECAO; o que esta colado no
+//      player e' a ORIGEM.
+//   5) O silent aim passa a ser gated por C.silentAim E pela TECLA SEGURADA.
+//   6) A direcao e' calculada a partir do parametro de ORIGEM REAL.
 //
-//  >>> FIX v24: silent aim SEGURO (restaura o original se falhar) + sonda.
-//  >>> FIX v23: fwd decl de hk_wndProc (C2065); (LPCSTR)IDC_ARROW (C2664).
-//  >>> FIX v22: HandleKeys incondicional; INPUT_TEST_LEVEL 7; dono unico do
-//      toggle; cursor auto-curavel; injecao de mouse so' como fallback.
-//  >>> FIX v21: SetStage nao escreve g_sdkReady (dono: Combat::Tick).
-//  >>> FIX v20: anti-blink via WithinFrameScope; hk_fire7 leve.
-//  >>> FIX v19: hk_fire7 blindado por etapa; Override(p2,p3).
-//  >>> FIX v18: bool Init(); VEH proprio.
-//  >>> FIX v17: sem enum Stage local; g_frameOpen atomico; SDK::SetRot.
-//  >>> FIX v16: cada desenho com seu __try e ImGui::Render() incondicional.
+//  >>> PATCH A2  (solavanco da camera no tiro)
+//   7) no-recoil guarda a rotacao da camera e DEVOLVE depois do tiro.
+//
+//  >>> FIX v26/v25/v24/... (mantidos)
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -51,7 +48,7 @@
 
 #define WATCH_MAX_LINES   12
 #define PROBE_DIFF_MAX    8
-#define TICK_WATCHDOG_MS  250
+#define TICK_WATCHDOG_MS  400     // >>> [B2] era 250: menos tick na thread de render
 #define WND_REAPPLY_MS    500     // reaplica o wndproc se o jogo restaurar o dele
 #define MOUSE_FALLBACK_MS 120     // injeta mouse so' se o wndproc ficou mudo
 
@@ -99,7 +96,8 @@ namespace Hooks {
     static std::atomic<ULONGLONG> g_lastWndMsg{ 0 };
     static std::atomic<ULONGLONG> g_lastMouseMsg{ 0 };
 
-    // slot do parametro que e' a DIRECAO no FireBullet (-1 = nao detectado)
+    // slot do parametro que e' a DIRECAO no FireBullet (-1 = nao detectado).
+    // [A1] agora e' so' espelho de log/consumo; a decisao e' por tiro.
     static std::atomic<int> s_dirSlot{ -1 };
 
     uint32_t FrameId() { return (uint32_t)g_frameCounter.load(std::memory_order_relaxed); }
@@ -327,9 +325,10 @@ namespace Hooks {
     }
 
     // -----------------------------------------------------------------------
-    //  NO-RECOIL — valida objeto E destino antes de escrever
+    //  NO-RECOIL (mantida; [A2] o caminho novo captura/restaura na hk_fire7)
+    //  valida objeto E destino antes de escrever
     // -----------------------------------------------------------------------
-    static void ApplyNoRecoil() {
+    [[maybe_unused]] static void ApplyNoRecoil() {
         if (!C.noRecoil || !SDK::g_localPlayer) return;
         __try {
             Il2CppObject* ct = SDK::CamTfObj();
@@ -613,8 +612,24 @@ namespace Hooks {
     }
 
     // -----------------------------------------------------------------------
-    //  FIRE — blindado + silent aim com slot DETECTADO
+    //  FIRE — blindado + silent aim com slot decidido POR TIRO
     // -----------------------------------------------------------------------
+    // [A1] Qual dos dois Vector3 e' a DIRECAO?
+    //      A direcao de tiro e' UNITARIA. A origem (boca do cano / camera) fica
+    //      COLADA no player. Nada de latch: decide a cada chamada.
+    static int PickDirSlot(const Vec3& a, const Vec3& b) {
+        const float la = Len(a), lb = Len(b);
+        const float da = fabsf(la - 1.f), db = fabsf(lb - 1.f);
+
+        if (da + 0.05f < db) return 0;
+        if (db + 0.05f < da) return 1;
+
+        // ambiguo: a que esta MAIS PERTO do player e' a ORIGEM -> o outro e' a direcao
+        const float pa = (a - SDK::g_localPos).len();
+        const float pb = (b - SDK::g_localPos).len();
+        return (pa < pb) ? 1 : 0;
+    }
+
     static bool __fastcall hk_fire7(void* self, void* method, int p0, float p1,
         Vec3 p2, Vec3 p3, bool p4, double p5, int p6) {
         PHASE("hk_fire");
@@ -623,7 +638,7 @@ namespace Hooks {
         if (StageNow() < Stage::Live || !self || !g_sdkReady.load(std::memory_order_relaxed))
             return o_fire7(self, method, p0, p1, p2, p3, p4, p5, p6);
 
-        // ---- sonda + deteccao automatica do slot da direcao (|v| ~ 1) ----
+        // ---- sonda (so' log, 8 primeiras balas) ----
         static int probe = 0;
         if (probe < 8) {
             ++probe;
@@ -631,39 +646,41 @@ namespace Hooks {
             Log("[fire-probe] p2=(%.2f,%.2f,%.2f)|%.3f| p3=(%.2f,%.2f,%.2f)|%.3f| local=(%.1f,%.1f,%.1f)",
                 p2.x, p2.y, p2.z, l2, p3.x, p3.y, p3.z, l3,
                 SDK::g_localPos.x, SDK::g_localPos.y, SDK::g_localPos.z);
-
-            if (s_dirSlot.load() < 0) {
-                const float d2 = fabsf(l2 - 1.f), d3 = fabsf(l3 - 1.f);
-                int slot = (d2 <= d3) ? 0 : 1;
-                if (d2 > 0.25f && d3 > 0.25f) {
-                    Log("[fire-probe] nenhum param e' unitario — assumindo slot 0");
-                    slot = 0;
-                }
-                s_dirSlot.store(slot);
-                SDK::g_fireDirSlot.store(slot);
-                Log("[fire] dirSlot auto = %d (|p2|=%.3f |p3|=%.3f)", slot, l2, l3);
-            }
         }
-        const int slot = s_dirSlot.load();
+
+        // ---- [A1] slot da direcao: decidido POR TIRO (sem latch permanente) ----
+        const int slot = PickDirSlot(p2, p3);
+        s_dirSlot.store(slot);
+        SDK::g_fireDirSlot.store(slot);
+
+        static int lastSlot = -2;
+        if (slot != lastSlot) {
+            lastSlot = slot;
+            Log("[fire] dirSlot=%d |p2|=%.3f |p3|=%.3f", slot, Len(p2), Len(p3));
+        }
 
         const Vec3 keep2 = p2;
         const Vec3 keep3 = p3;
 
-        // ---- silent aim ----
-        if (C.aimKey) {
+        // ---- [A1] silent aim: so' com o silent LIGADO e a TECLA SEGURADA ----
+        const bool silentOn = C.silentAim &&
+            (C.aimToggle ? Aimbot::IsActive() : C.aimKeyDown);
+
+        if (silentOn) {
             __try {
                 Vec3& dir = (slot == 0) ? p2 : p3;
+                Vec3& org = (slot == 0) ? p3 : p2;   // o outro param e' a ORIGEM
                 const Vec3 keepDir = dir;
 
-                // muzzle: usa o parametro irmao SO' se ele parecer uma posicao
-                Vec3 muz = (slot == 0) ? p3 : p2;
-                const float lm = Len(muz);
-                const float lp = Len(SDK::g_localPos);
-                if (!(lm > 1.f && lm < 5000.f) || fabsf(lm - lp) > lp)
-                    muz = SDK::g_localPos;
+                // [A1] a origem tem de parecer uma posicao COLADA no player
+                Vec3 origin = org;
+                const float lo = Len(origin);
+                const bool originOk = (lo > 0.5f) && (lo < 20000.f) &&
+                    ((origin - SDK::g_localPos).len() < 6.f);
+                if (!originOk) origin = SDK::MuzzlePos();
 
                 PHASE("fire:aim");
-                const bool ok = Aimbot::Silent::Override(muz, dir);
+                const bool ok = Aimbot::Silent::Override(origin, dir);
 
                 if (!ok) dir = keepDir;
                 else {
@@ -677,16 +694,29 @@ namespace Hooks {
             }
         }
 
-        // ---- no-recoil ----
+        // ---- [A2] no-recoil: guarda a rotacao da camera e devolve DEPOIS ----
+        Quat camBefore{};
+        bool camOk = false;
         if (C.noRecoil) {
-            __try { PHASE("fire:recoil"); ApplyNoRecoil(); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { Log("[fire] AV no no-recoil"); }
+            __try {
+                Il2CppObject* ct = SDK::CamTfObj();
+                camOk = ct && SDK::GetRot(ct, camBefore);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { camOk = false; }
         }
 
         __try {
             PHASE("fire:orig");
             const bool r = o_fire7(self, method, p0, p1, p2, p3, p4, p5, p6);
             PHASE("fire:post");                 // sobreviveu ao original
+
+            // [A2] cancela o recoil sem solavanco: devolve a rotacao original
+            if (camOk) {
+                __try {
+                    if (Il2CppObject* ct = SDK::CamTfObj()) SDK::SetRot(ct, camBefore);
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
             return r;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) { Log("[fire] AV no original"); return false; }
@@ -799,15 +829,15 @@ namespace Hooks {
             if (C.menuOpen) {
                 const bool wndMute =
                     (GetTickCount64() - g_lastMouseMsg.load(std::memory_order_relaxed))
-                    > MOUSE_FALLBACK_MS;
-                    if (wndMute) {
-                        POINT pt{};
-                        if (GetCursorPos(&pt) && ScreenToClient(g_hwnd, &pt))
-                            io.AddMousePosEvent((float)pt.x, (float)pt.y);
-                        io.AddMouseButtonEvent(0, (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
-                        io.AddMouseButtonEvent(1, (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0);
-                        io.AddMouseButtonEvent(2, (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0);
-                    }
+        > MOUSE_FALLBACK_MS;
+        if (wndMute) {
+            POINT pt{};
+            if (GetCursorPos(&pt) && ScreenToClient(g_hwnd, &pt))
+                io.AddMousePosEvent((float)pt.x, (float)pt.y);
+            io.AddMouseButtonEvent(0, (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
+            io.AddMouseButtonEvent(1, (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0);
+            io.AddMouseButtonEvent(2, (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0);
+        }
             }
 
             ImGui::NewFrame();
@@ -816,8 +846,11 @@ namespace Hooks {
         __except (EXCEPTION_EXECUTE_HANDLER) { g_abortPre.fetch_add(1, std::memory_order_relaxed); }
 
         if (frameOk) {
-            __try { Menu::Render(); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { g_abortMenu.fetch_add(1, std::memory_order_relaxed); }
+            // >>> [B2] menu so' quando ABERTO
+            if (C.menuOpen) {
+                __try { Menu::Render(); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { g_abortMenu.fetch_add(1, std::memory_order_relaxed); }
+            }
 
             if (AtLeast(Stage::Live) && AtLvl(Lvl::Esp)) {
                 __try { ESP::Draw(); }
@@ -831,7 +864,8 @@ namespace Hooks {
             __try { ImGui::Render(); }
             __except (EXCEPTION_EXECUTE_HANDLER) { g_abortRender.fetch_add(1, std::memory_order_relaxed); }
 
-            DrainGlErrors("antes");
+            // >>> [B2] glGetError forca sync: so' com probeLog
+            if (C.probeLog) DrainGlErrors("antes");
 
             ImDrawData* dd = ImGui::GetDrawData();
             if (dd && dd->Valid && dd->CmdListsCount > 0) {
@@ -840,7 +874,7 @@ namespace Hooks {
                 __except (EXCEPTION_EXECUTE_HANDLER) { g_abortDraw.fetch_add(1, std::memory_order_relaxed); }
             }
 
-            DrainGlErrors("depois");
+            if (C.probeLog) DrainGlErrors("depois");
 
             static uint32_t lastSum = 0;
             static ULONGLONG lastAbLog = 0;

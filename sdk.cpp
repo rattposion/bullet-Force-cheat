@@ -1,6 +1,13 @@
 // ============================================================================
 //  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, LOS via Physics.Raycast
 //
+//  v7.1 — PATCH B2 (stutter / travada na partida):
+//    [B2.a] UpdateTargets: re-scan de entidades 200ms -> 500ms (FindObjectsOfType
+//           aloca um array gerenciado e e' a maior fonte de pico de GC).
+//    [B2.b] Busca de ossos com orcamento 4096 -> 768 nos (cada no' faz um
+//           runtime_invoke de get_name; era o pico ao aparecer player novo).
+//    [B2.c] Dump da hierarquia 80 -> 40 nos por arvore.
+//
 //  v7.0 — FONTE UNICA DE TAMANHO + SNAPSHOT DE FRAME:
 //    [F1] g_vpW/g_vpH: o viewport do GL vira a UNICA fonte de tamanho.
 //         ScreenW/ScreenH devolvem isso (com fallback no client rect). W2S,
@@ -1297,6 +1304,10 @@ namespace SDK {
     static const char* kFeet[] = { "Foot", "foot", "Foot_L", "Bip01 L Foot",
                                    "mixamorig:LeftFoot", "toe", "Bone_Foot" };
 
+    // >>> [B2.b] era 4096: cada no' da busca faz um runtime_invoke de get_name.
+    // 768 e' folgado para um esqueleto humanoide e corta o pico de hitch.
+    static const int kBoneSearchBudget = 768;
+
     Il2CppObject* FindBoneContains(Il2CppObject* root, const char* sub, int budget) {
         if (!root || !sub) return nullptr;
 
@@ -1348,7 +1359,7 @@ namespace SDK {
     static Il2CppObject* FindBoneAny(Il2CppObject* root, const char** names, int count) {
         if (!root) return nullptr;
         for (int i = 0; i < count; ++i) {
-            Il2CppObject* b = FindBoneContains(root, names[i], 4096);
+            Il2CppObject* b = FindBoneContains(root, names[i], kBoneSearchBudget);   // >>> [B2.b]
             if (b) return b;
         }
         return nullptr;
@@ -1381,10 +1392,10 @@ namespace SDK {
                 if (!g_hierDumped) {
                     g_hierDumped = true;
                     Log("[hier] ---- player transform ----");
-                    LogHierarchy(playerTf, 80);
+                    LogHierarchy(playerTf, 40);                        // >>> [B2.c] era 80
                     if (animTf && animTf != playerTf) {
                         Log("[hier] ---- animator transform ----");
-                        LogHierarchy(animTf, 80);
+                        LogHierarchy(animTf, 40);                      // >>> [B2.c] era 80
                     }
                     Log("[hier] ---- fim ----");
                 }
@@ -2495,7 +2506,8 @@ namespace SDK {
         static ULONGLONG lastRefresh = 0;
         static ULONGLONG lastTfPrune = 0;
         ULONGLONG now = GetTickCount64();
-        if (now - lastRefresh > 200) { lastRefresh = now; RefreshTargets(); }
+        // >>> [B2.a] era 200ms: FindObjectsOfType aloca um array gerenciado (pico de GC)
+        if (now - lastRefresh > 500) { lastRefresh = now; RefreshTargets(); }
         if (now - lastTfPrune > 2000) { lastTfPrune = now; PruneTfCache(); }
 
         if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
