@@ -1,22 +1,20 @@
 // ============================================================================
-//  hooks.cpp  (v35b)
+//  hooks.cpp  (v36)
 //
-//  >>> FIX E0020/C2065: GL_TEXTURE0 (GL 1.3) nao existe no gl.h do Windows.
+//  >>> PATCH R7  (crash fatal: AV fase=hk_swap derrubou a thread de render)
+//   1) LoadGlExt() agora e' chamado no Init — antes so' rodava se fbo!=0 e o
+//      fbo e' SEMPRE 0, entao p_glBindFramebuffer/p_glActiveTexture ficavam
+//      nullptr a sessao toda.
+//   2) CORPO INTEIRO do swap dentro de UM __try + __except com unwind da
+//      critical section (CsUnwind). Nenhum trecho desprotegido.
+//   3) __try separado em volta do o_swap(hdc) — se o present do jogo estourar,
+//      a gente sobrevive e o jogo continua.
+//   4) FASES FINAS: swap:pre / swap:ctx / swap:vp / swap:frame / swap:draw /
+//      swap:present. O proximo AV diz exatamente onde.
 //
-//  >>> PATCH R6  (glDepthMask matando o mapa / texturas)
-//   O ImGui precisa de depthMask FALSE, MAS glClear(GL_DEPTH_BUFFER_BIT)
-//   RESPEITA o depthMask. Deixando FALSE e nao devolvendo, o clear de
-//   profundidade do Unity parou de limpar -> depth acumula -> geometria
-//   distante rejeitada -> skybox azul no lugar do mapa.
-//   -> SNAPSHOT antes, FORCA para desenhar, RESTAURA depois
-//      (depth/color/stencil mask, enable states, blend func, scissor box,
-//       active texture). Tudo que o glClear do jogo depende.
-//   -> Loga o DIFF do estado do jogo (1/s) e o [espdbg] mundo->tela.
-//
-//  >>> PATCH R5  (stencil — overlay invisivel vivo). hostile=N no [beat].
-//  >>> PATCH R4  (sonda glstate + FBO — fbo sempre 0, no-op)
-//  >>> PATCH A13  (so' o tiro do dono)  |  A12 (sonda p2)  |  A11 (ABI)
-//  >>> PATCH R1/R2/R3  |  B2  |  A1  |  A2
+//  >>> PATCH R6  (glDepthMask/colorMask matando o mapa) — SNAPSHOT+FORCE+RESTORE
+//  >>> PATCH R5  (stencil — overlay invisivel vivo)
+//  >>> PATCH A13 / A12 / A11 / R1-R4 / B2 / A1 / A2
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -54,7 +52,6 @@
 
 #define INPUT_TEST_LEVEL  7
 
-// ---- GL 1.2+ via wglGetProcAddress (o gl.h do Windows e' 1.1) --------------
 #ifndef GL_FRAMEBUFFER
 #define GL_FRAMEBUFFER 0x8D40
 #endif
@@ -80,11 +77,11 @@
 #define GL_ACTIVE_TEXTURE 0x84E0
 #endif
 #ifndef GL_TEXTURE0
-#define GL_TEXTURE0 0x84C0          // [FIX E0020/C2065] GL 1.3
+#define GL_TEXTURE0 0x84C0
 #endif
 
 extern const char* g_phase;
-extern std::atomic<bool> g_unload;      // [FIX C2371]
+extern std::atomic<bool> g_unload;
 #ifndef PHASE
 #define PHASE(x) (g_phase = (x))
 #endif
@@ -103,12 +100,9 @@ namespace Hooks {
             p_glBindFramebuffer = (PFN_glBindFramebuffer)wglGetProcAddress("glBindFramebufferEXT");
         if (!p_glActiveTexture)
             p_glActiveTexture = (PFN_glActiveTexture)wglGetProcAddress("glActiveTexture");
-        return p_glBindFramebuffer != nullptr;
+        return p_glBindFramebuffer != nullptr && p_glActiveTexture != nullptr;
     }
 
-    // -----------------------------------------------------------------------
-    //  Globais DECLARADAS no hooks.h
-    // -----------------------------------------------------------------------
     std::atomic<bool>     g_hooksLive{ false };
     std::atomic<bool>     g_imguiReady{ false };
     std::atomic<bool>     g_sdkReady{ false };
@@ -131,13 +125,14 @@ namespace Hooks {
     static std::atomic<uint32_t> g_abortMisc{ 0 };
     static std::atomic<uint32_t> g_abortRender{ 0 };
     static std::atomic<uint32_t> g_abortDraw{ 0 };
+    static std::atomic<uint32_t> g_abortBody{ 0 };      // [R7]
+    static std::atomic<uint32_t> g_abortPresent{ 0 };   // [R7]
 
     static std::atomic<ULONGLONG> g_lastWndMsg{ 0 };
     static std::atomic<ULONGLONG> g_lastMouseMsg{ 0 };
 
     static std::atomic<int> s_dirSlot{ -1 };
 
-    // ---- vigia do render ---------------------------------------------------
     static std::atomic<uint32_t>  g_swapCalls{ 0 };
     static std::atomic<ULONGLONG> g_lastSwapMs{ 0 };
     static std::atomic<uint32_t>  g_noDrawStreak{ 0 };
@@ -227,6 +222,12 @@ namespace Hooks {
     static HHOOK  g_cwp = nullptr;
     static PVOID  g_veh = nullptr;
 
+    // >>> [R7] critical section com profundidade — permite unwind em AV
+    static thread_local int t_csDepth = 0;
+    static inline void CsEnter() { if (g_imCsInit) { EnterCriticalSection(&g_imCs); ++t_csDepth; } }
+    static inline void CsLeave() { if (g_imCsInit && t_csDepth > 0) { --t_csDepth; LeaveCriticalSection(&g_imCs); } }
+    static inline void CsUnwind() { while (t_csDepth > 0) CsLeave(); }
+
     typedef BOOL(WINAPI* tSwapBuffers)(HDC);
     typedef BOOL(WINAPI* tSetCursorPos)(int, int);
     typedef void(__fastcall* tLateUpdate)(void*, void*);
@@ -286,7 +287,6 @@ namespace Hooks {
         return n;
     }
 
-    // ---------------- [R1] vigia do render ----------------
     static void NoteNoDraw(const char* why) {
         const char* prev = g_noDrawReason.exchange(why);
         if (prev != why) Log("[render] SEM DESENHO: %s", why);
@@ -301,7 +301,6 @@ namespace Hooks {
         g_lastDrawMs.store(GetTickCount64(), std::memory_order_relaxed);
     }
 
-    // ---------------- [R2] reinit do backend GL3 ----------------
     static void ReinitGlBackend(const char* why) {
         if (!g_imguiInit) return;
         ImGui_ImplOpenGL3_Shutdown();
@@ -309,12 +308,11 @@ namespace Hooks {
         else                           Log("[render] backend GL3 recriado (%s)", why);
     }
 
-    // ======================= [R6] SNAPSHOT / RESTORE DE ESTADO GL ===========
     struct GlSnap {
         GLboolean depthMask = 1, colorMask[4] = { 1,1,1,1 };
         GLint     stencilMask = 0xFF;
         GLboolean depthTest = 1, stencilTest = 0, cullFace = 0, blend = 1, scissorTest = 0;
-        GLint     blendSrc = 1, blendDst = 0;      // ONE, ZERO
+        GLint     blendSrc = 1, blendDst = 0;
         GLint     scissorBox[4] = { 0,0,0,0 };
         GLint     activeTex = GL_TEXTURE0;
     };
@@ -348,7 +346,6 @@ namespace Hooks {
         if (p_glActiveTexture) p_glActiveTexture((GLenum)s.activeTex);
     }
 
-    // >>> [R6] log do DIFF: o que o jogo tinha e que a gente ia sujar
     static void LogStateDiff(const GlSnap& s) {
         static uint32_t lastSig = 0;
         uint32_t sig = ((uint32_t)s.depthMask << 0) | ((uint32_t)s.colorMask[0] << 1) |
@@ -365,8 +362,7 @@ namespace Hooks {
         if (bad) {
             g_maskHostile.fetch_add(1, std::memory_order_relaxed);
             Log("[render] ESTADO GL DO JOGO: depthMask=%d colorMask=%d%d%d%d stencilMask=0x%X "
-                "scissorTest=%d scissorBox=%d,%d,%d,%d blend=%d -> o clear do proximo frame "
-                "seria AFETADO se nao restaurarmos",
+                "scissorTest=%d scissorBox=%d,%d,%d,%d blend=%d -> devolvido no fim do frame",
                 (int)s.depthMask, (int)s.colorMask[0], (int)s.colorMask[1],
                 (int)s.colorMask[2], (int)s.colorMask[3], (unsigned)s.stencilMask,
                 (int)s.scissorTest, s.scissorBox[0], s.scissorBox[1],
@@ -388,7 +384,6 @@ namespace Hooks {
         return "?";
     }
 
-    // ---------------- [R5] sonda de estado GL ----------------
     static void LogGlState() {
         static ULONGLONG last = 0;
         const ULONGLONG now = GetTickCount64();
@@ -433,13 +428,11 @@ namespace Hooks {
             static uint32_t lastLogged = 0;
             if (lastLogged != g_stencilHostile.load()) {
                 lastLogged = g_stencilHostile.load();
-                Log("[render] STENCIL HOSTIL: sFunc=%s sRef=%d — sem o force as quads somem",
-                    GlFuncName(sFunc), (int)sRef);
+                Log("[render] STENCIL HOSTIL: sFunc=%s sRef=%d", GlFuncName(sFunc), (int)sRef);
             }
         }
     }
 
-    // ---------------- [R6] sonda do ESP: mundo -> tela ----------------
     static void LogEspDbg() {
         static ULONGLONG last = 0;
         if (GetTickCount64() - last < 2000) return;
@@ -463,7 +456,6 @@ namespace Hooks {
         Log("[espdbg] scr=%dx%d alvos=%d", SDK::ScreenW(), SDK::ScreenH(), SDK::g_targetCount);
     }
 
-    // ---------------- [R3] thread de vigilancia ----------------
     static DWORD WINAPI RenderWatchThread(LPVOID) {
         while (g_watchRun.load(std::memory_order_relaxed) &&
             !g_unload.load(std::memory_order_relaxed)) {
@@ -476,8 +468,8 @@ namespace Hooks {
                 static ULONGLONG lastMute = 0;
                 if (now - lastMute > SWAP_MUTE_MS) {
                     lastMute = now;
-                    Log("[render] SWAP MUDO: %llums sem wglSwapBuffers (stage=%s)",
-                        (unsigned long long)(now - lastSwap), StageName(StageNow()));
+                    Log("[render] SWAP MUDO: %llums sem wglSwapBuffers (stage=%s fase=%s)",
+                        (unsigned long long)(now - lastSwap), StageName(StageNow()), g_phase);
                 }
             }
 
@@ -579,12 +571,8 @@ namespace Hooks {
         __try {
             Il2CppObject* ct = SDK::CamTfObj();
             if (!ct || !Writable(ct)) return;
-
             void* dst = (uint8_t*)ct + SDK::O_rotation;
-            if (!Writable(dst)) {
-                Log("[fire] no-recoil: destino NAO gravavel (%p) ct=%p", dst, ct);
-                return;
-            }
+            if (!Writable(dst)) return;
             ::Quat pr = SDK::GetPlayerRot(SDK::g_localPlayer);
             SDK::SetRot(ct, pr);
         }
@@ -600,22 +588,19 @@ namespace Hooks {
         if (!GetCursorInfo(&ci)) return true;
         return (ci.flags & CURSOR_SHOWING) != 0;
     }
-
     static void ForceCursor(bool show) {
         if (IsCursorShowing() == show) return;
         int guard = 0;
         if (show) { while (!IsCursorShowing() && ++guard < 64) ShowCursor(TRUE); }
         else { while (IsCursorShowing() && ++guard < 64) ShowCursor(FALSE); }
     }
-
     static void ApplyCursorOwnership() {
         const bool want = MenuWantsMouse();
-
         if (want) {
             if (!g_cursorFreed) {
                 g_cursorWasShowing = IsCursorShowing();
                 g_cursorFreed = true;
-                Log("[cursor] menu aberto: cursor LIVRE (wasShowing=%d)", (int)g_cursorWasShowing);
+                Log("[cursor] menu aberto: cursor LIVRE");
             }
             ForceCursor(true);
             ClipCursor(nullptr);
@@ -623,7 +608,7 @@ namespace Hooks {
         else if (g_cursorFreed) {
             g_cursorFreed = false;
             ForceCursor(g_cursorWasShowing);
-            Log("[cursor] menu fechado: cursor devolvido (showing=%d)", (int)g_cursorWasShowing);
+            Log("[cursor] menu fechado: cursor devolvido");
         }
     }
 
@@ -646,11 +631,7 @@ namespace Hooks {
     void LogWndProcInfo() {
         if (!g_hwnd) { Log("[wndproc] hwnd=null"); return; }
         LONG_PTR cur = GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
-        MEMORY_BASIC_INFORMATION mbi{};
-        VirtualQuery((void*)cur, &mbi, sizeof(mbi));
-        Log("[wndproc] hwnd=%p cur=%p state=0x%X protect=0x%X orig=%p ours=%p",
-            (void*)g_hwnd, (void*)cur, (unsigned)mbi.State, (unsigned)mbi.Protect,
-            (void*)o_wndProc, (void*)hk_wndProc);
+        Log("[wndproc] hwnd=%p cur=%p orig=%p", (void*)g_hwnd, (void*)cur, (void*)o_wndProc);
     }
 
     static thread_local int t_wndDepth = 0;
@@ -677,7 +658,6 @@ namespace Hooks {
             : DefWindowProcA(h, msg, wp, lp);
 
         ++t_wndDepth;
-
         if (C.menuOpen && msg == WM_SETCURSOR) {
             SetCursor(LoadCursorA(nullptr, (LPCSTR)IDC_ARROW));
             --t_wndDepth;
@@ -691,11 +671,7 @@ namespace Hooks {
             ImGuiIO& io = ImGui::GetIO();
             ate = io.WantCaptureMouse || io.WantCaptureKeyboard;
             LeaveCriticalSection(&g_imCs);
-
-            if (ate && IsMouseMsg(msg)) {
-                --t_wndDepth;
-                return TRUE;
-            }
+            if (ate && IsMouseMsg(msg)) { --t_wndDepth; return TRUE; }
         }
 
         LRESULT r = o_wndProc ? CallWindowProcA(o_wndProc, h, msg, wp, lp)
@@ -750,7 +726,6 @@ namespace Hooks {
             g_win32Backend = false;
             return false;
         }
-
         g_imguiInit = true;
         Log("[imgui] contexto criado");
         Advance(Stage::ImGui);
@@ -768,15 +743,12 @@ namespace Hooks {
 
     static void RebindWindow(HWND hwnd) {
         if (!hwnd || hwnd == GetDesktopWindow()) return;
-        if (g_imCsInit) EnterCriticalSection(&g_imCs);
+        CsEnter();
 
         HWND oldWnd = g_hwnd;
         LONG_PTR prev = GetWindowLongPtrA(hwnd, GWLP_WNDPROC);
 
-        if (prev == (LONG_PTR)hk_wndProc && hwnd == g_hwnd) {
-            if (g_imCsInit) LeaveCriticalSection(&g_imCs);
-            return;
-        }
+        if (prev == (LONG_PTR)hk_wndProc && hwnd == g_hwnd) { CsLeave(); return; }
 
         SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
         if (prev && prev != (LONG_PTR)hk_wndProc) o_wndProc = (WNDPROC)prev;
@@ -791,7 +763,6 @@ namespace Hooks {
             ImGui_ImplWin32_Shutdown();
             g_win32Backend = false;
             if (!ImGui_ImplWin32_Init(hwnd)) {
-                Log("[hooks] ImGui_ImplWin32_Init FALHOU (rebind)");
                 g_imguiReady.store(false, std::memory_order_release);
             }
             else {
@@ -801,8 +772,7 @@ namespace Hooks {
             }
             ReinitGlBackend("janela trocada");
         }
-
-        if (g_imCsInit) LeaveCriticalSection(&g_imCs);
+        CsLeave();
     }
 
     static void RunTickOnce() {
@@ -843,10 +813,8 @@ namespace Hooks {
     static int PickDirSlot(const Vec3& a, const Vec3& b) {
         const float la = Len(a), lb = Len(b);
         const float da = fabsf(la - 1.f), db = fabsf(lb - 1.f);
-
         if (da + 0.05f < db) return 0;
         if (db + 0.05f < da) return 1;
-
         const float pa = (a - SDK::g_localPos).len();
         const float pb = (b - SDK::g_localPos).len();
         return (pa < pb) ? 1 : 0;
@@ -878,14 +846,10 @@ namespace Hooks {
             if (Il2CppObject* ct = SDK::CamTfObj()) camPos = SDK::GetPos(ct);
             selfPos = SDK::GetPos((Il2CppObject*)self);
             Log("[fire-probe] LOCAL=%d self=%p p2=(%.2f,%.2f,%.2f)|%.3f| dSelf=%.1f dCam=%.1f "
-                "|| p3=(%.2f,%.2f,%.2f)|%.3f| || localPos=(%.1f,%.1f,%.1f) selfPos=(%.1f,%.1f,%.1f) "
-                "|| args p0=%d p1=%.3f p4=%d p6=%d method=%p",
+                "|| p3=(%.2f,%.2f,%.2f)|%.3f| || args p0=%d p1=%.3f p4=%d p6=%d",
                 (int)isLocalShot, self,
                 p2.x, p2.y, p2.z, Len(p2), Dist(p2, selfPos), Dist(p2, camPos),
-                p3.x, p3.y, p3.z, Len(p3),
-                SDK::g_localPos.x, SDK::g_localPos.y, SDK::g_localPos.z,
-                selfPos.x, selfPos.y, selfPos.z,
-                p0, p1, (int)p4, p6, method);
+                p3.x, p3.y, p3.z, Len(p3), p0, p1, (int)p4, p6);
         }
 
         const int slot = PickDirSlot(p2, p3);
@@ -946,11 +910,8 @@ namespace Hooks {
             PHASE("fire:orig");
             const bool r = o_fire7(self, p0, p1, p2, p3, p4, p5, p6, method);
             PHASE("fire:post");
-
             if (camOk) {
-                __try {
-                    if (Il2CppObject* ct = SDK::CamTfObj()) SDK::SetRot(ct, camBefore);
-                }
+                __try { if (Il2CppObject* ct = SDK::CamTfObj()) SDK::SetRot(ct, camBefore); }
                 __except (EXCEPTION_EXECUTE_HANDLER) {}
             }
             return r;
@@ -966,15 +927,8 @@ namespace Hooks {
         return g && g->WithinFrameScope;
     }
 
-    static BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
-        PHASE("hk_swap");
-        g_frameCounter.fetch_add(1, std::memory_order_relaxed);
-        g_swapCalls.fetch_add(1, std::memory_order_relaxed);
-        g_lastSwapMs.store(GetTickCount64(), std::memory_order_relaxed);
-        SDK::g_frameId = (uint32_t)g_frameCounter.load(std::memory_order_relaxed);
-
-        if (!o_swap) return TRUE;
-
+    // corpo do swap — SEM __try interno grande; o chamador protege tudo
+    static void SwapBody(HDC hdc) {
         __try {
             static int winPoll = 0;
             if (!g_hwnd || ++winPoll >= 8) {
@@ -990,14 +944,13 @@ namespace Hooks {
                     lastWndCheck = nowc;
                     LONG_PTR cur = GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
                     if (cur != (LONG_PTR)hk_wndProc) {
-                        Log("[hooks] wndproc restaurado (cur=%p) — reaplicando", (void*)cur);
+                        Log("[hooks] wndproc restaurado — reaplicando");
                         SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
                     }
                 }
             }
 
             if (AtLvl(Lvl::CursorFn)) ApplyCursorOwnership();
-
             HandleKeys();
             Watchdog();
             LogGlState();
@@ -1008,22 +961,21 @@ namespace Hooks {
             if (nowb - lastBeat >= 1000) {
                 lastBeat = nowb;
                 Log("[beat] swap=%u noDraw=%u(%s) ctx=%u vtx=%u fbo=%d hostile=%u maskH=%u "
-                    "alvos=%d invis=%d esp=%u abort=%u menu=%d stage=%s av=%u veh=%u",
+                    "abortBody=%u abortPres=%u alvos=%d invis=%d esp=%u menu=%d stage=%s av=%u veh=%u",
                     g_swapCalls.load(), g_noDrawStreak.load(),
                     g_noDrawReason.load(), g_ctxChanges.load(), g_vtxTotal.load(),
                     g_lastFbo.load(), g_stencilHostile.load(), g_maskHostile.load(),
-                    SDK::g_targetCount, ESP::Invisiveis(),
-                    g_espBranch.load(),
-                    g_abortPre.load() + g_abortMenu.load() + g_abortEsp.load() +
-                    g_abortMisc.load() + g_abortRender.load() + g_abortDraw.load(),
+                    g_abortBody.load(), g_abortPresent.load(),
+                    SDK::g_targetCount, ESP::Invisiveis(), g_espBranch.load(),
                     (int)C.menuOpen, StageName(StageNow()),
                     g_avCount.load(), g_vehCount.load());
             }
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] bloco1 swap (AV)"); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] swap bloco1 (AV)"); }
 
-        if (!g_imguiInit || !g_hwnd) { NoteNoDraw("sem imgui/hwnd"); return o_swap(hdc); }
+        if (!g_imguiInit || !g_hwnd) { NoteNoDraw("sem imgui/hwnd"); return; }
 
+        PHASE("swap:ctx");
         {
             HGLRC rc = wglGetCurrentContext();
             if (rc != g_glrc) {
@@ -1034,6 +986,7 @@ namespace Hooks {
             }
         }
 
+        PHASE("swap:vp");
         GLint vp[4] = { 0, 0, 0, 0 };
         glGetIntegerv(GL_VIEWPORT, vp);
 
@@ -1044,22 +997,13 @@ namespace Hooks {
                 RECT rc{};
                 if (GetClientRect(g_hwnd, &rc)) { w = rc.right - rc.left; h = rc.bottom - rc.top; }
             }
-            if (w <= 0 || h <= 0) { NoteNoDraw("viewport 0x0"); return o_swap(hdc); }
-
-            RECT rc{};
-            if (GetClientRect(g_hwnd, &rc) && (rc.right != w || rc.bottom != h)) {
-                static bool warned = false;
-                if (!warned) {
-                    warned = true;
-                    Log("[vp] DIVERGENCIA cliente=%dx%d viewport=%dx%d -> usando o viewport",
-                        (int)rc.right, (int)rc.bottom, w, h);
-                }
-            }
+            if (w <= 0 || h <= 0) { NoteNoDraw("viewport 0x0"); return; }
             SDK::SetViewport(w, h);
             SetViewSize(w, h);
         }
 
-        if (g_imCsInit) EnterCriticalSection(&g_imCs);
+        CsEnter();
+        PHASE("swap:frame");
 
         bool frameOk = false;
         __try {
@@ -1104,7 +1048,6 @@ namespace Hooks {
                     g_maskHostile.load(std::memory_order_relaxed));
                 dl->AddText(ImVec2(88.f, 16.f), IM_COL32(255, 255, 0, 255), tb);
             }
-
             frameOk = true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) { g_abortPre.fetch_add(1, std::memory_order_relaxed); }
@@ -1121,7 +1064,6 @@ namespace Hooks {
                 g_espBranch.fetch_add(1, std::memory_order_relaxed);
                 __try { ESP::Draw(); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { g_abortEsp.fetch_add(1, std::memory_order_relaxed); }
-
                 __try { Misc::Draw(); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { g_abortMisc.fetch_add(1, std::memory_order_relaxed); }
             }
@@ -1132,13 +1074,11 @@ namespace Hooks {
             __try { ImGui::Render(); }
             __except (EXCEPTION_EXECUTE_HANDLER) { g_abortRender.fetch_add(1, std::memory_order_relaxed); }
 
-            if (C.probeLog) DrainGlErrors("antes");
-
+            PHASE("swap:draw");
             ImDrawData* dd = ImGui::GetDrawData();
             if (dd && dd->Valid && dd->CmdListsCount > 0) {
                 NoteDraw((uint32_t)dd->TotalVtxCount);
 
-                // >>> [R6] SNAPSHOT antes de sujar
                 GlSnap snap{};
                 __try { GlSnapNow(snap); LogStateDiff(snap); }
                 __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -1146,15 +1086,13 @@ namespace Hooks {
                 GLint prevFbo = 0;
                 glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
                 bool bound = false;
-                if (prevFbo != 0) {
+                if (prevFbo != 0 && p_glBindFramebuffer) {
                     g_fboFrames.fetch_add(1, std::memory_order_relaxed);
-                    if (g_fboLogged.exchange((int)prevFbo) != (int)prevFbo)
-                        Log("[render] FBO != 0 (fbo=%d) — bindando 0", (int)prevFbo);
-                    if (p_glBindFramebuffer) { p_glBindFramebuffer(GL_FRAMEBUFFER, 0); bound = true; }
+                    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    bound = true;
                 }
                 glDrawBuffer(GL_BACK);
 
-                // FORCA estado seguro para o NOSSO desenho
                 __try {
                     glDisable(GL_DEPTH_TEST);
                     glDisable(GL_STENCIL_TEST);
@@ -1174,7 +1112,7 @@ namespace Hooks {
                 __try { ImGui_ImplOpenGL3_RenderDrawData(dd); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { g_abortDraw.fetch_add(1, std::memory_order_relaxed); }
 
-                // >>> [R6] DEVOLVE o estado — e' isto que salva o clear do jogo
+                // DEVOLVE o estado — salva o clear do proximo frame do jogo
                 __try { GlRestoreNow(snap); }
                 __except (EXCEPTION_EXECUTE_HANDLER) {}
 
@@ -1183,26 +1121,37 @@ namespace Hooks {
             else {
                 NoteNoDraw("drawdata vazio");
             }
-
-            if (C.probeLog) DrainGlErrors("depois");
-
-            static uint32_t lastSum = 0;
-            static ULONGLONG lastAbLog = 0;
-            const uint32_t sum = g_abortPre + g_abortMenu + g_abortEsp +
-                g_abortMisc + g_abortRender + g_abortDraw;
-            if (sum != lastSum && GetTickCount64() - lastAbLog >= 1000) {
-                lastSum = sum;
-                lastAbLog = GetTickCount64();
-                Log("[crash] aborts: pre=%u menu=%u esp=%u misc=%u render=%u draw=%u",
-                    g_abortPre.load(), g_abortMenu.load(), g_abortEsp.load(),
-                    g_abortMisc.load(), g_abortRender.load(), g_abortDraw.load());
-            }
         }
 
+        PHASE("swap:post");
         glViewport(vp[0], vp[1], vp[2], vp[3]);
-        if (g_imCsInit) LeaveCriticalSection(&g_imCs);
+        CsLeave();
+    }
 
-        return o_swap(hdc);
+    static BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
+        PHASE("swap:pre");
+        g_frameCounter.fetch_add(1, std::memory_order_relaxed);
+        g_swapCalls.fetch_add(1, std::memory_order_relaxed);
+        g_lastSwapMs.store(GetTickCount64(), std::memory_order_relaxed);
+        SDK::g_frameId = (uint32_t)g_frameCounter.load(std::memory_order_relaxed);
+
+        if (!o_swap) return TRUE;
+
+        // >>> [R7] corpo inteiro protegido; qualquer AV nao derruba a thread
+        __try { SwapBody(hdc); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_abortBody.fetch_add(1, std::memory_order_relaxed);
+            Log("[crash] swap CORPO (AV) — fase=%s", g_phase);
+            CsUnwind();
+        }
+
+        PHASE("swap:present");
+        __try { return o_swap(hdc); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_abortPresent.fetch_add(1, std::memory_order_relaxed);
+            Log("[crash] o_swap (AV)");
+            return TRUE;
+        }
     }
 
     void HandleKeys() {
@@ -1270,6 +1219,14 @@ namespace Hooks {
         SetStage(Stage::Init);
         Log("[input] INPUT_TEST_LEVEL=%d", INPUT_TEST_LEVEL);
 
+        // >>> [R7] resolve as extensoes GL AGORA (antes ficava nullptr sempre)
+        if (!LoadGlExt())
+            Log("[gl] extensoes GL parciais: bindFbo=%p activeTex=%p",
+                (void*)p_glBindFramebuffer, (void*)p_glActiveTexture);
+        else
+            Log("[gl] extensoes GL ok: bindFbo=%p activeTex=%p",
+                (void*)p_glBindFramebuffer, (void*)p_glActiveTexture);
+
         if (!g_veh) g_veh = AddVectoredExceptionHandler(1, VehHandler);
 
         if (AtLvl(Lvl::CursorFn)) InstallCursor();
@@ -1284,13 +1241,12 @@ namespace Hooks {
         if (!g_watchThread) {
             g_watchRun.store(true, std::memory_order_relaxed);
             g_watchThread = CreateThread(nullptr, 0, RenderWatchThread, nullptr, 0, nullptr);
-            Log("[render] vigia do render iniciado (tid=%u)",
-                g_watchThread ? GetThreadId(g_watchThread) : 0);
+            Log("[render] vigia do render iniciado");
         }
 
         g_lastLuMs.store(GetTickCount64(), std::memory_order_relaxed);
         SetStage(Stage::Live);
-        Log("[hooks] init ok stage=%s veh=%p menuKey=0x%X", StageName(StageNow()), g_veh, C.menuKey);
+        Log("[hooks] init ok stage=%s menuKey=0x%X", StageName(StageNow()), C.menuKey);
         return true;
     }
 
@@ -1309,9 +1265,8 @@ namespace Hooks {
     }
 
     bool Shutdown() {
-        if (StageNow() == Stage::Down) { Log("[hooks] Shutdown: ja' em Down"); return true; }
+        if (StageNow() == Stage::Down) return true;
         SetStage(Stage::Tearing);
-
         g_hooksLive.store(false, std::memory_order_release);
         g_imguiReady.store(false, std::memory_order_release);
 
@@ -1323,7 +1278,6 @@ namespace Hooks {
         }
 
         SDK::g_recoilHookActive = false;
-
         if (g_cursorFreed) { g_cursorFreed = false; ForceCursor(g_cursorWasShowing); }
 
         if (o_wndProc && g_hwnd)
@@ -1336,9 +1290,7 @@ namespace Hooks {
         MH_DisableHook(MH_ALL_HOOKS);
         Sleep(120);
 
-        if (g_imCsInit) EnterCriticalSection(&g_imCs);
-        ShutdownImGui();
-        if (g_imCsInit) LeaveCriticalSection(&g_imCs);
+        CsEnter(); ShutdownImGui(); CsLeave();
 
         MH_Uninitialize();
         g_lastLuMs.store(0, std::memory_order_relaxed);
