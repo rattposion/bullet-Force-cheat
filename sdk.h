@@ -1,17 +1,7 @@
 #pragma once
 // ============================================================================
 //  sdk.h — UMBRELLA.
-//
-//  REGRA DE THREAD:
-//    [J] = so' no thread do jogo (dentro do Combat::Tick). Pode chamar il2cpp,
-//          alocar, tomar lock, fazer raycast.
-//    [R] = seguro no thread de render, mas le estado escrito pelo thread do
-//          jogo -> capture no Tick se puder.
-//    [L] = exige LockTargets()/UnlockTargets() em volta.
-//
-//  UpdateTargets() DEVE escrever g_targets/g_targetCount sob g_targetCs.
-//
-//  >>> v2: TeamRelation declarado (DEFINIR em sdk.cpp — ver bloco no fim).
+//    [J] = so' no thread do jogo   [R] = seguro no render   [L] = exige lock
 // ============================================================================
 
 #include <atomic>
@@ -34,11 +24,9 @@ extern const char* g_phase;
 #define PHASE(x) (g_phase = (x))
 #endif
 
-// globais de escopo de arquivo (definidas em sdk.cpp)
 bool         ValidInstance_(const void* o);
 Il2CppClass* SafeClass_(Il2CppObject* o);
 
-// helper de validacao de ponteiro — inline puro
 inline bool PtrOk_(const void* o) {
     const uintptr_t p = (uintptr_t)o;
     if (p == 0) return false;
@@ -52,121 +40,123 @@ inline bool PtrOk_(const void* o) {
 namespace SDK {
 
     // ------------------------------------------------------------ tela
-    int           ScreenW();                       // [R] le Hooks::g_viewW
-    int           ScreenH();                       // [R]
-    float         FovRadiusPx(float deg);          // [J]
-    float         CameraCotHalfFovY();             // [J]
-    Il2CppObject* CameraObj();                     // [J]
+    int           ScreenW();
+    int           ScreenH();
+    float         FovRadiusPx(float deg);
+    float         CameraCotHalfFovY();
+    Il2CppObject* CameraObj();
 
     // ------------------------------------------------------------ cursor do JOGO
     extern std::atomic<int> g_cursorState;
-    void RefreshCursorState();                     // [J] chamado pelo Combat
+    void RefreshCursorState();
 
     // ------------------------------------------------------------ ciclo
-    bool Init();                                   // [J]
-    void Shutdown();                               // [J]
-    void BuildCache();                             // [J]
-    bool OnDomainReload();                         // [J]
-    void InvalidateRuntime();                      // [J]
+    bool Init();
+    void Shutdown();
+    void BuildCache();
+    bool OnDomainReload();
+    void InvalidateRuntime();
 
     // ------------------------------------------------------------ por frame
-    void UpdateView();                             // [J] so' marca viewProjOk
-    void UpdateTargets();                          // [J] escreve g_targets SOB LOCK
-    void RefreshTargets();                         // [J] re-scan de entidades
+    void UpdateView();
+    void UpdateTargets();
+    void RefreshTargets();
 
     // ------------------------------------------------------------ alvos
-    void  LockTargets();                           // [qualquer]
-    void  UnlockTargets();                         // [qualquer]
-    void  SnapshotInto(std::vector<Target>& out);  // [J]
-    std::vector<Target> Snapshot();                // [J] aloca
+    void  LockTargets();
+    void  UnlockTargets();
+    void  SnapshotInto(std::vector<Target>& out);
+    std::vector<Target> Snapshot();
 
-    Il2CppObject* GetLocalPlayer();                // [J]
-    Il2CppObject* GetCamera();                     // [J]
-    bool  IsA(Il2CppObject* o, Il2CppClass* c);    // [J]
-    bool  IsEnemy(Il2CppObject* o);                // [J]
-    int   TeamRelation(Il2CppObject* o);           // [J] 1=inimigo 0=aliado -1=?
-    int   GetTeamId(Il2CppObject* o);              // [J]
-    int   GetLocalTeam();                          // [J]
-    float GetHealth(Il2CppObject* o);              // [J]
+    Il2CppObject* GetLocalPlayer();
+    Il2CppObject* GetCamera();
+    bool  IsA(Il2CppObject* o, Il2CppClass* c);
+    bool  IsEnemy(Il2CppObject* o);
+    int   TeamRelation(Il2CppObject* o);
+    int   GetTeamId(Il2CppObject* o);
+    int   GetLocalTeam();
+    float GetHealth(Il2CppObject* o);
+    float GetHealthRaw(Il2CppObject* o);            // NOVO — sem normalizar
+    bool  SetHealth(Il2CppObject* o, float value);  // NOVO — respeita SyncVar
 
-    Vec3  GetPos(Il2CppObject* o);                 // [J]
-    void  SetPos(Il2CppObject* o, Vec3 v);         // [J]
-    Vec3  GetVelocity(Il2CppObject* o);            // [J]
-    Vec3  MuzzlePos();                             // [J]
+    Vec3  GetPos(Il2CppObject* o);
+    void  SetPos(Il2CppObject* o, Vec3 v);
+    Vec3  GetVelocity(Il2CppObject* o);
+    Vec3  MuzzlePos();
 
     Il2CppObject* FindBoneContains(Il2CppObject* root, const char* sub,
-        int budget = 8192);                        // [J] caro
-    Vec3  GetBonePos(void* bone);                  // [J]
-    void  GetNameBuf(Il2CppObject* o, char* out, int n);   // [J] sem aloc
-    std::string GetName(Il2CppObject* o);          // [J] aloca
+        int budget = 8192);
+    Vec3  GetBonePos(void* bone);
+    void  GetNameBuf(Il2CppObject* o, char* out, int n);
+    std::string GetName(Il2CppObject* o);
 
-    bool  WorldToScreen(Vec3 w, Vec2& s);          // [J]
-    bool  VisibleLine(Vec3 a, Vec3 b);             // [J]
-    Vec3  TargetAimPos(Il2CppObject* p, int boneMode);     // [J]
-    Vec3  BonePoint(Vec3 head, Vec3 feet, int boneMode);   // [J]
+    bool  WorldToScreen(Vec3 w, Vec2& s);
+    bool  VisibleLine(Vec3 a, Vec3 b);
+    Vec3  TargetAimPos(Il2CppObject* p, int boneMode);
+    Vec3  BonePoint(Vec3 head, Vec3 feet, int boneMode);
 
     // ------------------------------------------------------------ rotacao
-    Il2CppObject* CamTfObj();                      // [J]
-    Quat  LookRot(Vec3 dir);                       // [puro]
-    bool  GetRot(Il2CppObject* tf, Quat& out);     // [J]
-    bool  SetRot(Il2CppObject* tf, Quat q);        // [J]
-    void  SetPlayerRot(Il2CppObject* p, const Quat& q);    // [J]
-    Quat  GetPlayerRot(Il2CppObject* p);           // [J]
+    Il2CppObject* CamTfObj();
+    Quat  LookRot(Vec3 dir);
+    bool  GetRot(Il2CppObject* tf, Quat& out);
+    bool  SetRot(Il2CppObject* tf, Quat q);
+    void  SetPlayerRot(Il2CppObject* p, const Quat& q);
+    Quat  GetPlayerRot(Il2CppObject* p);
 
     // ------------------------------------------------------------ arma
-    Il2CppObject* GetGunStats(Il2CppObject* player);       // [J]
-    Il2CppObject* GetGunStatsLive();               // [J]
-    Il2CppObject* FindGunStatsObj();               // [J]
-    Il2CppObject* GetWeapon(Il2CppObject* player);         // [J]
+    Il2CppObject* GetGunStats(Il2CppObject* player);
+    Il2CppObject* GetGunStatsLive();
+    Il2CppObject* FindGunStatsObj();
+    Il2CppObject* GetWeapon(Il2CppObject* player);
     int  ResolveWeaponFields(Il2CppObject* stats, uint32_t& cur, uint32_t& max,
         uint32_t& reserve, uint32_t& reload, uint32_t& spread,
-        uint32_t& rate, uint32_t& dmg);            // [J]
+        uint32_t& rate, uint32_t& dmg);
 
-    bool  AimLock(Il2CppObject* p, Quat& savedOriginal);   // [J]
-    void  RestoreAim(Il2CppObject* p, const Quat& q);      // [J]
-    bool  FireBulletReady();                       // [J]
-    void  FireBulletAt(Vec3 dir);                  // [J]
+    bool  AimLock(Il2CppObject* p, Quat& savedOriginal);
+    void  RestoreAim(Il2CppObject* p, const Quat& q);
+    bool  FireBulletReady();
+    void  FireBulletAt(Vec3 dir);
 
     // ------------------------------------------------------------ LOS
-    bool  HasLineOfSight(Vec3 eye, Vec3 aim);                      // [J]
+    bool  HasLineOfSight(Vec3 eye, Vec3 aim);
     bool  HasLineOfSightEx(Vec3 eye, Vec3 aim,
-        Il2CppObject* localTf, Il2CppObject* targetTf);            // [J]
+        Il2CppObject* localTf, Il2CppObject* targetTf);
     bool  HasLineOfSightExRaw(Vec3 eye, Vec3 aim,
-        Il2CppObject* localTf, Il2CppObject* targetTf);            // [J]
-    bool  TargetVisible(int idx, Vec3 eye, Vec3 aim);              // [J]
-    bool  RaycastTest(Vec3 from, Vec3 to, float& outHitDist);      // [J]
+        Il2CppObject* localTf, Il2CppObject* targetTf);
+    bool  TargetVisible(int idx, Vec3 eye, Vec3 aim);
+    bool  RaycastTest(Vec3 from, Vec3 to, float& outHitDist);
 
-    void  LosInvalidate();                         // [J]
-    bool  LosReady();                              // [barato]
-    const char* LosBackend();                      // [barato]
+    void  LosInvalidate();
+    bool  LosReady();
+    const char* LosBackend();
 
-    void  ClearTfCache();                          // [J]
-    void  ClearBoneCache();                        // [J]
-    void  PruneTfCache();                          // [J]
+    void  ClearTfCache();
+    void  ClearBoneCache();
+    void  PruneTfCache();
 
     // ------------------------------------------------------------ il2cpp
-    Il2CppClass* FindClass(const char* name, const char* ns = nullptr);  // [J]
-    Il2CppObject* GetTransform(void* obj);         // [J]
-    Il2CppObject* SafeReadObjPub(void* obj, uint32_t off);   // [J]
-    bool         ValidInstance(Il2CppObject* o);   // [J]
-    Il2CppClass* SafeClass(Il2CppObject* o);       // [J]
+    Il2CppClass* FindClass(const char* name, const char* ns = nullptr);
+    Il2CppObject* GetTransform(void* obj);
+    Il2CppObject* SafeReadObjPub(void* obj, uint32_t off);
+    bool         ValidInstance(Il2CppObject* o);
+    Il2CppClass* SafeClass(Il2CppObject* o);
 
     uint32_t PickFieldOff(Il2CppClass* k, std::initializer_list<const char*> names,
-        const char* typeSub = nullptr);            // [J]
+        const char* typeSub = nullptr);
 
-    void* MethodPtr(MethodInfo* m);                // [puro]
-    const char* MethodReturnName(MethodInfo* m);   // [puro]
+    void* MethodPtr(MethodInfo* m);
+    const char* MethodReturnName(MethodInfo* m);
 
     // ------------------------------------------------------------ anti-hack
-    Il2CppClass* AntiHackClass();                 // [J]
-    Il2CppClass* FindAntiHackClass();             // [J]
-    Il2CppObject* AntiHackInstance();              // [J]
+    Il2CppClass* AntiHackClass();
+    Il2CppClass* FindAntiHackClass();
+    Il2CppObject* AntiHackInstance();
 
     // ------------------------------------------------------------ debug
-    void DumpFields(const char* className);        // [J]
-    void DumpFields(Il2CppClass* k, const char* tag);      // [J]
-    void DumpFieldsWithValues(Il2CppObject* o);    // [J]
-    void ListClassesContaining(const char* sub);   // [J]
+    void DumpFields(const char* className);
+    void DumpFields(Il2CppClass* k, const char* tag);
+    void DumpFieldsWithValues(Il2CppObject* o);
+    void ListClassesContaining(const char* sub);
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +214,8 @@ using SDK::SetPos;
 using SDK::GetVelocity;
 using SDK::MuzzlePos;
 using SDK::GetHealth;
+using SDK::GetHealthRaw;
+using SDK::SetHealth;
 using SDK::IsA;
 using SDK::IsEnemy;
 using SDK::GetTeamId;

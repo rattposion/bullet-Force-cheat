@@ -45,7 +45,7 @@ struct Config {
     bool  fps = false;
 
     // ---- PERFORMANCE ----
-    int   losPerFrame = 4;              // [B2] era 8
+    int   losPerFrame = 4;
 
     // ---- AIMBOT ----
     bool  aimbot = false;
@@ -53,7 +53,7 @@ struct Config {
     float aimFov = 8.f;
     float aimSmooth = 5.f;
     int   aimBone = 0;
-    int   aimMode = 0;              // 0=Camera(screen) 1=Angulo(3D) 2=Mouse(->Camera)
+    int   aimMode = 0;
     bool  aimVisible = true;
 
     bool  aimVisCheck = true;
@@ -68,9 +68,7 @@ struct Config {
     bool  silentAim = false;
     bool  magicBullets = false;
 
-    // =======================================================================
-    //  ALIASES / CAMPOS NOVOS
-    // =======================================================================
+    // ---- ALIASES / CAMPOS NOVOS ----
     bool  aimEnabled = true;
     bool  aimTeamCheck = false;
     int   aimSelect = 0;
@@ -85,7 +83,7 @@ struct Config {
     float triggerRadius = 10.f;
 
     // ---- ARMA ----
-    bool  noRecoil = false;             // [B2] era true (dava solavanco/AV)
+    bool  noRecoil = false;
     bool  noSpread = false;
     bool  infAmmo = false;
     bool  noReload = false;
@@ -100,14 +98,34 @@ struct Config {
     float jumpPower = 6.f;
     bool  teleport = false;
 
+    // ---- BUNNYHOP / TIRO NO AR ----
+    bool  bhop = false;
+    int   bhopKey = 0;               // 0 = sempre ativo
+    bool  bhopKeepSpeed = false;
+    bool  bhopSkipMenu = true;
+
+    int   bhopMode = 1;              // 0=segurar 1=pulso 2=velocidade
+    int   bhopHoldMs = 25;
+    int   bhopRePressMs = 70;
+    float bhopJumpSpeed = 0.f;
+
+    bool  shootInAir = false;
+    int   airFireKey = VK_LBUTTON;
+    int   airFireDelayMs = 70;
+
     // ---- MISC ----
     bool  godmode = false;
+    float godmodeValue = 100.f;
     bool  hitmarker = false;
     float camFov = 90.f;
     bool  crosshair = false;
     float crosshairSize = 6.f;
     float crosshairColor[4] = { 0.f, 1.f, 0.f, 1.f };
     bool  watermark = true;
+
+    // ---- ALERTA DE RISCO ----
+    bool  showRiskAlert = true;
+    bool  riskAlertBlink = true;
 
     // ---- ANTICHEAT ----
     bool  antiCheat = true;
@@ -141,7 +159,7 @@ struct Config {
     bool  aimKeyDown = false;
     float lastHitTime = 0.f;
 
-    // ---- SELECAO DO LOADOUT / SKINS / PERSONAGENS ----
+    // ---- SELECAO ----
     bool  unlockChars = true;
     bool  applySelection = true;
     int   selWeapon = -1;
@@ -153,7 +171,7 @@ struct Config {
 
     // ---- LOG / DUMP ----
     bool  probeLog = false;
-    bool  beatLog = false;              // [B2] era true (log a cada 250ms no swap)
+    bool  beatLog = false;
     bool  verboseUnlock = true;
     int   watchMaxLines = 12;
 

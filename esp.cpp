@@ -1,22 +1,11 @@
 // ============================================================================
 //  esp.cpp — publicacao (Tick, thread do jogo) + desenho (Draw, thread render)
-//                                                                          v22
+//                                                                          v23
 //
-//  FIX v22 (INSTRUMENTACAO COMPLETA — principio 6):
-//   - [esp] loga os contadores do WorldToScreen separados (ok/semMatriz/atras/
-//     fora): sem isso "fora" misturava camera, alvo atras e escala.
-//   - [esp-draw] loga proj (validade da matriz), frame, torn (leitura rasgada
-//     do snapshot) e glErr (falha do renderer) junto de scr x vp.
-//  FIX v22b: no caminho do hold, o frame do snap preservado era sobrescrito.
-//
-//  FIX v21 (PISCADA): s_buf tinha 2 slots -> 4 slots (o leitor fica seguro por
-//  3 escritas do Tick; com 2, o LateUpdate mais rapido que o present fazia o
-//  Draw ler um slot sendo reescrito).
-//
-//  FIX v20b: Draw nao da mais early-return por snap->w/h<=0 (usa DisplaySize).
-//  FIX v20c: Tick blinda o laco com __try e SEMPRE chama UnlockTargets.
-//
-//  (mantidas: s.count=out; latches de morte/visao; hold de frame vazio; Col())
+//  FIX v23: C4244 — keepFrame agora com cast explicito (uint32_t)s.frame.
+//  FIX v22: instrumentacao completa do WorldToScreen (ok/semMatriz/atras/fora).
+//  FIX v21: s_buf com 4 slots (leitor seguro por 3 escritas do Tick).
+//  FIX v20: Draw nao da early-return por tamanho; Tick blinda o laco com __try.
 // ============================================================================
 
 #include <windows.h>
@@ -189,7 +178,7 @@ namespace ESP
         {
             if (++failStreak <= kGraceFrames && lastGood.count > 0)
             {
-                const uint32_t keepFrame = s.frame;
+                const uint32_t keepFrame = (uint32_t)s.frame;   // >>> FIX C4244
                 s = lastGood;
                 s.frame = keepFrame;
                 s_active.store(dst, std::memory_order_release);
@@ -279,7 +268,7 @@ namespace ESP
         s.count = out;   // >>> o fix que fazia o ESP nao desenhar nada
 
         if (out == 0 && lastGood.count > 0 && ++s_emptyStreak <= kGraceFrames) {
-            const uint32_t keepFrame = s.frame;
+            const uint32_t keepFrame = (uint32_t)s.frame;       // >>> FIX C4244
             s = lastGood;
             s.frame = keepFrame;
         }

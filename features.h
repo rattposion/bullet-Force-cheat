@@ -2,23 +2,6 @@
 // ============================================================================
 //  features.h — declaracoes publicas compartilhadas.
 //  Cada simbolo tem UM dono. Nada e' definido aqui (exceto inlines triviais).
-//
-//  >>> v4
-//    * Aimbot::IsActive() declarado (PATCH A3): o hook do FireBullet usa para
-//      so' aplicar silent aim com a tecla REALMENTE segurada.
-//
-//  >>> v3
-//    * Consistente com o hooks.cpp reconstruido (Reinstall, GetViewSize,
-//      LogWndProcInfo sem param, SafeFont/FontCount, ViewW/ViewH).
-//    * CONTRATO DE DONOS (defina em UM unico .cpp):
-//        Menu::Draw / Menu::ApplyStyle   -> menu.cpp
-//        Menu::Render                    -> features.cpp
-//        Menu_WantsMouse / Aimbot::Bone  -> features.cpp
-//        ESP::Tick/Draw/Latest/Reset     -> esp.cpp
-//        Combat::Tick/Init/Shutdown/...  -> combat.cpp
-//        Aimbot::Silent::Override        -> aimbot.cpp
-//      g_open e' ALIAS de C.menuOpen: definir em menu.cpp como
-//        bool& Menu::g_open = C.menuOpen;
 // ============================================================================
 #include <atomic>
 #include <cstdint>
@@ -36,31 +19,26 @@
 // ---------------------------------------------------------------------------
 extern std::atomic<bool> g_unload;
 
-// Numero de slots de anexo guardados no config (C.selAttach). Mantenha em
-// sincronia com o tamanho do array no config.h.
 constexpr int kMaxAttach = 3;
 
-bool Menu_WantsMouse();          // consultada pelo hook de cursor
+bool Menu_WantsMouse();
 
-void DrawMenu();                 // alias de Menu::Draw()
-void DrawOverlay();              // alias de Menu::Draw()
+void DrawMenu();
+void DrawOverlay();
 
 namespace Menu {
-    extern bool& g_open;         // alias de C.menuOpen — mesma celula (menu.cpp)
-    void ApplyStyle();           // dono: menu.cpp
-    void Draw();                 // dono: menu.cpp
-    void Render();               // dono: features.cpp
+    extern bool& g_open;
+    void ApplyStyle();
+    void Draw();
+    void Render();
 }
 
 // ============================================================================
 //  ESP
-//  Tick() roda no thread do JOGO (dentro do Combat::Tick, depois de
-//  UpdateTargets/UpdateView) e publica o Snap. Draw() roda no thread de render
-//  e SO' consome Latest() — zero lock, zero chamada de SDK.
 // ============================================================================
 namespace ESP {
     constexpr int kMaxEspEnts = 64;
-    constexpr int kGraceFrames = 12;   // evita piscar com frame vazio isolado
+    constexpr int kGraceFrames = 12;
 
     struct Snap {
         uint64_t frame = 0;
@@ -93,7 +71,6 @@ namespace Misc { void Panic(); void Draw(); void Tick(); }
 
 // ============================================================================
 //  COMBAT + PROFILER
-//  Stats escritas sob SRWLOCK. Leitura do overlay via CopyStats().
 // ============================================================================
 namespace Combat {
     constexpr int kMaxSteps = 16;
@@ -105,9 +82,9 @@ namespace Combat {
     };
 
     extern StepStat g_stats[kMaxSteps];
-    extern int       g_statsN;            // sempre sob lock
+    extern int       g_statsN;
     extern float     g_tickMs;
-    extern std::atomic<bool> g_dataOk;    // estado transitorio (nao e' prontidao)
+    extern std::atomic<bool> g_dataOk;
 
     void  Tick();
     void  Init();
@@ -123,8 +100,6 @@ namespace Movement { void Tick(); }
 
 // ============================================================================
 //  AIMBOT
-//  NAO declare 'struct Quat' aqui dentro: cria Aimbot::Quat, tipo distinto de
-//  ::Quat, e quebra toda chamada de SDK que recebe Quat&.
 // ============================================================================
 namespace Aimbot {
     Il2CppObject* Best();
@@ -133,9 +108,6 @@ namespace Aimbot {
     void  Shutdown();
     void  Bone(Il2CppObject* p, Il2CppObject* target);
 
-    // [A3] true quando o aimbot esta ATIVO (tecla segurada / toggle ligado).
-    // O hook do FireBullet usa isto para so' aplicar silent aim quando voce
-    // esta realmente mirando — sem isso, toda bala era redirecionada.
     bool  IsActive();
 
     Vec3  Sub(Vec3, Vec3);
@@ -147,21 +119,25 @@ namespace Aimbot {
     Vec3  LocalPos();
     Vec3  CamForward();
 
-    // Distancia entre dois pontos. A definicao vive fora daqui.
     float Dist3D(Vec3 a, Vec3 b);
 
-    // Comprimento de um vetor. Inline: nao depende de link.
-    // ATENCAO: dentro de namespace Aimbot isto esconde a versao global de
-    // 2 argumentos — chame ::Dist3D(a, b) se precisar da global.
     inline float Dist3D(Vec3 v) {
         return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
     }
 
-    // silent aim — chamada no hook do FireBullet (hooks.cpp)
-    // origin = posicao do cano (por valor), dir = direcao do tiro (por ref)
     namespace Silent { bool Override(Vec3 origin, Vec3& dir); }
 }
 
 namespace Recoil { void Install(); void Tick(); }
 namespace Triggerbot { bool Install(); void Tick(); }
-namespace AntiCheat { bool Install(); void Tick(); }
+
+namespace AntiCheat {
+    bool Install();
+    void Tick();
+
+    // ---- alerta de risco de ban / desconexao ----
+    int  RiskScore();                    // pontuacao bruta
+    int  RiskLevel();                    // 0=baixo 1=medio 2=alto 3=critico
+    const char* RiskText();              // "BAIXO"/"MEDIO"/"ALTO"/"CRITICO"
+    void RiskReasons(char* out, int n);  // lista dos itens que somam risco
+}

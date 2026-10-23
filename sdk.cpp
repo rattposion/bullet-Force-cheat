@@ -1,21 +1,6 @@
 // ============================================================================
 //  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, LOS via Physics.Raycast
-//
-//  v7.2 — PATCH B3 (stutter):
-//    [B3] Cache de posicao por frame. GetPos() e' um runtime_invoke de
-//         get_position que ALOCA um Vector3 boxed a cada chamada; o mesmo
-//         objeto era pedido varias vezes por frame (osso da cabeca, osso do pe,
-//         player, camera) -> dezenas de alocacoes/frame -> GC -> hitch.
-//         Agora GetPosRaw() faz o invoke e GetPos() cacheia por g_frameId.
-//
-//  v7.1 — PATCH B2 (stutter):
-//    [B2a] UpdateTargets: RefreshTargets 200ms -> 500ms.
-//    [B2b] FindBoneAny: orcamento 4096 -> 768 nos.
-//    [B2c] LogHierarchy: 80 -> 40 nos.
-//
-//  v7.0 — [F1] fonte unica de tamanho (g_vpW/g_vpH); [E1] FrameData seqlock.
-//  v6.9 — [P1..P5] contrato de projecao / sentinela no W2S.
-//  v6.8 — ClearRuntimeCaches zera k*; ResolveAll().
+//  v7.3: O_grounded resolvido (bhop) + GetHealthRaw/SetHealth (god mode)
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -460,9 +445,8 @@ namespace SDK {
     int    dbg_drawn = 0;
     Vec3   g_localPos{ 0.f, 0.f, 0.f };
     CRITICAL_SECTION g_targetCs;
-    uint64_t g_frameId = 0;                 // dono unico: hk_wglSwapBuffers
+    uint64_t g_frameId = 0;
 
-    // -1 = API de cursor ausente | bit0 = visible | (>>1)&3 = lockState
     std::atomic<int> g_cursorState{ -1 };
 
     std::atomic<int>  g_fireDirSlot{ -1 };
@@ -485,6 +469,7 @@ namespace SDK {
 
     uint32_t O_health = 0, O_alive = 0, O_team = 0, O_isLocal = 0, O_name = 0, O_weapon = 0;
     uint32_t O_vel = 0, O_speed = 0, O_rot = 0, O_rotation = 0, O_cam = 0, O_camTf = 0;
+    uint32_t O_grounded = 0;                 // NOVO — bhop
     uint32_t O_mCamera = 0, O_humanMeshAnimator = 0, O_humanMeshReferences = 0;
     uint32_t O_stats = 0, O_gunView = 0, O_gunStats = 0, O_gunStatsOnView = 0;
     uint32_t O_curAmmo = 0, O_maxAmmo = 0, O_reloading = 0, O_spread = 0, O_fireRate = 0, O_dmg = 0;
@@ -565,7 +550,6 @@ namespace SDK {
     static BoneCacheEnt g_boneCache[64] = {};
     static int          g_boneEvict = 0;
 
-    // [B3] cache de posicao por frame
     struct PosEnt { Il2CppObject* o = nullptr; Vec3 p{}; uint64_t frame = ~0ull; };
     static PosEnt g_posCache[512];
 
@@ -589,7 +573,6 @@ namespace SDK {
     bool         ValidInstance(Il2CppObject* o) { return ValidInstance_((const void*)o); }
     Il2CppClass* SafeClass(Il2CppObject* o) { return SafeClass_(o); }
 
-    // ======================= [F] fonte unica de tamanho =======================
     void SetViewport(int w, int h) {
         if (w > 0) g_vpW.store(w, std::memory_order_relaxed);
         if (h > 0) g_vpH.store(h, std::memory_order_relaxed);
@@ -604,7 +587,6 @@ namespace SDK {
         return v > 0 ? v : Hooks::g_viewH.load(std::memory_order_relaxed);
     }
 
-    // ======================= [E] snapshot de frame =======================
     void PublishFrame() {
         const uint32_t s = g_fdSeq.load(std::memory_order_relaxed);
         g_fdSeq.store(s + 1, std::memory_order_release);
@@ -993,7 +975,6 @@ namespace SDK {
         return false;
     }
 
-    // [B3] sem cache: e' o que faz o runtime_invoke
     static Vec3 GetPosRaw(Il2CppObject* obj) {
         Vec3 out{ 0.f, 0.f, 0.f };
         if (!obj || !PlausibleObj(obj)) return out;
@@ -1019,7 +1000,6 @@ namespace SDK {
         return out;
     }
 
-    // [B3] cache por frame: o mesmo objeto e' pedido varias vezes por frame
     Vec3 GetPos(Il2CppObject* obj) {
         if (!obj || !PlausibleObj(obj)) return Vec3();
         const uint64_t f = g_frameId;
@@ -1048,7 +1028,7 @@ namespace SDK {
         void* args[1]; args[0] = &vv;
         se_runtime_invoke(sp, node, args);
 
-        PosEnt& e = g_posCache[((uintptr_t)obj >> 4) & 511];   // [B3]
+        PosEnt& e = g_posCache[((uintptr_t)obj >> 4) & 511];
         if (e.o == obj) e.frame = ~0ull;
     }
 
@@ -1152,6 +1132,27 @@ namespace SDK {
     }
 
     float GetHealth(Il2CppObject* o) { return ReadHealth(o); }
+
+    // ---- NOVO: leitura crua + escrita (god mode) ----
+    float GetHealthRaw(Il2CppObject* o) {
+        if (!o || !O_health) return 0.f;
+        uintptr_t a = 0;
+        if (g_healthIsSync) a = SyncVarValueAddr(o, O_health, "Single");
+        if (!a) a = (uintptr_t)o + O_health;
+        return SafeRead<float>(a, 0.f);
+    }
+
+    bool SetHealth(Il2CppObject* o, float value) {
+        if (!o || !O_health) return false;
+        uintptr_t a = 0;
+        if (g_healthIsSync) a = SyncVarValueAddr(o, O_health, "Single");
+        if (!a) a = (uintptr_t)o + O_health;
+
+        const float cur = SafeRead<float>(a, 100.f);
+        float v = value;
+        if (cur > 0.f && cur <= 1.5f && v > 1.5f) v /= 100.f;
+        return TryWrite(a, v);
+    }
 
     // ======================= time =======================
     int TeamRelation(Il2CppObject* o) {
@@ -1357,7 +1358,7 @@ namespace SDK {
     static Il2CppObject* FindBoneAny(Il2CppObject* root, const char** names, int count) {
         if (!root) return nullptr;
         for (int i = 0; i < count; ++i) {
-            Il2CppObject* b = FindBoneContains(root, names[i], 768);   // [B2b] era 4096
+            Il2CppObject* b = FindBoneContains(root, names[i], 768);
             if (b) return b;
         }
         return nullptr;
@@ -1390,10 +1391,10 @@ namespace SDK {
                 if (!g_hierDumped) {
                     g_hierDumped = true;
                     Log("[hier] ---- player transform ----");
-                    LogHierarchy(playerTf, 40);                       // [B2c] era 80
+                    LogHierarchy(playerTf, 40);
                     if (animTf && animTf != playerTf) {
                         Log("[hier] ---- animator transform ----");
-                        LogHierarchy(animTf, 40);                     // [B2c] era 80
+                        LogHierarchy(animTf, 40);
                     }
                     Log("[hier] ---- fim ----");
                 }
@@ -2501,7 +2502,7 @@ namespace SDK {
         static ULONGLONG lastRefresh = 0;
         static ULONGLONG lastTfPrune = 0;
         ULONGLONG now = GetTickCount64();
-        if (now - lastRefresh > 500) { lastRefresh = now; RefreshTargets(); }   // [B2a] era 200
+        if (now - lastRefresh > 500) { lastRefresh = now; RefreshTargets(); }
         if (now - lastTfPrune > 2000) { lastTfPrune = now; PruneTfCache(); }
 
         if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
@@ -2673,7 +2674,7 @@ namespace SDK {
 
         int vIndex = 0;
         for (uint32_t i = 0; i < np; ++i) {
-            const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_fireBullet, i) : nullptr;
+            const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
             const char* tn = TypeNameCached(t);
             if (strstr(tn, "Vector3")) {
                 vbuf[i] = (vIndex == dirVIndex) ? dir : muzzle;
@@ -2696,7 +2697,7 @@ namespace SDK {
         { std::lock_guard<std::mutex> lk(g_tfMx);     g_tfCache.clear(); }
         memset(g_boneCache, 0, sizeof(g_boneCache));
         g_boneEvict = 0;
-        memset(g_posCache, 0, sizeof(g_posCache));            // [B3]
+        memset(g_posCache, 0, sizeof(g_posCache));
         memset(g_syncCache, 0, sizeof(g_syncCache));
         g_syncCacheN = 0;
         g_syncDumped = false;
@@ -2727,6 +2728,7 @@ namespace SDK {
         g_hierDumped = false; g_dumpTarget = false;
 
         O_health = O_alive = O_team = O_isLocal = O_name = O_weapon = 0;
+        O_grounded = 0;                                   // NOVO
         O_vel = O_speed = O_rot = O_rotation = O_cam = O_camTf = 0;
         O_mCamera = O_humanMeshAnimator = O_humanMeshReferences = 0;
         O_stats = O_gunView = O_gunStats = O_gunStatsOnView = 0;
@@ -2803,6 +2805,16 @@ namespace SDK {
             O_humanMeshAnimator = PickFieldOff(kPlayerScript, { "humanMeshAnimator", "meshAnimator", "animator" });
             O_humanMeshReferences = PickFieldOff(kPlayerScript, { "humanMeshReferences", "meshReferences" });
         }
+
+        // ---- NOVO: campo de solo (bhop) ----
+        if (kEntity)
+            O_grounded = PickFieldOff(kEntity, { "isGrounded", "grounded", "onGround",
+                                                 "m_Grounded", "_grounded", "isOnGround",
+                                                 "groundedCheck" }, "Boolean");
+        if (kPlayerScript && !O_grounded)
+            O_grounded = PickFieldOff(kPlayerScript, { "isGrounded", "grounded", "onGround",
+                                                       "m_Grounded", "_grounded", "isOnGround" }, "Boolean");
+        Log("[sdk] grounded = 0x%X (%s)", O_grounded, O_grounded ? "campo" : "heuristica");
 
         if (!O_rotation) O_rotation = 0x9B8;
         if (!O_camTf)    O_camTf = 0x828;

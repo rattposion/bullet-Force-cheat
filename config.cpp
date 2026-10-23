@@ -64,6 +64,8 @@ namespace ConfigIO {
         S_B(showFovCircle); S_F(aimMaxDist);
         WCol(f, "aimColor", g_cfg.aimColor);
 
+        S_I(aimSelect); S_B(aimToggle); S_B(aimAutoFire); S_I(aimFireDelayMs);
+
         S_B(silentAim); S_B(magicBullets);
 
         S_B(triggerbot); S_I(triggerKey); S_F(triggerDelay); S_F(triggerRadius);
@@ -73,10 +75,19 @@ namespace ConfigIO {
         S_B(speedHack); S_F(speedValue); S_B(fly); S_F(flySpeed);
         S_B(superJump); S_F(jumpPower); S_B(teleport);
 
-        S_B(godmode); S_B(hitmarker); S_F(camFov);
+        // ---- BUNNYHOP / TIRO NO AR ----
+        S_B(bhop); S_I(bhopKey); S_B(bhopKeepSpeed); S_B(bhopSkipMenu);
+        S_I(bhopMode); S_I(bhopHoldMs); S_I(bhopRePressMs); S_F(bhopJumpSpeed);
+        S_B(shootInAir); S_I(airFireKey); S_I(airFireDelayMs);
+
+        S_B(godmode); S_F(godmodeValue);
+        S_B(hitmarker); S_F(camFov);
         S_B(crosshair); S_F(crosshairSize);
         WCol(f, "crosshairColor", g_cfg.crosshairColor);
         S_B(watermark);
+
+        // ---- ALERTA DE RISCO ----
+        S_B(showRiskAlert); S_B(riskAlertBlink);
 
         S_B(antiCheat); S_B(blockedNoZone); S_B(blockedUnlock); S_I(stage);
 
@@ -142,6 +153,8 @@ namespace ConfigIO {
             L_B(showFovCircle); L_F(aimMaxDist);
             L_C(aimColor);
 
+            L_I(aimSelect); L_B(aimToggle); L_B(aimAutoFire); L_I(aimFireDelayMs);
+
             L_B(silentAim); L_B(magicBullets);
 
             L_B(triggerbot); L_I(triggerKey); L_F(triggerDelay); L_F(triggerRadius);
@@ -151,14 +164,20 @@ namespace ConfigIO {
             L_B(speedHack); L_F(speedValue); L_B(fly); L_F(flySpeed);
             L_B(superJump); L_F(jumpPower); L_B(teleport);
 
-            L_B(godmode); L_B(hitmarker); L_F(camFov);
+            L_B(bhop); L_I(bhopKey); L_B(bhopKeepSpeed); L_B(bhopSkipMenu);
+            L_I(bhopMode); L_I(bhopHoldMs); L_I(bhopRePressMs); L_F(bhopJumpSpeed);
+            L_B(shootInAir); L_I(airFireKey); L_I(airFireDelayMs);
+
+            L_B(godmode); L_F(godmodeValue);
+            L_B(hitmarker); L_F(camFov);
             L_B(crosshair); L_F(crosshairSize);
             L_C(crosshairColor);
             L_B(watermark);
 
+            L_B(showRiskAlert); L_B(riskAlertBlink);
+
             L_B(antiCheat); L_B(blockedNoZone); L_B(blockedUnlock); L_I(stage);
 
-            // ---- UNLOCK ----
             L_B(unlockAll); L_B(unlockWeapons); L_B(unlockSkins);
             L_B(unlockAttachments); L_B(unlockCurrency);
             L_B(unlockChars);
@@ -167,7 +186,6 @@ namespace ConfigIO {
             L_I(currencyValue); L_F(unlockInterval);
             L_B(skinChanger); L_I(skinIndex); L_I(unlockLevel);
 
-            // ---- SELECAO / LOG ----
             L_B(applySelection); L_I(loadoutSlot);
             L_I(selWeapon); L_I(selCamo); L_I(selChar);
             L_I(selAttach[0]); L_I(selAttach[1]); L_I(selAttach[2]);

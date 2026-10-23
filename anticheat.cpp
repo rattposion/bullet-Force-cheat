@@ -1,17 +1,7 @@
 // ============================================================================
-//  anticheat.cpp — bypass em camadas (v6)
-//
-//  FIX v6
-//   [C1] ClearAll: cada laco de escrita agora tem SEU __try. Antes um offset
-//        ruim abortava a limpeza toda (o __try do caller pegava, mas pulava o
-//        resto). Agora o que der AV e' so' o campo ruim.
-//   [C2] #include "memory.h" explicito (WriteAt nao vinha garantido).
-//
-//  >>> FIX v5 (FPS): hk_acUpdate rodava ClearAll() 2x por Update do AC. Agora
-//      no maximo 1x por FRAME (SDK::g_frameId).
-//  >>> FIX v4: estatico/getter 1x; scan do player no maximo 6x; guarda OFFSET.
-//  Mantido: template dos 16 getters, IsStaticField/IsStaticMethod antes do
-//  static_get/runtime_invoke, ScanFieldsFallback, __try em tudo.
+//  anticheat.cpp — bypass em camadas (v7)
+//  v7: + RISCO DE BAN / DESCONEXAO (alerta do menu)
+//      Log vem do globals.h (sem re-declarar -> sem C28251)
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -29,8 +19,6 @@
 #include <cstdio>
 #include <initializer_list>
 #include <vector>
-
-void Log(const char* fmt, ...);
 
 extern "C" int bfi_anticheat_obj = 0xACE;
 
@@ -133,7 +121,7 @@ namespace AntiCheat {
     static int      g_findFails = 0;
     static bool     g_triedCheap = false;
     static bool     g_findGiveUp = false;
-    static uint32_t g_offAcOnPlayer = 0;      // cache do campo achado
+    static uint32_t g_offAcOnPlayer = 0;
     static bool     g_adopted = false;
     static uint32_t g_ticks = 0;
     static uint32_t g_cleared = 0;
@@ -544,7 +532,6 @@ namespace AntiCheat {
     }
 
     // ---------------------------------------------------------------- limpeza
-    // >>> [C1] cada laco tem seu __try: um offset ruim nao aborta o resto.
     static void ClearAll() {
         if (g_obj && AcObjOk(g_obj, g_cls)) {
             const uintptr_t base = (uintptr_t)g_obj;
@@ -584,7 +571,6 @@ namespace AntiCheat {
 
     typedef void(__fastcall* tAcUpd)(void* self, void* method);
     static void __fastcall hk_acUpdate(void* self, void* method) {
-        // no maximo 1x por frame (o AC pode rodar varias vezes).
         static uint64_t lastFrame = (uint64_t)-1;
         const uint64_t f = SDK::g_frameId;
         const bool doIt = (f != lastFrame);
@@ -682,6 +668,80 @@ namespace AntiCheat {
             static int n = 0;
             if (n++ < 10) Log("[ac] AV contido no Tick");
         }
+    }
+
+    // ======================================================================
+    //  ALERTA DE RISCO DE BAN / DESCONEXAO
+    // ======================================================================
+    static void AddReason(char* out, int n, const char* what)
+    {
+        if (!out || n <= 0) return;
+        const size_t len = strlen(out);
+        if (len + 2 >= (size_t)n) return;
+        if (len) strcat_s(out, (size_t)n, ", ");
+        strcat_s(out, (size_t)n, what);
+    }
+
+    void RiskReasons(char* out, int n)
+    {
+        if (!out || n <= 0) return;
+        out[0] = 0;
+
+        if (!C.antiCheat)   AddReason(out, n, "bypass OFF");
+        if (C.speedHack)    AddReason(out, n, "speed hack");
+        if (C.fly)          AddReason(out, n, "fly");
+        if (C.teleport)     AddReason(out, n, "teleport");
+        if (C.godmode)      AddReason(out, n, "god mode");
+        if (C.rapidFire)    AddReason(out, n, "rapid fire");
+        if (C.infAmmo)      AddReason(out, n, "municao inf");
+        if (C.noReload)     AddReason(out, n, "sem reload");
+        if (C.silentAim)    AddReason(out, n, "silent aim");
+        if (C.magicBullets) AddReason(out, n, "magic bullets");
+        if (C.noRecoil)     AddReason(out, n, "sem recoil");
+        if (C.noSpread)     AddReason(out, n, "sem spread");
+        if (C.bhop)         AddReason(out, n, "bunny hop");
+        if (C.shootInAir)   AddReason(out, n, "tiro no ar");
+        if (!out[0])        AddReason(out, n, "so ESP/aimbot");
+    }
+
+    int RiskScore()
+    {
+        int r = 0;
+
+        if (!C.antiCheat) r += 4;
+        else if (!g_cls || !g_obj) r += 1;
+
+        if (C.speedHack)  r += (C.speedValue >= 2.0f) ? 4 : 1;
+        if (C.fly)        r += 3;
+        if (C.godmode)    r += 2;
+        if (C.teleport)   r += 1;
+        if (C.rapidFire)  r += 1;
+        if (C.infAmmo)    r += 1;
+        if (C.noReload)   r += 1;
+        if (C.silentAim)  r += 1;
+        if (C.magicBullets) r += 1;
+        if (C.noRecoil)   r += 1;
+        if (C.noSpread)   r += 1;
+        if (C.bhop)       r += 1;
+        if (C.shootInAir) r += 1;
+
+        return r;
+    }
+
+    int RiskLevel()
+    {
+        const int r = RiskScore();
+        if (r >= 12) return 3;
+        if (r >= 7)  return 2;
+        if (r >= 3)  return 1;
+        return 0;
+    }
+
+    const char* RiskText()
+    {
+        static const char* k[] = { "BAIXO", "MEDIO", "ALTO", "CRITICO" };
+        const int l = RiskLevel();
+        return k[(l < 0 || l > 3) ? 0 : l];
     }
 
 } // namespace AntiCheat

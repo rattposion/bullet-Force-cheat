@@ -1,19 +1,14 @@
 // ============================================================================
-//  dllmain.cpp — bfi (v2)
+//  dllmain.cpp — bfi (v3)
 //
-//  Mudancas desta versao:
-//   1) CrashFilter agora identifica MODULO + OFFSET do endereco que estourou,
-//      o tipo de acesso (read/write) e faz CHAIN com o filtro anterior (o da
-//      Unity). Resultado: voce recebe o nosso log E o crash report do jogo,
-//      em vez de o jogo simplesmente sumir.
-//   2) VEH de primeira chance (BFI_LOG_FIRST_CHANCE). Ele loga o AV ANTES do
-//      SEH — e o que mostra o local exato mesmo quando um __try contem a
-//      falha. Sem isso, "conter" o AV esconde o bug.
-//   3) Teardown() idempotente: UnloadWatch e DLL_PROCESS_DETACH nao chamam
-//      Shutdown() duas vezes.
-//   4) Cada etapa do Main e logada; nada mais de "return 0" silencioso.
-//
-//  Dica: para desligar o ruido do VEH, troque BFI_LOG_FIRST_CHANCE para 0.
+//  Mudancas:
+//   1) Teardown() remove os HANDLERS (VEH de primeira chance + filtro top-level)
+//      ANTES do FreeLibrary — sem isso a DLL sai do mapa e o proximo AV chama
+//      endereco liberado.
+//   2) Modulos de feature sao INICIALIZADOS aqui (Combat/Weapons/Aimbot/
+//      Triggerbot/AntiCheat/Recoil).
+//   3) CrashFilter com modulo+offset, chain com o filtro anterior (Unity).
+//   4) Log/LogInit vem do globals.h (sem re-declarar -> sem C28251).
 // ============================================================================
 #define BFI_LOG_FIRST_CHANCE 1
 
@@ -33,12 +28,10 @@
 HMODULE g_hModule = nullptr;
 std::atomic<bool> g_unload{ false };
 
-void Log(const char* fmt, ...);
-void LogInit();
-
 static std::atomic<bool> g_tornDown{ false };
 static bool                      g_inFilter = false;
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = nullptr;
+static PVOID                     g_vehFirstChance = nullptr;
 static int                       g_crashLogs = 0;
 
 // ---------------------------------------------------------------------------
@@ -64,12 +57,11 @@ static const char* ModuleOf(void* addr, uintptr_t* outRva)
 }
 
 // ---------------------------------------------------------------------------
-//  Filtro de ultimo recurso. Loga e passa a bola pro handler anterior (Unity),
-//  que normalmente gera o crash report do engine.
+//  Filtro de ultimo recurso. Loga e passa a bola pro handler anterior (Unity).
 // ---------------------------------------------------------------------------
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
 {
-    if (g_inFilter) return EXCEPTION_CONTINUE_SEARCH;   // evita recursao
+    if (g_inFilter) return EXCEPTION_CONTINUE_SEARCH;
     g_inFilter = true;
 
     EXCEPTION_RECORD* er = ep ? ep->ExceptionRecord : nullptr;
@@ -96,7 +88,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
     }
 
     LONG r = EXCEPTION_EXECUTE_HANDLER;
-    if (g_prevFilter) {
+    if (g_prevFilter && ep) {
         __try { r = g_prevFilter(ep); }
         __except (EXCEPTION_EXECUTE_HANDLER) { r = EXCEPTION_EXECUTE_HANDLER; }
     }
@@ -107,8 +99,8 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
 
 #if BFI_LOG_FIRST_CHANCE
 // ---------------------------------------------------------------------------
-//  VEH: roda ANTES de qualquer __try. So loga AV e devolve CONTINUE_SEARCH,
-//  entao o SEH do projeto continua funcionando normalmente.
+//  VEH de primeira chance: roda ANTES de qualquer __try. So loga AV e devolve
+//  CONTINUE_SEARCH, entao o SEH do projeto continua funcionando normalmente.
 // ---------------------------------------------------------------------------
 static LONG WINAPI FirstChanceVEH(EXCEPTION_POINTERS* ep)
 {
@@ -135,7 +127,7 @@ static LONG WINAPI FirstChanceVEH(EXCEPTION_POINTERS* ep)
             g_phase ? g_phase : "?");
     }
 
-    return EXCEPTION_CONTINUE_SEARCH;    // deixa o SEH/__try tratar
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
 
@@ -143,6 +135,11 @@ static LONG WINAPI FirstChanceVEH(EXCEPTION_POINTERS* ep)
 static void Teardown()
 {
     if (g_tornDown.exchange(true)) return;
+
+    // handlers FORA do mapa antes de a DLL sair
+    if (g_vehFirstChance) { RemoveVectoredExceptionHandler(g_vehFirstChance); g_vehFirstChance = nullptr; }
+    if (g_prevFilter) { SetUnhandledExceptionFilter(g_prevFilter); g_prevFilter = nullptr; }
+
     Hooks::Shutdown();
     SDK::Shutdown();
 }
@@ -156,7 +153,7 @@ static DWORD WINAPI UnloadWatch(LPVOID)
     while (!g_unload.load()) Sleep(50);
 
     Log("[bfi] descarregando...");
-    Sleep(200);            // deixa o frame atual terminar
+    Sleep(200);
 
     Teardown();
 
@@ -176,7 +173,7 @@ static DWORD WINAPI Main(LPVOID)
 
     g_prevFilter = SetUnhandledExceptionFilter(CrashFilter);
 #if BFI_LOG_FIRST_CHANCE
-    AddVectoredExceptionHandler(1, FirstChanceVEH);
+    g_vehFirstChance = AddVectoredExceptionHandler(1, FirstChanceVEH);
 #endif
 
     while (!GetModuleHandleA("GameAssembly.dll")) {
@@ -188,7 +185,6 @@ static DWORD WINAPI Main(LPVOID)
     g_phase = "resolve";
     if (!IL2CPP_API::Resolve()) { Log("[bfi] Resolve FALHOU"); return 0; }
 
-    // a camada IL2CPP:: (il2cpp.cpp) nunca era inicializada
     g_phase = "resolve2";
     Log("[bfi] IL2CPP::Init = %d", (int)IL2CPP::Init());
 
@@ -207,6 +203,16 @@ static DWORD WINAPI Main(LPVOID)
 
     g_phase = "hooks";
     if (!Hooks::Init()) Log("[bfi] Hooks::Init FALHOU");
+
+    // ---- modulos de feature ----
+    g_phase = "features";
+    Combat::Init();
+    Weapons::Init();
+    Aimbot::Install();
+    Triggerbot::Install();
+    AntiCheat::Install();
+    Recoil::Install();
+    Log("[bfi] modulos de feature inicializados");
 
     g_phase = "done";
     Log("[bfi] ===== pronto =====");

@@ -1,20 +1,7 @@
 // ============================================================================
-//  hooks.cpp  (v36)
-//
-//  >>> PATCH R7  (crash fatal: AV fase=hk_swap derrubou a thread de render)
-//   1) LoadGlExt() agora e' chamado no Init — antes so' rodava se fbo!=0 e o
-//      fbo e' SEMPRE 0, entao p_glBindFramebuffer/p_glActiveTexture ficavam
-//      nullptr a sessao toda.
-//   2) CORPO INTEIRO do swap dentro de UM __try + __except com unwind da
-//      critical section (CsUnwind). Nenhum trecho desprotegido.
-//   3) __try separado em volta do o_swap(hdc) — se o present do jogo estourar,
-//      a gente sobrevive e o jogo continua.
-//   4) FASES FINAS: swap:pre / swap:ctx / swap:vp / swap:frame / swap:draw /
-//      swap:present. O proximo AV diz exatamente onde.
-//
-//  >>> PATCH R6  (glDepthMask/colorMask matando o mapa) — SNAPSHOT+FORCE+RESTORE
-//  >>> PATCH R5  (stencil — overlay invisivel vivo)
-//  >>> PATCH A13 / A12 / A11 / R1-R4 / B2 / A1 / A2
+//  hooks.cpp  (v37)
+//   * hk_fire7: silent aim + MAGIC BULLETS + hitmarker num unico bloco
+//   * R7: LoadGlExt no Init, corpo do swap sob __try, fases finas
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -125,8 +112,8 @@ namespace Hooks {
     static std::atomic<uint32_t> g_abortMisc{ 0 };
     static std::atomic<uint32_t> g_abortRender{ 0 };
     static std::atomic<uint32_t> g_abortDraw{ 0 };
-    static std::atomic<uint32_t> g_abortBody{ 0 };      // [R7]
-    static std::atomic<uint32_t> g_abortPresent{ 0 };   // [R7]
+    static std::atomic<uint32_t> g_abortBody{ 0 };
+    static std::atomic<uint32_t> g_abortPresent{ 0 };
 
     static std::atomic<ULONGLONG> g_lastWndMsg{ 0 };
     static std::atomic<ULONGLONG> g_lastMouseMsg{ 0 };
@@ -222,7 +209,6 @@ namespace Hooks {
     static HHOOK  g_cwp = nullptr;
     static PVOID  g_veh = nullptr;
 
-    // >>> [R7] critical section com profundidade — permite unwind em AV
     static thread_local int t_csDepth = 0;
     static inline void CsEnter() { if (g_imCsInit) { EnterCriticalSection(&g_imCs); ++t_csDepth; } }
     static inline void CsLeave() { if (g_imCsInit && t_csDepth > 0) { --t_csDepth; LeaveCriticalSection(&g_imCs); } }
@@ -865,10 +851,15 @@ namespace Hooks {
         const Vec3 keep2 = p2;
         const Vec3 keep3 = p3;
 
-        const bool silentOn = isLocalShot && C.silentAim &&
+        const bool aimOn = isLocalShot &&
             (C.aimToggle ? Aimbot::IsActive() : C.aimKeyDown);
+        const bool silentOn = aimOn && C.silentAim;
+        const bool magicOn = isLocalShot && C.magicBullets && SDK::g_aimTarget != nullptr;
 
-        if (silentOn) {
+        if (isLocalShot && C.hitmarker)
+            C.lastHitTime = (float)(GetTickCount64() / 1000.0);
+
+        if (silentOn || magicOn) {
             __try {
                 Vec3& dir = (slot == 0) ? p2 : p3;
                 Vec3& org = (slot == 0) ? p3 : p2;
@@ -881,18 +872,34 @@ namespace Hooks {
                     (selfPos.zero() || Dist(origin, selfPos) < 6.f);
                 if (!originOk) origin = SDK::MuzzlePos();
 
-                PHASE("fire:aim");
-                const bool ok = Aimbot::Silent::Override(origin, dir);
-
-                if (!ok) dir = keepDir;
-                else {
-                    const float L = Len(dir);
-                    if (L > 1e-4f) { dir.x /= L; dir.y /= L; dir.z /= L; }
+                if (silentOn) {
+                    PHASE("fire:aim");
+                    const bool ok = Aimbot::Silent::Override(origin, dir);
+                    if (!ok) dir = keepDir;
                 }
+
+                if (magicOn) {
+                    Il2CppObject* t = SDK::g_aimTarget;
+                    Vec3 aim = SDK::TargetAimPos(t, C.aimBone);
+                    if (aim.zero()) aim = SDK::GetPos(t);
+                    if (!aim.zero()) {
+                        Vec3 d = aim - origin;
+                        const float L = d.len();
+                        if (L > 1e-4f) {
+                            d = d * (1.f / L);
+                            dir = d;
+                            origin = aim - d * 0.25f;   // nasce colada no alvo
+                        }
+                    }
+                }
+
+                const float L = Len(dir);
+                if (L > 1e-4f) { dir.x /= L; dir.y /= L; dir.z /= L; }
+                org = origin;
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {
                 p2 = keep2; p3 = keep3;
-                Log("[fire] AV no silent aim");
+                Log("[fire] AV no silent/magic");
             }
         }
 
@@ -927,9 +934,10 @@ namespace Hooks {
         return g && g->WithinFrameScope;
     }
 
-    // corpo do swap — SEM __try interno grande; o chamador protege tudo
     static void SwapBody(HDC hdc) {
         __try {
+            if (!p_glBindFramebuffer || !p_glActiveTexture) LoadGlExt();
+
             static int winPoll = 0;
             if (!g_hwnd || ++winPoll >= 8) {
                 winPoll = 0;
@@ -1030,24 +1038,6 @@ namespace Hooks {
             }
 
             ImGui::NewFrame();
-
-            {
-                ImDrawList* dl = ImGui::GetBackgroundDrawList();
-                const float W = (float)SDK::ScreenW(), H = (float)SDK::ScreenH();
-                const float t = (float)(GetTickCount64() % 1000) / 1000.f;
-                dl->AddRect(ImVec2(2.f, 2.f), ImVec2(W - 2.f, H - 2.f),
-                    IM_COL32(255, 0, 0, 255), 0.f, 0, 4.f);
-                dl->AddRectFilled(ImVec2(10.f, 10.f), ImVec2(80.f, 80.f),
-                    IM_COL32(255, 0, 0, (int)(120 + 135 * t)));
-                char tb[128];
-                snprintf(tb, sizeof(tb), "TESTE f=%llu fbo=%d vtx=%u tgt=%d host=%u mask=%u",
-                    (unsigned long long)g_frameCounter.load(std::memory_order_relaxed),
-                    g_lastFbo.load(std::memory_order_relaxed),
-                    g_vtxTotal.load(std::memory_order_relaxed), SDK::g_targetCount,
-                    g_stencilHostile.load(std::memory_order_relaxed),
-                    g_maskHostile.load(std::memory_order_relaxed));
-                dl->AddText(ImVec2(88.f, 16.f), IM_COL32(255, 255, 0, 255), tb);
-            }
             frameOk = true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) { g_abortPre.fetch_add(1, std::memory_order_relaxed); }
@@ -1112,7 +1102,6 @@ namespace Hooks {
                 __try { ImGui_ImplOpenGL3_RenderDrawData(dd); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { g_abortDraw.fetch_add(1, std::memory_order_relaxed); }
 
-                // DEVOLVE o estado — salva o clear do proximo frame do jogo
                 __try { GlRestoreNow(snap); }
                 __except (EXCEPTION_EXECUTE_HANDLER) {}
 
@@ -1137,7 +1126,6 @@ namespace Hooks {
 
         if (!o_swap) return TRUE;
 
-        // >>> [R7] corpo inteiro protegido; qualquer AV nao derruba a thread
         __try { SwapBody(hdc); }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             g_abortBody.fetch_add(1, std::memory_order_relaxed);
@@ -1219,7 +1207,6 @@ namespace Hooks {
         SetStage(Stage::Init);
         Log("[input] INPUT_TEST_LEVEL=%d", INPUT_TEST_LEVEL);
 
-        // >>> [R7] resolve as extensoes GL AGORA (antes ficava nullptr sempre)
         if (!LoadGlExt())
             Log("[gl] extensoes GL parciais: bindFbo=%p activeTex=%p",
                 (void*)p_glBindFramebuffer, (void*)p_glActiveTexture);

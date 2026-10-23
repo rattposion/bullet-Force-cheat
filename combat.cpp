@@ -1,13 +1,5 @@
 // ============================================================================
-//  combat.cpp — UNICO orquestrador por frame. (v10)
-//
-//  FIX v10 (PATCH C2) — PROFILER, pra parar de adivinhar o stutter:
-//   * conta quantos passos rodaram no frame (passos=N/12)
-//   * loga os 3 passos MAIS CAROS do frame (top=)
-//   * se passos=12 em 100% das linhas, a cadencia NAO esta' ativa
-//
-//  FIX v9 (PATCH C1) — cadencia por passo (everyN).
-//  FIX v8 — [O1] AimbotBest antes do ESP; [O2] dono unico do g_sdkReady.
+//  combat.cpp — UNICO orquestrador por frame. (v11)
 // ============================================================================
 #include <windows.h>
 
@@ -155,10 +147,13 @@ namespace Combat {
     static bool S_UpdateView() { SDK::UpdateView();         return true; }
     static bool S_Cursor() { SDK::RefreshCursorState(); return true; }
     static bool S_ESP() { ESP::Tick();               return true; }
+
     static bool S_AimbotBest() {
-        SDK::g_aimTarget = (C.aimbot || C.triggerbot) ? Aimbot::Best() : nullptr;
+        const bool querAlvo = C.aimbot || C.triggerbot || C.magicBullets || C.silentAim;
+        SDK::g_aimTarget = querAlvo ? Aimbot::Best() : nullptr;
         return true;
     }
+
     static bool S_Misc() { Misc::Tick();         return true; }
     static bool S_Aimbot() { Aimbot::Tick();       return true; }
     static bool S_Triggerbot() { Triggerbot::Tick();   return true; }
@@ -168,10 +163,9 @@ namespace Combat {
 
     struct StepDef { const char* nome; bool (*fn)(); bool critico; int everyN; };
 
-    // >>> [O1] AimbotBest ANTES do ESP.
     static const StepDef kSteps[] = {
         { "Unlock",        S_Unlock,        false, 4 },
-        { "UpdateTargets", S_UpdateTargets, true,  1 },   // unico critico
+        { "UpdateTargets", S_UpdateTargets, true,  1 },
         { "UpdateView",    S_UpdateView,    false, 1 },
         { "AimbotBest",    S_AimbotBest,    false, 1 },
         { "Cursor",        S_Cursor,        false, 4 },
@@ -221,7 +215,6 @@ namespace Combat {
         const double t0 = QpcMs();
         PHASE("Combat::Tick");
 
-        // [C2] os 3 passos mais caros do frame (ordenados)
         struct Hot { const char* n; double ms; } hot[3] = { { nullptr,0.0 },{ nullptr,0.0 },{ nullptr,0.0 } };
         auto pushHot = [&](const char* n, double ms) {
             if (ms <= hot[2].ms) return;

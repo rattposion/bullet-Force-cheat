@@ -1,16 +1,6 @@
 // ============================================================
 //  menu.cpp - bfi / Bullet Force (ImGui)
-//
-//  >>> v18:
-//   - ApplyStyle e' DONO UNICO do estilo (era duplicado em features.cpp).
-//   - ApplyStyleOnce usa GERACAO de contexto, nao ponteiro: DestroyContext +
-//     CreateContext reaproveita o endereco e o ponteiro dava ABA.
-//   - Keybind: espera todas as teclas subirem antes de escutar (antes
-//     capturava o VK_LBUTTON do proprio clique) + Esc cancela.
-//   - _snprintf_s no lugar de sprintf_s (truncamento em vez de string vazia).
-//   - C.selAttach[s] clampado em kMaxAttach.
-//   - Janela mantida viva quando fechada (alpha 0 + NoInputs): antes o ImGui
-//     reciclava a janela e posicao/tamanho se perdiam.
+//  v19: banner de risco + aba movimento completa (bhop/timings)
 // ============================================================
 #include "common.h"
 #include "config.h"
@@ -24,34 +14,20 @@
 
 namespace Menu {
 
-    bool& g_open = C.menuOpen;      // mesma celula, sem estado duplicado
+    bool& g_open = C.menuOpen;
 
-    // ---------------------------------------------------------- estilo
     void ApplyStyle()
     {
         if (!ImGui::GetCurrentContext()) return;
-
-        // ORDEM IMPORTA: StyleColorsDark() zera os campos de rounding.
         ImGui::StyleColorsDark();
 
         ImGuiStyle& s = ImGui::GetStyle();
-
-        s.WindowRounding = 6.f;
-        s.ChildRounding = 6.f;
-        s.FrameRounding = 4.f;
-        s.PopupRounding = 4.f;
-        s.GrabRounding = 4.f;
-        s.ScrollbarRounding = 4.f;
-        s.TabRounding = 4.f;
-
-        s.WindowBorderSize = 1.f;
-        s.FrameBorderSize = 0.f;
-        s.WindowPadding = ImVec2(10, 10);
-        s.FramePadding = ImVec2(8, 4);
-        s.ItemSpacing = ImVec2(8, 6);
-        s.ItemInnerSpacing = ImVec2(6, 4);
-        s.ScrollbarSize = 12.f;
-        s.WindowTitleAlign = ImVec2(0.5f, 0.5f);
+        s.WindowRounding = 6.f; s.ChildRounding = 6.f; s.FrameRounding = 4.f;
+        s.PopupRounding = 4.f; s.GrabRounding = 4.f; s.ScrollbarRounding = 4.f; s.TabRounding = 4.f;
+        s.WindowBorderSize = 1.f; s.FrameBorderSize = 0.f;
+        s.WindowPadding = ImVec2(10, 10); s.FramePadding = ImVec2(8, 4);
+        s.ItemSpacing = ImVec2(8, 6); s.ItemInnerSpacing = ImVec2(6, 4);
+        s.ScrollbarSize = 12.f; s.WindowTitleAlign = ImVec2(0.5f, 0.5f);
 
         ImVec4* c = s.Colors;
         c[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.07f, 0.09f, 0.94f);
@@ -73,7 +49,6 @@ namespace Menu {
         c[ImGuiCol_Separator] = ImVec4(0.24f, 0.24f, 0.30f, 1.f);
     }
 
-    // Aplica uma vez por GERACAO de contexto. Marca DEPOIS de aplicar.
     static void ApplyStyleOnce()
     {
         static uint32_t styledGen = 0;
@@ -84,8 +59,6 @@ namespace Menu {
         styledGen = gen;
     }
 
-    // ---------------------------------------------------------- keybind
-    // Buffer rotativo: VkName() e' chamada varias vezes na MESMA expressao.
     static const char* VkName(int vk)
     {
         static char     s_buf[8][32];
@@ -143,8 +116,6 @@ namespace Menu {
 
         if (g_waitKey != key) return;
 
-        // Espera TODAS as teclas subirem: sem isso o proprio clique do botao
-        // (VK_LBUTTON) era capturado no frame seguinte.
         if (!g_waitArm) {
             if (AlgumaTeclaDown()) return;
             g_waitArm = true;
@@ -162,7 +133,6 @@ namespace Menu {
         }
     }
 
-    // ---------------------------------------------------------- abas
     static void TabAimbot();
     static void TabTrigger();
     static void TabVisual();
@@ -171,6 +141,47 @@ namespace Menu {
     static void TabUnlock();
     static void TabMisc();
 
+    // ---------------------------------------------------------- banner de risco
+    static void RiskBanner()
+    {
+        if (!C.showRiskAlert) return;
+
+        const int lvl = AntiCheat::RiskLevel();
+
+        ImVec4 col;
+        switch (lvl) {
+        case 3:  col = ImVec4(1.00f, 0.25f, 0.25f, 1.f); break;
+        case 2:  col = ImVec4(1.00f, 0.55f, 0.15f, 1.f); break;
+        case 1:  col = ImVec4(1.00f, 0.85f, 0.25f, 1.f); break;
+        default: col = ImVec4(0.45f, 0.90f, 0.45f, 1.f); break;
+        }
+
+        const char* tag = (lvl >= 2) ? "!! " : "";
+
+        if (lvl >= 2 && C.riskAlertBlink) {
+            const float t = (float)(GetTickCount64() % 900) / 900.f;
+            col.w = 0.55f + 0.45f * (1.f - t);
+        }
+
+        ImGui::TextColored(col, "%sRISCO DE BAN / DESCONEXAO: %s%s",
+            tag, AntiCheat::RiskText(), tag);
+
+        if (lvl >= 2) {
+            char why[256];
+            AntiCheat::RiskReasons(why, sizeof(why));
+            ImGui::TextColored(col, "   culpados: %s", why);
+            if (lvl == 3)
+                ImGui::TextColored(col,
+                    "   desligue speed/fly ou religue o anti-cheat bypass");
+        }
+        else if (lvl == 1) {
+            char why[256];
+            AntiCheat::RiskReasons(why, sizeof(why));
+            if (why[0]) ImGui::TextDisabled("   ativo: %s", why);
+        }
+        ImGui::Separator();
+    }
+
     void Draw()
     {
         ImGuiContext* ctx = ImGui::GetCurrentContext();
@@ -178,11 +189,9 @@ namespace Menu {
 
         ApplyStyleOnce();
 
-        // Janela mantida viva quando fechada: o ImGui recicla janelas nao
-        // submetidas, e sem ini a posicao/tamanho se perdiam.
         if (!C.menuOpen) {
             ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.0f);
-            ImGui::SetNextWindowSize(ImVec2(600, 560), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(620, 600), ImGuiCond_FirstUseEver);
             ImGui::Begin("bfi##main", nullptr,
                 ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoBringToFrontOnFocus);
             ImGui::End();
@@ -190,14 +199,14 @@ namespace Menu {
             return;
         }
 
-        ImGui::SetNextWindowSize(ImVec2(600, 560), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(620, 600), ImGuiCond_FirstUseEver);
         if (!ImGui::Begin("bfi##main", &C.menuOpen)) {
             ImGui::End();
             return;
         }
 
         ImGui::Text("bfi | Bullet Force internal");
-        ImGui::Separator();
+        RiskBanner();
 
         if (ImGui::BeginTabBar("tabs"))
         {
@@ -217,7 +226,6 @@ namespace Menu {
         ImGui::End();
     }
 
-    // ------------------------------------------------------------
     static void TabAimbot()
     {
         ImGui::Checkbox("Aimbot", &C.aimbot);
@@ -230,11 +238,6 @@ namespace Menu {
                 "Desmarcado: mira atraves da parede.");
 
         ImGui::Checkbox("So visivel (sem fallback)", &C.aimStrictVis);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Marcado: se ninguem estiver visivel, nao mira\n"
-                "em ninguem. Nada de mirar atras do muro.\n"
-                "Desmarcado: cai no mais proximo da mira.");
-
         ImGui::Checkbox("Rotacionar camera", &C.aimRotate);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Desmarcado: o aimbot NAO mexe na camera\n"
@@ -244,10 +247,6 @@ namespace Menu {
 
         static const char* kModes[] = { "Camera (screen)", "Angulo (3D)", "Mouse" };
         ImGui::Combo("Modo", &C.aimMode, kModes, IM_ARRAYSIZE(kModes));
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Camera: FOV medido em pixels na tela.\n"
-                "Angulo: FOV medido em graus no mundo (independe do zoom).\n"
-                "Mouse: sem suporte -> cai em Camera.");
 
         static const char* kBones[] = { "Auto", "Cabeca", "Peito", "Estomago", "Perna", "Aleatorio" };
         ImGui::Combo("Osso", &C.aimBone, kBones, IM_ARRAYSIZE(kBones));
@@ -260,25 +259,23 @@ namespace Menu {
 
         ImGui::Separator();
         ImGui::Checkbox("Silent aim", &C.silentAim);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Redireciona a bala pro alvo SEM mexer na camera.\n"
+                "Precisa de aimbot OU triggerbot ligado pra ter alvo.");
         ImGui::Checkbox("Magic bullets", &C.magicBullets);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("A bala nasce colada no alvo: ignora parede\n"
+                "e geometria. Precisa de alvo (aimbot/triggerbot).");
     }
 
-    // ------------------------------------------------------------
     static void TabTrigger()
     {
         ImGui::Checkbox("Triggerbot", &C.triggerbot);
         ImGui::SliderFloat("Delay (ms)", &C.triggerDelay, 0.0f, 300.0f, "%.0f");
-
         ImGui::SliderFloat("Raio da mira (px)", &C.triggerRadius, 0.0f, 60.0f, "%.0f");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("So atira se o alvo estiver a menos de N pixels\n"
-                "do centro da tela. 0 = desliga (atira com o alvo em\n"
-                "qualquer lugar do FOV do aimbot).");
-
         Keybind("Tecla do trigger", &C.triggerKey);
     }
 
-    // ------------------------------------------------------------
     static void TabVisual()
     {
         ImGui::Checkbox("ESP", &C.esp);
@@ -299,12 +296,7 @@ namespace Menu {
         ImGui::Separator();
         ImGui::Checkbox("Checar visao", &C.espVisCheck);
         ImGui::Checkbox("Linha de visao", &C.espVisLine);
-
         ImGui::SliderInt("LOS por frame", &C.losPerFrame, 1, 32);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Quantos alvos sao testados por frame (rodizio).\n"
-                "Baixo = mais FPS. A visibilidade atualiza em poucos frames.\n"
-                "Isso e' o custo real do 'Checar visao'.");
 
         ImGui::SliderFloat("Espessura", &C.espThickness, 0.5f, 5.0f, "%.1f");
         ImGui::SliderFloat("Dist. max", &C.espMaxDist, 10.0f, 1000.0f, "%.0f");
@@ -322,7 +314,6 @@ namespace Menu {
         ImGui::ColorEdit4("Cor nao visivel", C.noVisColor);
     }
 
-    // ------------------------------------------------------------
     static void TabWeapon()
     {
         ImGui::Checkbox("Sem recoil", &C.noRecoil);
@@ -332,7 +323,6 @@ namespace Menu {
         ImGui::Checkbox("Rapid fire", &C.rapidFire);
     }
 
-    // ------------------------------------------------------------
     static void TabMovement()
     {
         ImGui::Checkbox("Speed hack", &C.speedHack);
@@ -344,11 +334,38 @@ namespace Menu {
         ImGui::Checkbox("Super pulo", &C.superJump);
         ImGui::SliderFloat("Forca do pulo", &C.jumpPower, 1.0f, 30.0f, "%.1f");
 
-        ImGui::Checkbox("Teleport", &C.teleport);
+        ImGui::Checkbox("Teleport (segure T)", &C.teleport);
         ImGui::Checkbox("God mode", &C.godmode);
+        ImGui::SliderFloat("Vida do god mode", &C.godmodeValue, 10.f, 200.f, "%.0f");
+
+        ImGui::Separator();
+        ImGui::Text("Bunny hop / tiro no ar");
+        ImGui::Checkbox("Bunny hop (auto pulo)", &C.bhop);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Pula sozinho a cada pouso.\n"
+                "Tecla em 'Nenhuma' deixa sempre ligado.");
+        Keybind("Tecla do bhop", &C.bhopKey);
+        ImGui::Checkbox("Nao pular com o menu aberto", &C.bhopSkipMenu);
+
+        static const char* kModes[] = { "Segurar (auto)", "Pulso rapido", "Velocidade direta" };
+        ImGui::Combo("Modo do bhop", &C.bhopMode, kModes, IM_ARRAYSIZE(kModes));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Pulso = mais confiavel (padrao).\n"
+                "Segurar = mais rapido SE o jogo repetir com a tecla presa.\n"
+                "Velocidade = pula escrevendo a velocidade (sem fila de input).");
+
+        ImGui::SliderInt("Duracao do press (ms)", &C.bhopHoldMs, 10, 120);
+        ImGui::SliderInt("Re-press (ms)", &C.bhopRePressMs, 20, 200);
+        if (C.bhopMode == 2)
+            ImGui::SliderFloat("Forca do pulo (0=auto)", &C.bhopJumpSpeed, 0.f, 15.f, "%.2f");
+
+        ImGui::Checkbox("Manter velocidade no pulo", &C.bhopKeepSpeed);
+
+        ImGui::Checkbox("Atirar pulando", &C.shootInAir);
+        Keybind("Tecla de tiro", &C.airFireKey);
+        ImGui::SliderInt("Cadencia no ar (ms)", &C.airFireDelayMs, 20, 300);
     }
 
-    // ------------------------------------------------------------
     static const char* ItemOr(const char* const* list, int idx, int count,
         const char* fallback)
     {
@@ -373,7 +390,6 @@ namespace Menu {
         return mudou;
     }
 
-    // ------------------------------------------------------------
     static void TabUnlock()
     {
         ImGui::Checkbox("Unlock All", &C.unlockAll);
@@ -390,18 +406,12 @@ namespace Menu {
         ImGui::Separator();
         ImGui::Text("Catalogo: %s", Dupe::HasFile() ? "bfi_dupe.json OK" : "AUSENTE");
 
-        if (Dupe::Building()) {
+        if (Dupe::Building())
             ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "gerando... etapa %d/5", Dupe::Stage());
-        }
-        else {
+        else
             ImGui::TextDisabled("%s", Dupe::Status());
-        }
 
         if (ImGui::Button("DUPE COMPLETO (gerar JSON)")) Dupe::RequestBuild();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Varre armas, anexos, skins e personagens UMA vez\n"
-                "e salva em bfi_dupe.json, ao lado da DLL.\n"
-                "Roda em 5 etapas, 1 por frame. Entre numa partida antes.");
         ImGui::SameLine();
         if (ImGui::Button("Recarregar JSON")) Dupe::RequestReload();
         ImGui::SameLine();
@@ -415,10 +425,6 @@ namespace Menu {
         ImGui::TextDisabled("armas=%d skins=%d chars=%d anexos=%d/%d/%d",
             Dupe::WeaponCount(), Dupe::CamoCount(), Dupe::CharCount(),
             Dupe::AttachCount(0), Dupe::AttachCount(1), Dupe::AttachCount(2));
-
-        if (!Dupe::HasFile() && Dupe::WeaponCount() == 0)
-            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.4f, 1.f),
-                "sem catalogo: aperte DUPE COMPLETO dentro de uma partida");
 
         ImGui::SameLine();
         ImGui::Checkbox("Aplicar selecao", &C.applySelection);
@@ -434,8 +440,6 @@ namespace Menu {
             else
                 ImGui::TextDisabled("Arma: catalogo vazio (aperte DUPE COMPLETO)");
 
-            // clamp em kMaxAttach: C.selAttach tem kMaxAttach posicoes e o
-            // AttachSlotCount() vem do jogo.
             const int slots = Unlock::AttachSlotCount();
             for (int s = 0; s < slots && s < kMaxAttach; ++s) {
                 const int an = Unlock::AttachCount(s);
@@ -509,17 +513,22 @@ namespace Menu {
         }
     }
 
-    // ------------------------------------------------------------
     static void TabMisc()
     {
         ImGui::Checkbox("Watermark", &C.watermark);
         ImGui::Checkbox("Mostrar FPS", &C.fps);
-
         ImGui::Checkbox("Profiler (ms por passo)", &C.showFpsGraph);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Mostra o tempo de CADA passo do tick.\n"
-                "Use pra achar o gargalo em vez de chutar.");
 
+        ImGui::Separator();
+        ImGui::Text("Alerta de risco");
+        ImGui::Checkbox("Mostrar alerta de ban/desconexao", &C.showRiskAlert);
+        ImGui::Checkbox("Piscar quando ALTO", &C.riskAlertBlink);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("O alerta soma o 'quanto voce parece cheater'.\n"
+                "Speed/fly/god mode e desligar o anti-cheat bypass\n"
+                "sao o que mais chama atencao.");
+
+        ImGui::Separator();
         ImGui::Checkbox("Crosshair", &C.crosshair);
         ImGui::SliderFloat("Tamanho da mira", &C.crosshairSize, 1.0f, 20.0f, "%.0f");
         ImGui::ColorEdit4("Cor da mira", C.crosshairColor);
@@ -543,6 +552,8 @@ namespace Menu {
         if (ImGui::Button("Salvar config"))   ConfigIO::Save();
         ImGui::SameLine();
         if (ImGui::Button("Carregar config")) ConfigIO::Load();
+        ImGui::SameLine();
+        if (ImGui::Button("PANIC")) Misc::Panic();
     }
 
 } // namespace Menu
