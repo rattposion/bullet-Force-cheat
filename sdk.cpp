@@ -1,6 +1,8 @@
 // ============================================================================
 //  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, LOS via Physics.Raycast
-//  v7.3: O_grounded resolvido (bhop) + GetHealthRaw/SetHealth (god mode)
+//  v7.5: O_grounded por varredura de nome + DUMP dos bools quando nada casa
+//        + log de contagem POR CLASSE no RefreshTargets (diagnostico do
+//          "objetos=1 alvos=0": da' pra ver qual classe rende quantos objetos)
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -469,7 +471,7 @@ namespace SDK {
 
     uint32_t O_health = 0, O_alive = 0, O_team = 0, O_isLocal = 0, O_name = 0, O_weapon = 0;
     uint32_t O_vel = 0, O_speed = 0, O_rot = 0, O_rotation = 0, O_cam = 0, O_camTf = 0;
-    uint32_t O_grounded = 0;                 // NOVO — bhop
+    uint32_t O_grounded = 0;
     uint32_t O_mCamera = 0, O_humanMeshAnimator = 0, O_humanMeshReferences = 0;
     uint32_t O_stats = 0, O_gunView = 0, O_gunStats = 0, O_gunStatsOnView = 0;
     uint32_t O_curAmmo = 0, O_maxAmmo = 0, O_reloading = 0, O_spread = 0, O_fireRate = 0, O_dmg = 0;
@@ -1133,7 +1135,6 @@ namespace SDK {
 
     float GetHealth(Il2CppObject* o) { return ReadHealth(o); }
 
-    // ---- NOVO: leitura crua + escrita (god mode) ----
     float GetHealthRaw(Il2CppObject* o) {
         if (!o || !O_health) return 0.f;
         uintptr_t a = 0;
@@ -2393,6 +2394,7 @@ namespace SDK {
         std::vector<FoundEnt> found;
         found.reserve(MAX_TARGETS);
         int totalObjs = 0;
+        int nLocal = 0;
 
         for (int s = 0; s < nScan; ++s) {
             Il2CppClass* sc = scans[s];
@@ -2409,16 +2411,27 @@ namespace SDK {
 
             uint32_t n = il2cpp_array_length ? il2cpp_array_length(arr) : 0;
             totalObjs += (int)n;
+            Log("[sdk] scan %s: %u objeto(s)", se_class_name(sc), n);   // >>> v7.5
 
             for (uint32_t i = 0; i < n; ++i) {
                 Il2CppObject* e = (Il2CppObject*)se_array_at(arr, i);
                 if (!e || !PlausibleObj(e)) continue;
-                if (IsLocalEntity(e)) { AdoptLocal(e); continue; }
+                if (IsLocalEntity(e)) { ++nLocal; AdoptLocal(e); continue; }
 
                 bool dup = false;
                 for (auto& f : found) if (f.e == e) { dup = true; break; }
                 if (!dup) found.push_back({ -1, e });
             }
+        }
+
+        // >>> v7.5: se TODO mundo foi classificado como local, O_isLocal esta' errado
+        if (totalObjs > 1 && nLocal == totalObjs && O_isLocal) {
+            static int warned = 0;
+            if (warned++ < 3) {
+                Log("[sdk] O_isLocal (0x%X) marcou %d/%d como local -> desligando",
+                    O_isLocal, nLocal, totalObjs);
+            }
+            O_isLocal = 0;
         }
 
         for (auto& f : found)
@@ -2728,7 +2741,7 @@ namespace SDK {
         g_hierDumped = false; g_dumpTarget = false;
 
         O_health = O_alive = O_team = O_isLocal = O_name = O_weapon = 0;
-        O_grounded = 0;                                   // NOVO
+        O_grounded = 0;
         O_vel = O_speed = O_rot = O_rotation = O_cam = O_camTf = 0;
         O_mCamera = O_humanMeshAnimator = O_humanMeshReferences = 0;
         O_stats = O_gunView = O_gunStats = O_gunStatsOnView = 0;
@@ -2806,14 +2819,68 @@ namespace SDK {
             O_humanMeshReferences = PickFieldOff(kPlayerScript, { "humanMeshReferences", "meshReferences" });
         }
 
-        // ---- NOVO: campo de solo (bhop) ----
+        // ---- grounded: nomes diretos, depois varredura, depois DUMP ----
         if (kEntity)
             O_grounded = PickFieldOff(kEntity, { "isGrounded", "grounded", "onGround",
                                                  "m_Grounded", "_grounded", "isOnGround",
-                                                 "groundedCheck" }, "Boolean");
+                                                 "groundedCheck", "groundCheck", "isOnFloor",
+                                                 "onFloor" }, "Boolean");
         if (kPlayerScript && !O_grounded)
             O_grounded = PickFieldOff(kPlayerScript, { "isGrounded", "grounded", "onGround",
-                                                       "m_Grounded", "_grounded", "isOnGround" }, "Boolean");
+                                                       "m_Grounded", "_grounded", "isOnGround",
+                                                       "groundCheck", "isOnFloor" }, "Boolean");
+
+        if (!O_grounded) {
+            static const char* kCls[] = { "PlayerScript", "Entity" };
+            for (int ci = 0; ci < 2 && !O_grounded; ++ci) {
+                Il2CppClass* k = FindClass(kCls[ci]);
+                for (Il2CppClass* c = k; c && !O_grounded; c = se_class_parent(c)) {
+                    void* it = nullptr;
+                    for (;;) {
+                        FieldInfo* f = se_class_get_fields(c, &it);
+                        if (!f) break;
+                        const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
+                        if (!strstr(TypeNameCached(t), "Boolean")) continue;
+                        const char* fn = se_field_name(f);
+                        if (!fn) continue;
+                        char low[96]; int i = 0;
+                        for (; fn[i] && i < 95; ++i) {
+                            char ch = fn[i];
+                            low[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+                        }
+                        low[i] = 0;
+                        if (strstr(low, "ground") || strstr(low, "floor")) {
+                            O_grounded = (uint32_t)se_field_offset(f);
+                            Log("[sdk] grounded por nome: %s::%s @0x%X",
+                                se_class_name(c), fn, O_grounded);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // >>> v7.5: se ainda for 0, despeja os bools p/ escolher o nome na mao
+        if (!O_grounded) {
+            int shown = 0;
+            for (int ci = 0; ci < 2 && shown < 40; ++ci) {
+                Il2CppClass* k = FindClass(ci == 0 ? "PlayerScript" : "Entity");
+                if (!k) continue;
+                for (Il2CppClass* c = k; c && shown < 40; c = se_class_parent(c)) {
+                    void* it = nullptr;
+                    for (;;) {
+                        FieldInfo* f = se_class_get_fields(c, &it);
+                        if (!f) break;
+                        const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
+                        if (!strstr(TypeNameCached(t), "Boolean")) continue;
+                        if (shown == 0) Log("[sdk] grounded: nada casou. bools disponiveis:");
+                        Log("[sdk]   %s::%s @0x%X", se_class_name(c), se_field_name(f),
+                            (unsigned)se_field_offset(f));
+                        ++shown;
+                    }
+                }
+            }
+        }
         Log("[sdk] grounded = 0x%X (%s)", O_grounded, O_grounded ? "campo" : "heuristica");
 
         if (!O_rotation) O_rotation = 0x9B8;

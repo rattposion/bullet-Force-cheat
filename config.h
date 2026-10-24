@@ -4,6 +4,10 @@
 
 #include <windows.h>
 
+// >>> v43.15: marcador de versao. O menu/unlock checam isto e dao #error
+//     se um config.h antigo estiver no include path.
+#define BFI_CONFIG_VER 4315
+
 struct Config {
 
     // ---- JANELA / MENU ----
@@ -80,7 +84,9 @@ struct Config {
     bool  triggerbot = false;
     int   triggerKey = VK_MENU;
     float triggerDelay = 30.f;
+    float triggerFov = 10.f;
     float triggerRadius = 10.f;
+    int   triggerBurst = 0;
 
     // ---- ARMA ----
     bool  noRecoil = false;
@@ -100,11 +106,11 @@ struct Config {
 
     // ---- BUNNYHOP / TIRO NO AR ----
     bool  bhop = false;
-    int   bhopKey = 0;               // 0 = sempre ativo
+    int   bhopKey = 0;
     bool  bhopKeepSpeed = false;
     bool  bhopSkipMenu = true;
 
-    int   bhopMode = 1;              // 0=segurar 1=pulso 2=velocidade
+    int   bhopMode = 1;
     int   bhopHoldMs = 25;
     int   bhopRePressMs = 70;
     float bhopJumpSpeed = 0.f;
@@ -203,18 +209,18 @@ struct Config {
     int   trigBurst = 0;
 
     // ========================================================================
-    //  >>> v42 — carteira / conta / janela de log (menu.cpp + config.cpp)
+    //  >>> v42 — carteira / conta / janela de log
     // ========================================================================
-    bool  moneyOnlyWallet = true;      // so mexe nos espelhos da carteira
-    bool  moneyWritePrefs = false;     // grava tambem nos PlayerPrefs
-    bool  moneyRescan = false;         // flag: pedir nova varredura
-    int   moneyMode = 0;               // 0 = travar, 1 = forcar 1x
-    int   moneyIntervalMs = 1000;      // reaplicar a cada N ms
-    bool  moneyApplyNow = false;       // flag: aplicar agora
+    bool  moneyOnlyWallet = true;
+    bool  moneyWritePrefs = false;
+    bool  moneyRescan = false;
+    int   moneyMode = 0;
+    int   moneyIntervalMs = 1000;
+    bool  moneyApplyNow = false;
 
-    int   accGold = 0;                 // gold a travar
-    int   accCases = 0;                // caixas a travar
-    bool  accAuto = true;              // reaplicar automatico
+    int   accGold = 0;
+    int   accCases = 0;
+    bool  accAuto = true;
 
     bool  logAutoScroll = true;
     char  logFilter[64] = "";

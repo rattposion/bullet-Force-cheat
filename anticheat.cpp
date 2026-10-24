@@ -1,7 +1,13 @@
 // ============================================================================
-//  anticheat.cpp — bypass em camadas (v7)
-//  v7: + RISCO DE BAN / DESCONEXAO (alerta do menu)
-//      Log vem do globals.h (sem re-declarar -> sem C28251)
+//  anticheat.cpp — bypass em camadas (v9)
+//  v9: + NAO adota classe sem campos de flag (PlayerAntiHack e' componente vazio:
+//        adotar ela zerava g_bools/g_ints e o bypass virava no-op)
+//      + g_instCls: classe REAL do objeto da instancia, separada da classe cujos
+//        campos limpamos. Sem isso o cache de offset se invalidava a cada Tick.
+//      + caches de type->class e class->isAC + WARM no Install: o 1o scan travava
+//        o thread do jogo por ~1.6s ("[ac] scan ... levou 1687 ms").
+//        O warm roda no thread de init, fora do frame.
+//      + __try unico no laco de campos (era 1 por campo)
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -105,8 +111,9 @@ namespace {
 namespace AntiCheat {
 
     // ---------------------------------------------------------------- estado
-    static Il2CppClass* g_cls = nullptr;
-    static Il2CppObject* g_obj = nullptr;
+    static Il2CppClass* g_cls = nullptr;       // classe cujos campos limpamos
+    static Il2CppObject* g_obj = nullptr;      // instancia viva
+    static Il2CppClass* g_instCls = nullptr;   // classe REAL do objeto da instancia
 
     struct FieldRef { uint32_t off; char name[48]; };
     static std::vector<FieldRef> g_bools;
@@ -380,16 +387,75 @@ namespace AntiCheat {
         return strstr(n, "AntiHack") || strstr(n, "AntiCheat");
     }
 
+    // classe para VALIDAR a instancia (a real do objeto), nao a dos campos
+    static Il2CppClass* InstCls() { return g_instCls ? g_instCls : g_cls; }
+
+    // >>> caches: matam o custo repetido do scan
+    static Il2CppClass* ClassFromTypeCached(const Il2CppType* t) {
+        if (!t) return nullptr;
+        static const Il2CppType* kt[512] = {};
+        static Il2CppClass* kv[512] = {};
+        static int n = 0;
+        for (int i = 0; i < n; ++i) if (kt[i] == t) return kv[i];
+        Il2CppClass* r = nullptr;
+        __try { r = il2cpp_class_from_type(t); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { r = nullptr; }
+        if (n < 512) { kt[n] = t; kv[n] = r; ++n; }
+        return r;
+    }
+
+    static bool ClassIsAcCached(Il2CppClass* k) {
+        if (!k) return false;
+        static Il2CppClass* kc[256] = {};
+        static unsigned char vc[256] = {};
+        static int n = 0;
+        for (int i = 0; i < n; ++i) if (kc[i] == k) return vc[i] != 0;
+        bool v = false;
+        for (Il2CppClass* q = k; q && AcPtr(q); q = il2cpp_class_get_parent(q))
+            if (ClassIsAc(q)) { v = true; break; }
+        if (n < 256) { kc[n] = k; vc[n] = v ? 1 : 0; ++n; }
+        return v;
+    }
+
+    // ------------------------------------------------------------------------
+    //  >>> v9 — aquece type->class de TODOS os campos do player no thread de init.
+    //  E' isso que tira o freeze de ~1.6s de dentro do frame.
+    // ------------------------------------------------------------------------
+    static void WarmPlayerFieldCache() {
+        Il2CppClass* pk = SDK::kPlayerScript ? SDK::kPlayerScript : SDK::FindClass("Entity");
+        if (!pk) { Log("[ac] warm: classe do player ainda nao resolvida"); return; }
+
+        const uint64_t t0 = GetTickCount64();
+        int n = 0;
+        __try {
+            void* it = nullptr;
+            for (;;) {
+                FieldInfo* f = il2cpp_class_get_fields(pk, &it);
+                if (!f) break;
+                if (IsStaticField(f)) continue;
+                const Il2CppType* t = il2cpp_field_get_type(f);
+                if (!t) continue;
+                ClassFromTypeCached(t);
+                ++n;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        Log("[ac] warm: %d campos de %s pre-resolvidos em %llu ms (fora do frame)",
+            n, ClassName(pk), (unsigned long long)(GetTickCount64() - t0));
+    }
+
     static Il2CppObject* InstanceOnPlayerFast() {
         if (!SDK::g_localPlayer || !g_cls || !AcPtr(SDK::g_localPlayer)) return nullptr;
 
-        if (g_offAcOnPlayer) {
+        if (g_offAcOnPlayer && g_instCls) {
             Il2CppObject* o = *(Il2CppObject**)((uintptr_t)SDK::g_localPlayer + g_offAcOnPlayer);
-            if (AcObjOk(o, g_cls)) return o;
+            if (AcObjOk(o, g_instCls)) return o;
             g_offAcOnPlayer = 0;
+            g_instCls = nullptr;
         }
 
-        uint64_t t0 = GetTickCount64();
+        const uint64_t t0 = GetTickCount64();
         uint32_t foundOff = 0;
         Il2CppObject* foundObj = nullptr;
         Il2CppClass* foundCls = nullptr;
@@ -398,59 +464,68 @@ namespace AntiCheat {
             Il2CppClass* pk = il2cpp_object_get_class(SDK::g_localPlayer);
             if (!AcPtr(pk)) return nullptr;
 
-            for (Il2CppClass* c = pk; c && AcPtr(c) && !foundObj; c = il2cpp_class_get_parent(c)) {
-                void* it = nullptr;
-                for (;;) {
-                    FieldInfo* f = il2cpp_class_get_fields(c, &it);
-                    if (!f) break;
-                    const Il2CppType* t = il2cpp_field_get_type(f);
-                    if (!t || !AcPtr(t)) continue;
+            // il2cpp_class_get_fields ja' percorre a hierarquia: NAO repetir o walk
+            void* it = nullptr;
+            for (;;) {
+                FieldInfo* f = il2cpp_class_get_fields(pk, &it);
+                if (!f) break;
+                if (IsStaticField(f)) continue;
 
-                    Il2CppClass* ft = nullptr;
-                    __try { ft = il2cpp_class_from_type(t); }
-                    __except (EXCEPTION_EXECUTE_HANDLER) { ft = nullptr; }
-                    if (!AcPtr(ft)) continue;
+                const Il2CppType* t = il2cpp_field_get_type(f);
+                if (!t) continue;
 
-                    bool match = false;
-                    for (Il2CppClass* q = ft; !match && q && AcPtr(q); q = il2cpp_class_get_parent(q))
-                        if (ClassIsAc(q)) match = true;
-                    if (!match) continue;
+                Il2CppClass* ft = ClassFromTypeCached(t);
+                if (!ft) continue;
+                if (!ClassIsAcCached(ft)) continue;
 
-                    uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
-                    if (!off) continue;
+                const uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
+                if (!off) continue;
 
-                    Il2CppObject* o = *(Il2CppObject**)((uintptr_t)SDK::g_localPlayer + off);
-                    if (AcObjOk(o, nullptr)) {
-                        foundOff = off;
-                        foundObj = o;
-                        foundCls = ft;
-                        Log("[ac] instancia no player: '%s' @0x%X (%p) cls=%s",
-                            il2cpp_field_get_name(f), off, o, ClassName(ft));
-                        break;
-                    }
-                }
+                Il2CppObject* o = *(Il2CppObject**)((uintptr_t)SDK::g_localPlayer + off);
+                if (!AcObjOk(o, nullptr)) continue;
+
+                foundOff = off;
+                foundObj = o;
+                foundCls = ft;
+                Log("[ac] instancia no player: '%s' @0x%X (%p) cls=%s",
+                    il2cpp_field_get_name(f), off, o, ClassName(ft));
+                break;
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
 
-        uint64_t dt = GetTickCount64() - t0;
+        const uint64_t dt = GetTickCount64() - t0;
         if (dt >= 20) Log("[ac] scan da instancia no player levou %llu ms",
             (unsigned long long)dt);
 
         if (!foundObj) return nullptr;
+        if (foundCls) g_instCls = foundCls;
 
+        // >>> so' troca a lista de campos se a nova classe realmente tiver flags
         if (foundCls && foundCls != g_cls && !g_adopted) {
             g_adopted = true;
-            Log("[ac] adotando classe %s (era %s)", ClassName(foundCls), ClassName(g_cls));
-            g_cls = foundCls;
+            Il2CppClass* old = g_cls;
+            Log("[ac] classe do player = %s (escolhida era %s)",
+                ClassName(foundCls), ClassName(old));
+
             ClearScans();
-            ScanFields(g_cls, "campos (adotada)");
+            g_cls = foundCls;
+            ScanFields(g_cls, "campos (player)");
             ScanStatics(g_cls);
+
+            if (g_bools.empty() && g_ints.empty() && g_statics.empty() && old) {
+                Log("[ac] %s sem flags -> campos continuam de %s",
+                    ClassName(g_cls), ClassName(old));
+                g_cls = old;
+                ClearScans();
+                ScanFields(g_cls, "campos");
+                ScanStatics(g_cls);
+            }
             DumpClass(g_cls);
         }
 
         g_offAcOnPlayer = foundOff;
-        return AcObjOk(foundObj, g_cls) ? foundObj : nullptr;
+        return AcObjOk(foundObj, InstCls()) ? foundObj : nullptr;
     }
 
     static Il2CppObject* InstanceViaGetter() {
@@ -479,7 +554,8 @@ namespace AntiCheat {
         }
         __except (EXCEPTION_EXECUTE_HANDLER) { o = nullptr; }
 
-        if (AcObjOk(o, g_cls)) {
+        if (AcObjOk(o, InstCls())) {
+            g_instCls = g_cls;
             Log("[ac] instancia via getter %s (%p)", il2cpp_method_get_name(g), o);
             return o;
         }
@@ -511,8 +587,9 @@ namespace AntiCheat {
                 __try { if (g_fieldStaticGet) g_fieldStaticGet(f, &o); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { o = nullptr; }
 
-                if (AcObjOk(o, g_cls)) {
+                if (AcObjOk(o, InstCls())) {
                     g_obj = o;
+                    g_instCls = g_cls;
                     Log("[ac] instancia via estatico '%s' (%p)", n, o);
                     return;
                 }
@@ -533,7 +610,7 @@ namespace AntiCheat {
 
     // ---------------------------------------------------------------- limpeza
     static void ClearAll() {
-        if (g_obj && AcObjOk(g_obj, g_cls)) {
+        if (g_obj && AcObjOk(g_obj, InstCls())) {
             const uintptr_t base = (uintptr_t)g_obj;
 
             __try { for (auto& b : g_bools) WriteAt<bool>(base + b.off, false); }
@@ -642,6 +719,9 @@ namespace AntiCheat {
         DumpClass(g_cls);
         HookFlagGetters(g_cls);
         HookAcUpdates();
+
+        WarmPlayerFieldCache();     // >>> v9: tira o custo do thread do jogo
+
         FindInstance();
 
         Log("[ac] Install ok cls=%p obj=%p bools=%d ints=%d statics=%d",
@@ -655,7 +735,7 @@ namespace AntiCheat {
         if (!g_cls) return;
 
         __try {
-            if (g_obj && !AcObjOk(g_obj, g_cls)) {
+            if (g_obj && !AcObjOk(g_obj, InstCls())) {
                 Log("[ac] instancia invalida, refazendo");
                 g_obj = nullptr;
             }

@@ -1,30 +1,19 @@
 // ============================================================================
-//  unlock.cpp — bfi (v43.1)
+//  unlock.cpp — bfi (v43.16)
 //
-//  >>> v43.1
-//    * ESPELHO DA LOJA: a busca de campo ficou CASE-INSENSITIVE
-//      (il2cpp_class_get_field_from_name e' case-sensitive, 'GoldAmount' nao
-//      casava com 'goldAmount'), ganhou fallback por palavra-chave e o salto
-//      'sidebar' ganhou fallback por offset (0x20).
-//    * Quando um espelho falha, MnyDumpObj joga no log a classe real e TODOS
-//      os campos do objeto (nome/tipo/offset) para voce corrigir a tabela.
-//    * O resumo "[mirror] N/M espelhos resolvidos" so' loga quando muda.
+//  >>> v43.16
+//    * BUILD: nova BuildAllNow() — faz install + CollectWeapons/Attachs/
+//      Camos/Chars + Save NUMA chamada so. O botao da aba Dupe chama ela
+//      direto, entao o build nao depende mais da maquina de estagios
+//      nem da ordem do Tick.
 //
-//  >>> v43
-//    * Define a API da CARTEIRA que o Menu::TabConta consome (assinaturas
-//      exatas: MoneyCount/MoneyName/MoneyLocked/MoneySetLock/MoneyValue/
-//      MoneySet/MoneyRefresh/MoneyLockByName/ForceMirrors/MoneyUnlockAll).
-//    * Install() e' bool (sem E0311).
-//    * Os espelhos sao campos de INSTANCIA alcancados pelo singleton
-//      ESTATICO da classe (bug da v40: procurava-se campo static).
-//      kind 0 = int, 1 = ObscuredInt (hidden = v ^ key, +0xC inited=1).
-//    * MoneyTick consome C.accAuto, C.moneyIntervalMs, C.moneyApplyNow,
-//      C.moneyRescan, C.moneyWritePrefs, C.moneyOnlyWallet, C.accGold,
-//      C.accCases.
-//    * Tick(): o tick da carteira roda ANTES do check de g_localPlayer.
+//  >>> v43.14
+//    * FIX BUILD: 'case 0' no BuildStepInner (mantido).
+//    * CREDITOS: probes JBNJGEGJGAD @0x34 e FIOMIPONAAM @0xA4.
+//    * Readback em toda escrita. #error se o config.h estiver velho.
 //
-//  >>> v25 (mantido): retry de Install no maximo 2x/s.
-//  >>> v24 (mantido): loadout de ALFA/BRAVO/CHARLIE vem dos PlayerPrefs.
+//  >>> v43.13 / v43.12 / v43.11 (mantidos)
+//    * kind do espelho pelo tipo real; JSON da conta; 3 saltos p/ bfAccountInfo.
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -41,9 +30,16 @@
 #include <string>
 #include <vector>
 
-#define BFI_UNLOCK_VER "v43.1"
+#ifndef BFI_CONFIG_VER
+#error "config.h ANTIGO sendo incluido (sem BFI_CONFIG_VER). Substitua o config.h."
+#elif BFI_CONFIG_VER < 4315
+#error "config.h desatualizado (BFI_CONFIG_VER < 4315). Substitua o config.h."
+#endif
 
+#define BFI_UNLOCK_VER "v43.16"
 namespace Unlock {
+
+    static void* StaticInstanceOf(Il2CppClass* k);
 
     static void* g_arr = nullptr;
     static int    g_arrLen = 0;
@@ -63,6 +59,14 @@ namespace Unlock {
     static const uint32_t kLoPrim = 0x144;
     static const uint32_t kLoSec = 0x145;
     static const uint32_t kLoGad = 0x10A4;
+
+    static const uint32_t kLmCurType = 0x290;
+    static const uint32_t kLmSel1 = 0x2BC;
+    static const uint32_t kLmSel2 = 0x2C0;
+    static const uint32_t kLmSel3 = 0x2C4;
+    static const uint32_t kLmActive = 0x2D0;
+
+    static const uint32_t kAmJson = 0x90;
 
     static bool   g_installed = false;
     static const char* kSlotNames[3] = { "Mira (sights)", "Acessorios", "Cano (barrels)" };
@@ -162,6 +166,33 @@ namespace Unlock {
         }
         dst[i] = 0;
     }
+    static bool HasWord(const char* lowHay, const char* lowNeedle) {
+        return (lowHay && lowNeedle && lowNeedle[0] && strstr(lowHay, lowNeedle) != nullptr);
+    }
+
+    struct TypeNameCU {
+        static const int SLOTS = 16384;
+        const void* key[SLOTS];
+        const char* val[SLOTS];
+        TypeNameCU() { memset(key, 0, sizeof(key)); memset(val, 0, sizeof(val)); }
+        const char* Get(const Il2CppType* t) {
+            if (!t || !il2cpp_type_get_name) return "";
+            size_t h = ((uintptr_t)t >> 4) & (SLOTS - 1);
+            for (int i = 0; i < SLOTS; ++i) {
+                size_t idx = (h + i) & (SLOTS - 1);
+                if (key[idx] == (const void*)t) return val[idx];
+                if (!key[idx]) {
+                    const char* n = il2cpp_type_get_name(t);
+                    key[idx] = (const void*)t;
+                    val[idx] = n ? n : "";
+                    return val[idx];
+                }
+            }
+            return "";
+        }
+    };
+    static TypeNameCU g_tn;
+    static const char* TN(const Il2CppType* t) { return g_tn.Get(t); }
 
     static int ArrLen(Il2CppArray* a) {
         if (!a) return 0;
@@ -209,6 +240,27 @@ namespace Unlock {
         __except (EXCEPTION_EXECUTE_HANDLER) { return; }
         memcpy(out, buf, sizeof(void*));
     }
+    static bool StaticGetRaw(FieldInfo* f, void* out, size_t n) {
+        if (!f || !p_fieldStaticGet || !out) return false;
+        unsigned char buf[256];
+        memset(buf, 0, sizeof(buf));
+        __try { p_fieldStaticGet(f, buf); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        memcpy(out, buf, n > sizeof(buf) ? sizeof(buf) : n);
+        return true;
+    }
+    static bool StaticGetInt(FieldInfo* f, int* out) {
+        *out = 0;
+        return StaticGetRaw(f, out, sizeof(int));
+    }
+    static void StaticSetRaw(FieldInfo* f, const void* in, size_t n) {
+        if (!f || !p_fieldStaticSet || !in) return;
+        unsigned char buf[256];
+        memset(buf, 0, sizeof(buf));
+        memcpy(buf, in, n > sizeof(buf) ? sizeof(buf) : n);
+        __try { p_fieldStaticSet(f, buf); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
     static void StaticSetInt(FieldInfo* f, int value, int isByte) {
         if (!f || !p_fieldStaticSet) return;
         unsigned char buf[64];
@@ -249,31 +301,45 @@ namespace Unlock {
     }
 
     // =========================================================================
-    //  >>> v43.1 — MODULO CARTEIRA / ESPELHOS
-    //  kind: 0 = int, 1 = ObscuredInt.
-    //  A busca de campo e' CASE-INSENSITIVE e tem fallback por palavra-chave.
-    //  hopFld/hopOff = salto intermediario (nome com fallback por offset).
+    //  CARTEIRA / ESPELHOS
     // =========================================================================
     struct MnyMirror {
-        const char* cls;      // classe dona do campo
-        const char* fld;      // campo do espelho (INSTANCIA)
-        const char* fldKey;   // palavra-chave alternativa (substring, CI)
-        const char* hopFld;   // campo intermediario (0 = nenhum)
-        uint32_t    hopOff;   // fallback do salto por offset (0 = nenhum)
-        const char* label;    // nome amigavel (MoneyName)
-        int         kind;     // 0 = int, 1 = ObscuredInt
+        const char* cls;
+        const char* fld;
+        const char* fldKey;
+        const char* hopFld;
+        uint32_t    hopOff;
+        const char* hopFld2;
+        uint32_t    hopOff2;
+        const char* hopFld3;
+        uint32_t    hopOff3;
+        const char* label;
+        int         kind;
         bool        lock;
         bool        ok;
+        bool        isStatic;
+        bool        logged;
         void* base;
+        FieldInfo* sf;
         uint32_t    off;
+        const char* typeName;
     };
 
     static MnyMirror g_mny[] = {
-        { "CreditsManager",  "LDOGMJMLIOP", "credit", 0,         0,    "Creditos (UI)",  1, true, false, 0, 0 },
-        { "AccountManager",  "GEEFAPKBHJO", "gold",   0,         0,    "Conta (gold)",   1, true, false, 0, 0 },
-        { "CamoCaseManager", "goldCases",   "case",   0,         0,    "Caixas (gold)",  0, true, false, 0, 0 },
-        { "LoadoutManager",  "goldAmount",  "gold",   0,         0,    "Loadout (gold)", 0, true, false, 0, 0 },
-        { "LoadoutAndShop",  "goldAmount",  "gold",   "sidebar", 0x20, "Loja (sidebar)", 0, true, false, 0, 0 },
+        { "AccountManager",  "JBNJGEGJGAD", "money",  0,             0,    0,            0,    0,             0,    "Conta (acc.int34)",   0, false, false, false, false, 0, 0, 0 },
+        { "AccountManager",  "FIOMIPONAAM", "money",  0,             0,    0,            0,    0,             0,    "Conta (acc.intA4)",   0, false, false, false, false, 0, 0, 0 },
+
+        { "CreditsManager",  "LDOGMJMLIOP", "credit", 0,             0,    0,            0,    0,             0,    "Creditos (UI)",       1, true,  false, false, false, 0, 0, 0 },
+        { "AccountManager",  "GEEFAPKBHJO", "gold",   0,             0,    0,            0,    0,             0,    "Conta (gold UI)",     1, true,  false, false, false, 0, 0, 0 },
+        { "AccountManager",  "gold",        "gold",   "accountInfo", 0x58, "customInfo", 0x18, "bfAccountInfo", 0x10, "Conta (bf.gold)",     0, true,  false, false, false, 0, 0, 0 },
+        { "AccountManager",  "money",       "money",  "accountInfo", 0x58, "customInfo", 0x18, "bfAccountInfo", 0x10, "Conta (bf.money)",    0, true,  false, false, false, 0, 0, 0 },
+        { "AccountManager",  "xp",          "xp",     "accountInfo", 0x58, "customInfo", 0x18, "bfAccountInfo", 0x10, "Conta (bf.xp)",       0, false, false, false, false, 0, 0, 0 },
+        { "AccountManager",  "cases",       "case",   "accountInfo", 0x58, "customInfo", 0x18, "bfAccountInfo", 0x10, "Conta (bf.cases)",    0, false, false, false, false, 0, 0, 0 },
+        { "AccountManager",  "gold",        "gold",   "BMJJMJJIKPB", 0x98, "bfAccountInfo", 0x10, 0,             0,    "Conta (BM.gold)",     0, true,  false, false, false, 0, 0, 0 },
+        { "AccountManager",  "money",       "money",  "BMJJMJJIKPB", 0x98, "bfAccountInfo", 0x10, 0,             0,    "Conta (BM.money)",    0, true,  false, false, false, 0, 0, 0 },
+        { "CamoCaseManager", "goldCases",   "case",   0,             0,    0,            0,    0,             0,    "Caixas (gold)",       1, true,  false, false, false, 0, 0, 0 },
+        { "LoadoutManager",  "goldAmount",  "gold",   0,             0,    0,            0,    0,             0,    "Loadout (gold)",      1, true,  false, false, false, 0, 0, 0 },
+        { "LoadoutAndShop",  "goldAmount",  "gold",   "sidebar",     0x20, 0,            0,    0,             0,    "Loja (sidebar)",      0, true,  false, false, false, 0, 0, 0 },
     };
     static const int g_mnyN = (int)(sizeof(g_mny) / sizeof(g_mny[0]));
 
@@ -283,7 +349,6 @@ namespace Unlock {
 
     static bool MnyIn(int i) { return i >= 0 && i < g_mnyN; }
 
-    // singleton: por nome (varias grafias) e, se falhar, varredura CI
     static void* MnyStaticObj(const char* cls, const char* f1, const char* f2) {
         Il2CppClass* k = cls ? SDK::FindClass(cls) : nullptr;
         if (!k) return nullptr;
@@ -313,8 +378,6 @@ namespace Unlock {
         return nullptr;
     }
 
-    // campo por nome EXATO, case-insensitive
-    // (il2cpp_class_get_field_from_name e' case-sensitive: 'GoldAmount' != 'goldAmount')
     static uint32_t MnyOffExact(void* obj, const char* fld) {
         if (!LooksLikeObj(obj) || !fld) return 0;
         Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)obj);
@@ -333,33 +396,58 @@ namespace Unlock {
         return 0;
     }
 
-    // fallback: primeiro campo inteiro cujo nome contenha a palavra-chave
-    static uint32_t MnyOffKey(void* obj, const char* key) {
-        if (!LooksLikeObj(obj) || !key) return 0;
-        char kl[40]; Lower(kl, sizeof(kl), key);
-        Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)obj);
+    static FieldInfo* MnyFindField(void* obj, const char* fld, const char* key, bool& isStaticOut) {
+        isStaticOut = false;
+        Il2CppClass* k = obj ? il2cpp_object_get_class((Il2CppObject*)obj) : nullptr;
+        if (!k) return nullptr;
+
         for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
             void* it = nullptr;
             for (;;) {
                 FieldInfo* f = il2cpp_class_get_fields(c, &it);
                 if (!f) break;
                 if (IsStatic(f)) continue;
-                const Il2CppType* t = il2cpp_field_get_type(f);
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-                if (!tn) continue;
-                if (!strstr(tn, "Int32") && !strstr(tn, "ObscuredInt") && !strstr(tn, "Int64")) continue;
                 const char* fn = il2cpp_field_get_name(f);
-                if (!fn) continue;
-                char nl[80]; Lower(nl, sizeof(nl), fn);
-                if (!strstr(nl, kl)) continue;
-                uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
-                if (off) return off;
+                if (!fn || _stricmp(fn, fld) != 0) continue;
+                if (il2cpp_field_get_offset(f)) return f;
             }
         }
-        return 0;
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+            void* it = nullptr;
+            for (;;) {
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
+                if (!f) break;
+                if (!IsStatic(f)) continue;
+                const char* fn = il2cpp_field_get_name(f);
+                if (!fn || _stricmp(fn, fld) != 0) continue;
+                isStaticOut = true;
+                return f;
+            }
+        }
+        if (key) {
+            char kl[40]; Lower(kl, sizeof(kl), key);
+            for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+                void* it = nullptr;
+                for (;;) {
+                    FieldInfo* f = il2cpp_class_get_fields(c, &it);
+                    if (!f) break;
+                    const Il2CppType* t = il2cpp_field_get_type(f);
+                    const char* tn = TN(t);
+                    if (!tn) continue;
+                    if (!strstr(tn, "Int32") && !strstr(tn, "ObscuredInt") && !strstr(tn, "Int64")) continue;
+                    const char* fn = il2cpp_field_get_name(f);
+                    if (!fn) continue;
+                    char nl[80]; Lower(nl, sizeof(nl), fn);
+                    if (!strstr(nl, kl)) continue;
+                    if (!IsStatic(f) && !il2cpp_field_get_offset(f)) continue;
+                    isStaticOut = IsStatic(f);
+                    return f;
+                }
+            }
+        }
+        return nullptr;
     }
 
-    // diagnostico: joga no log a classe e os campos do objeto que falhou
     static void MnyDumpObj(void* o, const char* tag, int max) {
         if (!LooksLikeObj(o)) return;
         Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)o);
@@ -370,12 +458,12 @@ namespace Unlock {
             for (;;) {
                 FieldInfo* f = il2cpp_class_get_fields(c, &it);
                 if (!f) break;
-                if (IsStatic(f)) continue;
                 if (n++ >= max) break;
                 const Il2CppType* t = il2cpp_field_get_type(f);
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : "?";
-                Log("[mirror]   %s::%s %s @0x%X", il2cpp_class_get_name(c),
-                    il2cpp_field_get_name(f), tn, (unsigned)il2cpp_field_get_offset(f));
+                const char* tn = TN(t);
+                Log("[mirror]   %s::%s %s @0x%X%s", il2cpp_class_get_name(c),
+                    il2cpp_field_get_name(f), tn, (unsigned)il2cpp_field_get_offset(f),
+                    IsStatic(f) ? " [static]" : "");
             }
         }
     }
@@ -384,46 +472,98 @@ namespace Unlock {
         if (g_mnyDone) return;
         const ULONGLONG now = GetTickCount64();
         if (now < g_mnyNext) return;
-        g_mnyNext = now + 2000;                 // retry no maximo 1x/2s
+        g_mnyNext = now + 2000;
         int ok = 0;
         for (int i = 0; i < g_mnyN; ++i) {
             MnyMirror& m = g_mny[i];
-            m.ok = false; m.base = nullptr; m.off = 0;
+            m.ok = false; m.base = nullptr; m.off = 0; m.sf = nullptr;
+            m.isStatic = false; m.typeName = nullptr;
 
             void* base = MnyStaticObj(m.cls, "singleton", "Instance");
             if (!base) base = MnyStaticObj(m.cls, "instance", "s_instance");
-            if (!base) { Log("[mirror] %s: singleton ausente", m.label); continue; }
+            if (!base) {
+                if (!m.logged) { m.logged = true; Log("[mirror] %s: singleton ausente", m.label); }
+                continue;
+            }
 
-            if (m.hopFld || m.hopOff) {
-                uint32_t ho = MnyOffExact(base, m.hopFld);
-                if (!ho) ho = m.hopOff;         // fallback por offset
-                void* mid = ho ? SafeRead<void*>((uintptr_t)base + ho, nullptr) : nullptr;
+            bool hopFail = false;
+            for (int h = 0; h < 3 && !hopFail; ++h) {
+                const char* hf = (h == 0) ? m.hopFld : (h == 1) ? m.hopFld2 : m.hopFld3;
+                uint32_t hoff = (h == 0) ? m.hopOff : (h == 1) ? m.hopOff2 : m.hopOff3;
+                if (!hf && !hoff) continue;
+                uint32_t got = MnyOffExact(base, hf);
+                if (!got) got = hoff;
+                void* mid = got ? SafeRead<void*>((uintptr_t)base + got, nullptr) : nullptr;
                 if (!LooksLikeObj(mid)) {
-                    Log("[mirror] %s: salto falhou (off=0x%X)", m.label, ho);
-                    continue;
+                    hopFail = true;
+                    if (!m.logged) {
+                        m.logged = true;
+                        Log("[mirror] %s: salto%d '%s' falhou (off=0x%X, base=%p)",
+                            m.label, h + 1, hf ? hf : "?", got, base);
+                        MnyDumpObj(base, m.cls, 40);
+                    }
+                    break;
                 }
                 base = mid;
             }
+            if (hopFail) continue;
 
-            uint32_t off = MnyOffExact(base, m.fld);
-            if (!off && m.fldKey) off = MnyOffKey(base, m.fldKey);
-            if (!off) {
-                Log("[mirror] %s: campo '%s' nao achado", m.label, m.fld);
-                MnyDumpObj(base, m.label, 48);
+            bool isStatic = false;
+            FieldInfo* f = MnyFindField(base, m.fld, m.fldKey, isStatic);
+            if (!f) {
+                if (!m.logged) {
+                    m.logged = true;
+                    Log("[mirror] %s: campo '%s' nao achado", m.label, m.fld);
+                    MnyDumpObj(base, m.label, 48);
+                }
                 continue;
             }
-            m.base = base; m.off = off; m.ok = true;
+
+            const Il2CppType* ft = il2cpp_field_get_type(f);
+            const char* ftn = ft ? TN(ft) : nullptr;
+            m.typeName = (ftn && ftn[0]) ? ftn : "?";
+            if (ftn) {
+                if (strstr(ftn, "ObscuredInt"))      m.kind = 1;
+                else if (strstr(ftn, "Int64"))       m.kind = 2;
+                else if (strstr(ftn, "Int32"))       m.kind = 0;
+                if (strstr(ftn, "String")) {
+                    if (!m.logged) { m.logged = true; Log("[mirror] %s: campo e' String (%s)", m.label, ftn); }
+                }
+            }
+
+            m.sf = f; m.isStatic = isStatic;
+            if (!isStatic) { m.base = base; m.off = (uint32_t)il2cpp_field_get_offset(f); }
+            m.ok = true;
             ++ok;
         }
         if (ok == g_mnyN) g_mnyDone = true;
-        if (ok != g_mnyLastOk) {                // nao spamma o log a cada 2s
+        if (ok != g_mnyLastOk) {
             g_mnyLastOk = ok;
             Log("[mirror] %d/%d espelhos resolvidos", ok, g_mnyN);
+            for (int i = 0; i < g_mnyN; ++i) {
+                const MnyMirror& mm = g_mny[i];
+                if (!mm.ok) continue;
+                Log("[mirror]   [%d] %s -> %s::%s tipo=%s kind=%d%s",
+                    i, mm.label, mm.cls, mm.fld, mm.typeName ? mm.typeName : "?",
+                    mm.kind, mm.isStatic ? " [static]" : "");
+            }
         }
     }
 
     static long long MnyRead(const MnyMirror& m) {
-        if (!m.ok || !m.base || !m.off) return 0;
+        if (!m.ok || !m.sf) return 0;
+        if (m.kind == 2) {
+            if (m.isStatic) { long long v = 0; StaticGetRaw(m.sf, &v, sizeof(v)); return v; }
+            return SafeRead<long long>((uintptr_t)m.base + m.off, 0);
+        }
+        if (m.isStatic) {
+            if (m.kind == 0) { int v = 0; StaticGetInt(m.sf, &v); return (long long)v; }
+            unsigned char buf[64]; memset(buf, 0, sizeof(buf));
+            if (!StaticGetRaw(m.sf, buf, sizeof(buf))) return 0;
+            int key = 0, hid = 0;
+            memcpy(&key, buf + 0, 4); memcpy(&hid, buf + 4, 4);
+            return (long long)(int)(hid ^ key);
+        }
         uintptr_t a = (uintptr_t)m.base + m.off;
         if (m.kind == 0) return (long long)SafeRead<int>(a, 0);
         const int key = SafeRead<int>(a + 0, 0);
@@ -432,14 +572,29 @@ namespace Unlock {
     }
 
     static void MnyWriteOne(MnyMirror& m, long long v) {
-        if (!m.ok || !m.base || !m.off) return;
-        uintptr_t a = (uintptr_t)m.base + m.off;
+        if (!m.ok || !m.sf) return;
+        if (m.kind == 2) {
+            if (m.isStatic) { StaticSetRaw(m.sf, &v, sizeof(v)); return; }
+            SafeWrite<long long>((uintptr_t)m.base + m.off, v);
+            return;
+        }
         const int iv = (int)v;
+        if (m.isStatic) {
+            if (m.kind == 0) { StaticSetInt(m.sf, iv, 0); return; }
+            unsigned char buf[64]; memset(buf, 0, sizeof(buf));
+            StaticGetRaw(m.sf, buf, sizeof(buf));
+            int key = 0; memcpy(&key, buf + 0, 4);
+            int hid = iv ^ key; int one = 1;
+            memcpy(buf + 4, &hid, 4); memcpy(buf + 8, &iv, 4); memcpy(buf + 0xC, &one, 4);
+            StaticSetRaw(m.sf, buf, sizeof(buf));
+            return;
+        }
+        uintptr_t a = (uintptr_t)m.base + m.off;
         if (m.kind == 0) { SafeWrite<int>(a, iv); return; }
         const int key = SafeRead<int>(a + 0, 0);
-        SafeWrite<int>(a + 4, iv ^ key);   // ObscuredInt: +0 key, +4 hidden
-        SafeWrite<int>(a + 8, iv);         //               +8 fake
-        SafeWrite<int>(a + 0xC, 1);        //               +0xC inited
+        SafeWrite<int>(a + 4, iv ^ key);
+        SafeWrite<int>(a + 8, iv);
+        SafeWrite<int>(a + 0xC, 1);
     }
 
     static bool MnyMatch(const MnyMirror& m, const char* cls, const char* fld) {
@@ -465,20 +620,73 @@ namespace Unlock {
         return (C.currencyValue > 0) ? (long long)C.currencyValue : 999999LL;
     }
 
+    static void SyncCfg() {
+        C.aimVisOnly = C.aimVisible;
+        C.espDist = C.espMaxDist;
+        C.espFov = C.camFov;
+        C.fovCircle = C.showFovCircle;
+        C.trigKey = C.triggerKey;
+        C.trigDelay = C.triggerDelay;
+        C.trigFov = C.aimFov;
+        C.fovCircleSize = C.crosshairSize;
+    }
+
+    // =========================================================================
+    //  JSON da conta
+    // =========================================================================
+    static long long g_accMoney = -1, g_accGold = -1, g_accXp = -1;
+
+    static bool AccountJson(char* out, size_t n) {
+        if (!out || !n) return false;
+        out[0] = 0;
+        Il2CppClass* ak = SDK::FindClass("AccountManager");
+        if (!ak) return false;
+        void* am = StaticInstanceOf(ak);
+        if (!LooksLikeObj(am)) return false;
+        uint32_t off = MnyOffExact(am, "EIMOMMHLNPO");
+        if (!off) off = kAmJson;
+        void* s = SafeRead<void*>((uintptr_t)am + off, nullptr);
+        if (!LooksLikeObj(s)) return false;
+        CStr(s, out, n);
+        return out[0] != 0;
+    }
+
+    static bool JsonNum(const char* js, const char* key, long long* out) {
+        if (!js || !key || !out) return false;
+        char pat[48];
+        sprintf_s(pat, sizeof(pat), "\"%s\":", key);
+        const char* p = strstr(js, pat);
+        if (!p) return false;
+        p += strlen(pat);
+        while (*p == ' ' || *p == '\t') ++p;
+        bool neg = false;
+        if (*p == '-') { neg = true; ++p; }
+        if (*p < '0' || *p > '9') return false;
+        long long v = 0;
+        while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); ++p; }
+        *out = neg ? -v : v;
+        return true;
+    }
+
+    static void AccountJsonRefresh() {
+        char js[4096]; js[0] = 0;
+        if (!AccountJson(js, sizeof(js))) return;
+        long long v = 0;
+        if (JsonNum(js, "money", &v)) g_accMoney = v;
+        if (JsonNum(js, "gold", &v)) g_accGold = v;
+        if (JsonNum(js, "xp", &v)) g_accXp = v;
+    }
+
+    long long MoneyReal() {
+        AccountJsonRefresh();
+        return g_accMoney;
+    }
+
     // =========================== API publica da carteira =====================
     int MoneyCount() { return g_mnyN; }
-
-    const char* MoneyName(int idx) {
-        return MnyIn(idx) ? g_mny[idx].label : "";
-    }
-
-    bool MoneyLocked(int idx) {
-        return MnyIn(idx) ? g_mny[idx].lock : false;
-    }
-
-    void MoneySetLock(int idx, bool on) {
-        if (MnyIn(idx)) g_mny[idx].lock = on;
-    }
+    const char* MoneyName(int idx) { return MnyIn(idx) ? g_mny[idx].label : ""; }
+    bool MoneyLocked(int idx) { return MnyIn(idx) ? g_mny[idx].lock : false; }
+    void MoneySetLock(int idx, bool on) { if (MnyIn(idx)) g_mny[idx].lock = on; }
 
     long long MoneyValue(int idx) {
         if (!MnyIn(idx)) return 0;
@@ -490,7 +698,7 @@ namespace Unlock {
         if (!MnyIn(idx)) return;
         MnyResolve();
         MnyWriteOne(g_mny[idx], value);
-        Log("[mirror] %s <- %lld", g_mny[idx].label, value);
+        Log("[mirror] %s <- %lld (leitura: %lld)", g_mny[idx].label, value, MnyRead(g_mny[idx]));
     }
 
     void MoneyRefresh() {
@@ -516,6 +724,7 @@ namespace Unlock {
             m.lock = true;
             MnyWriteOne(m, value);
             ++n;
+            Log("[mirror]   %s = %lld | leitura=%lld", m.label, value, MnyRead(m));
         }
         Log("[mirror] LockByName(\"%s\", \"%s\", %lld): %d espelho(s)",
             cls ? cls : "", field ? field : "", value, n);
@@ -533,8 +742,7 @@ namespace Unlock {
             MnyWriteOne(m, value);
             ++n;
         }
-        Log("[mirror] ForceMirrors(%lld, mode=%lld): %d/%d escritos",
-            value, mode, n, g_mnyN);
+        Log("[mirror] ForceMirrors(%lld, mode=%lld): %d/%d escritos", value, mode, n, g_mnyN);
         return n;
     }
 
@@ -546,7 +754,7 @@ namespace Unlock {
 
     void ShopForceAll() {
         const long long gold = (C.accGold > 0) ? (long long)C.accGold : MnyCfgValue();
-        const long long cases = (C.accCases > 0) ? (long long)C.accCases : 500LL;
+        const long long cases = (C.accCases > 0) ? (long long)C.accCases : gold;
         MoneyLockByName("AccountManager", "GEEFAPKBHJO", gold);
         MoneyLockByName("CamoCaseManager", "goldCases", cases);
         MoneyLockByName("LoadoutManager", "goldAmount", gold);
@@ -573,7 +781,7 @@ namespace Unlock {
                 if (!f) break;
                 if (IsStatic(f)) continue;
                 const Il2CppType* t = il2cpp_field_get_type(f);
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                const char* tn = TN(t);
                 if (!tn || !strstr(tn, typeKey)) continue;
                 uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
                 if (off) return off;
@@ -593,7 +801,7 @@ namespace Unlock {
                 if (!f) break;
                 if (IsStatic(f)) continue;
                 const Il2CppType* t = il2cpp_field_get_type(f);
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                const char* tn = TN(t);
                 if (!tn || !strstr(tn, "[]")) continue;
                 uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
                 if (!off) continue;
@@ -703,7 +911,7 @@ namespace Unlock {
                 if (!f) break;
                 if (IsStatic(f)) continue;
                 const Il2CppType* t = il2cpp_field_get_type(f);
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                const char* tn = TN(t);
                 if (!tn) continue;
                 char tl[64]; Lower(tl, sizeof(tl), tn);
                 if (strstr(tl, "[]")) continue;
@@ -759,7 +967,7 @@ namespace Unlock {
     static void AddCandField(int kind, void* instBase, void* basePtr, FieldInfo* baseF,
         FieldInfo* f, const char* cls, bool isStaticScope) {
         const Il2CppType* t = il2cpp_field_get_type(f);
-        const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+        const char* tn = TN(t);
         const char* fn = il2cpp_field_get_name(f);
         if (!tn || !fn) return;
         char tl[96]; Lower(tl, sizeof(tl), tn);
@@ -842,7 +1050,7 @@ namespace Unlock {
                     if (!f) break;
                     if (!IsStatic(f)) continue;
                     const Il2CppType* t = il2cpp_field_get_type(f);
-                    const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                    const char* tn = TN(t);
                     if (!tn) continue;
                     if (strstr(tn, "[]") || strstr(tn, "List<")) continue;
                     if (!strstr(tn, cn)) continue;
@@ -917,7 +1125,7 @@ namespace Unlock {
                     if (!f) break;
                     if (!IsStatic(f)) continue;
                     const Il2CppType* t = il2cpp_field_get_type(f);
-                    const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                    const char* tn = TN(t);
                     if (!tn) continue;
                     const bool isArr = (strstr(tn, "[]") != nullptr);
                     if (!isArr && !nameHit) continue;
@@ -1107,7 +1315,7 @@ namespace Unlock {
                 if (!f) break;
                 if (IsStatic(f)) continue;
                 const Il2CppType* t = il2cpp_field_get_type(f);
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                const char* tn = TN(t);
                 if (!tn || (!strstr(tn, "Int32") && !strstr(tn, "Int64"))) continue;
                 const char* fn = il2cpp_field_get_name(f);
                 if (!fn) continue;
@@ -1129,14 +1337,361 @@ namespace Unlock {
             for (int i = 0; i < g_rankN; ++i) SafeWrite<int>(p + g_rankOff[i], C.unlockLevel);
     }
 
+    // =========================================================================
+    //  EQUIP POR SLOT (LoadoutManager)
+    // =========================================================================
+    static MethodInfo* g_mEquipPrim = nullptr;
+    static MethodInfo* g_mEquipSec = nullptr;
+    static MethodInfo* g_mEquipGad = nullptr;
     static MethodInfo* g_mEquip = nullptr;
+    static MethodInfo* g_mEquipForce = nullptr;
+    static void* g_equipForceObj = nullptr;
+
     static bool        g_equipResolved = false;
+    static bool        g_equipDumped = false;
+    static bool        g_equipMgrWarned = false;
+    static bool        g_equipSlotWarned = false;
     static int         g_lastEquip = -2;
+    static int         g_lastEquipSlot = -2;
+
+    static const char* kEquipForceClass = "";
+    static const char* kEquipForceName = "";
+    static const int   kEquipForceArgc = -1;
+
+    typedef uint32_t(*fn_epParamCount)(const MethodInfo*);
+    typedef const Il2CppType* (*fn_epParam)(const MethodInfo*, uint32_t);
+    typedef MethodInfo* (*fn_class_get_methods)(Il2CppClass*, void**);
+    typedef const char* (*fn_method_get_name)(const MethodInfo*);
+    typedef uint32_t(*fn_method_get_flags)(const MethodInfo*, uint32_t*);
+    static fn_epParamCount p_epParamCount = nullptr;
+    static fn_epParam      p_epParam = nullptr;
+    static fn_class_get_methods p_classGetMethods = nullptr;
+    static fn_method_get_name   p_methodGetName = nullptr;
+    static fn_method_get_flags  p_methodGetFlags = nullptr;
+
+    static void ResolveEquipProcs() {
+        static bool done = false;
+        if (done) return;
+        done = true;
+        HMODULE ga = GetModuleHandleA("GameAssembly.dll");
+        if (!ga) return;
+        p_epParamCount = (fn_epParamCount)GetProcAddress(ga, "il2cpp_method_get_param_count");
+        p_epParam = (fn_epParam)GetProcAddress(ga, "il2cpp_method_get_param");
+        p_classGetMethods = (fn_class_get_methods)GetProcAddress(ga, "il2cpp_class_get_methods");
+        p_methodGetName = (fn_method_get_name)GetProcAddress(ga, "il2cpp_method_get_name");
+        p_methodGetFlags = (fn_method_get_flags)GetProcAddress(ga, "il2cpp_method_get_flags");
+    }
+
+    static bool MethodIsStatic(MethodInfo* m) {
+        if (!m || !p_methodGetFlags) return false;
+        uint32_t fl = 0;
+        __try { fl = p_methodGetFlags(m, nullptr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { fl = 0; }
+        return (fl & 0x10) != 0;
+    }
+
+    static void* StaticInstanceOf(Il2CppClass* k) {
+        if (!k) return nullptr;
+        static const char* nm[] = { "Instance", "instance", "singleton", "Singleton", "s_instance" };
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+            for (size_t i = 0; i < sizeof(nm) / sizeof(nm[0]); ++i) {
+                FieldInfo* f = il2cpp_class_get_field_from_name(c, nm[i]);
+                if (!f || !IsStatic(f)) continue;
+                void* o = nullptr; StaticGetSafe(f, &o);
+                if (LooksLikeObj(o)) return o;
+            }
+        }
+        return nullptr;
+    }
+
+    static void* LoadoutMgr() {
+        static void* cached = nullptr;
+        if (LooksLikeObj(cached)) return cached;
+        Il2CppClass* k = SDK::FindClass("LoadoutManager");
+        if (!k) return nullptr;
+        void* o = StaticInstanceOf(k);
+        if (!o) {
+            FieldInfo* f = il2cpp_class_get_field_from_name(k, "Instance");
+            if (f && IsStatic(f)) StaticGetSafe(f, &o);
+        }
+        if (!LooksLikeObj(o)) {
+            if (!g_equipMgrWarned) { g_equipMgrWarned = true; Log("[unlock] LoadoutMgr() AUSENTE (cls=%p)", (void*)k); }
+            return nullptr;
+        }
+        cached = o;
+        if (!g_equipMgrWarned) { g_equipMgrWarned = true; Log("[unlock] LoadoutMgr() = %p", o); }
+        return cached;
+    }
+
+    static MethodInfo* FindMethodAnyArgc(Il2CppClass* k, const char* name,
+        int argcMin, int argcMax) {
+        if (!k || !name) return nullptr;
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+            for (int a = argcMin; a <= argcMax; ++a) {
+                MethodInfo* m = il2cpp_class_get_method_from_name(c, name, a);
+                if (m) return m;
+            }
+        }
+        return nullptr;
+    }
+
+    static bool EquipParamOk(const Il2CppType* t) {
+        if (!t) return false;
+        const char* tn = TN(t);
+        if (!tn) return false;
+        if (strstr(tn, "Int32") || strstr(tn, "Byte") || strstr(tn, "Int16") ||
+            strstr(tn, "SByte") || strstr(tn, "UInt16") || strstr(tn, "UInt32"))
+            return true;
+        if (p_classFromType && p_isValue) {
+            Il2CppClass* k = p_classFromType(t);
+            if (k && p_isValue(k)) return true;
+        }
+        return false;
+    }
+
+    static bool EquipIsEnumParam(const Il2CppType* t) {
+        if (!t || !p_classFromType || !p_isValue) return false;
+        Il2CppClass* k = p_classFromType(t);
+        return (k && p_isValue(k));
+    }
+
+    static bool EquipNameKnown(const char* n) {
+        if (!n) return false;
+        static const char* list[] = {
+            "serverSetWeapon", "rpcSetWeapon", "setWeaponType", "setWeapon",
+            "equipWeapon", "changeWeapon", "setCurrentWeapon", "cmdSetWeapon",
+            "serverChangeWeapon", "selectWeapon", "setLoadoutWeapon", "setGun",
+            "serverSetLoadout", "applyLoadout", "setClassWeapon", "setPrimary",
+            "setSecondary", "setGadget", "setGunAsPrimary", "setGunAsSecondary",
+            "setAsGadget", "equip", "setIndex", "setWeaponIndex"
+        };
+        char l[96]; Lower(l, sizeof(l), n);
+        for (size_t i = 0; i < sizeof(list) / sizeof(list[0]); ++i)
+            if (HasWord(l, list[i])) return true;
+        return false;
+    }
+
+    static bool EquipNameBlacklisted(const char* n) {
+        if (!n) return true;
+        static const char* bad[] = {
+            "finalize","tostring","gethashcode","equals","compareto","gettype",
+            "startcoroutine","invoke","getcomponent","setactive","setenabled",
+            "getenabled","awake","update","lateupdate","fixedupdate","start",
+            "get_","set_",".ctor","gethit","sethit"
+        };
+        char l[96]; Lower(l, sizeof(l), n);
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
+            if (HasWord(l, bad[i])) return true;
+        return false;
+    }
+
+    static int EquipNameScore(const char* n) {
+        if (!n) return -999;
+        char l[96]; Lower(l, sizeof(l), n);
+        int s = 0;
+        static const char* good[] = {
+            "setweapon","equipweapon","selectweapon","changeweapon","switchweapon",
+            "applyweapon","setcurrentweapon","setloadout","setgun","setclassweapon",
+            "setprimary","setsecondary","setgadget","useweapon","equip"
+        };
+        for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); ++i)
+            if (strstr(l, good[i])) s += 100;
+        if (strstr(l, "weapon")) s += 20;
+        if (strstr(l, "gun"))    s += 15;
+        if (strstr(l, "slot"))   s += 10;
+        if (strstr(l, "type"))   s += 5;
+        if (strstr(l, "index"))  s += 5;
+        if (!strcmp(l, "setgunasprimary"))   s += 220;
+        if (!strcmp(l, "setgunassecondary")) s += 210;
+        if (!strcmp(l, "setasgadget"))       s += 200;
+        if (strstr(l, "available")) s -= 45;
+        if (strstr(l, "sight"))     s -= 30;
+        if (strstr(l, "barrel"))    s -= 30;
+        if (strstr(l, "accessor"))  s -= 30;
+        if (strstr(l, "tracer"))    s -= 25;
+        if (strstr(l, "camo"))      s -= 25;
+        if (strstr(l, "ammo"))      s -= 30;
+        if (strstr(l, "object"))    s -= 20;
+        if (strstr(l, "stats"))     s -= 25;
+        if (!strncmp(l, "is", 2))  s -= 40;
+        if (!strncmp(l, "get", 3)) s -= 35;
+        if (!strncmp(l, "has", 3)) s -= 30;
+        if (!strncmp(l, "can", 3)) s -= 30;
+        if (!strncmp(l, "should", 6)) s -= 30;
+        if (!strncmp(l, "need", 4)) s -= 25;
+        return s;
+    }
+
+    struct EquipCand { MethodInfo* m; const char* name; int score; uint32_t np; };
+
+    static int CollectEquipCands(Il2CppClass* k, EquipCand* out, int max,
+        const char* wantType, bool allowPred) {
+        if (!k || !p_classGetMethods || !p_epParamCount || !p_epParam) return 0;
+        int n = 0;
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+            void* it = nullptr;
+            for (;;) {
+                MethodInfo* m = p_classGetMethods(c, &it);
+                if (!m) break;
+                const uint32_t np = p_epParamCount(m);
+                if (np < 1 || np > 3) continue;
+
+                bool hasWant = false, allOk = true;
+                for (uint32_t i = 0; i < np; ++i) {
+                    const Il2CppType* pt = p_epParam(m, i);
+                    if (!EquipParamOk(pt)) allOk = false;
+                    if (wantType && pt && p_classFromType) {
+                        Il2CppClass* pk = p_classFromType(pt);
+                        if (pk && strcmp(il2cpp_class_get_name(pk), wantType) == 0) hasWant = true;
+                    }
+                }
+                if (!hasWant || !allOk) continue;
+
+                const char* mn = p_methodGetName ? p_methodGetName(m) : "?";
+                const int sc = EquipNameScore(mn);
+                if (!allowPred && sc < 0) continue;
+                if (n < max) { out[n].m = m; out[n].name = mn; out[n].score = sc; out[n].np = np; }
+                ++n;
+            }
+        }
+        return n;
+    }
+
+    static void DumpEquipCandidates(Il2CppClass* k) {
+        if (!k || !p_classGetMethods || !p_methodGetName || !p_epParamCount || !p_epParam) return;
+        Log("[equip] ===== %s =====", il2cpp_class_get_name(k));
+        int shown = 0;
+        void* it = nullptr;
+        for (;;) {
+            MethodInfo* m = p_classGetMethods(k, &it);
+            if (!m) break;
+            const uint32_t np = p_epParamCount(m);
+            if (np < 1 || np > 3) continue;
+
+            bool hasEnum = false, allOk = true;
+            char pb[192] = "";
+            for (uint32_t i = 0; i < np; ++i) {
+                const Il2CppType* pt = p_epParam(m, i);
+                if (EquipIsEnumParam(pt)) hasEnum = true;
+                if (!EquipParamOk(pt)) allOk = false;
+                const char* pn = "?";
+                if (pt && p_classFromType) {
+                    Il2CppClass* pk = p_classFromType(pt);
+                    if (pk) pn = il2cpp_class_get_name(pk);
+                }
+                strncat_s(pb, sizeof(pb), pn, _TRUNCATE);
+                if (i + 1 < np) strncat_s(pb, sizeof(pb), ",", _TRUNCATE);
+            }
+            if (!hasEnum) continue;
+            const char* mn = p_methodGetName(m);
+            Log("[equip]   score=%4d %s argc=%u%s%s (%s)",
+                EquipNameScore(mn), mn, np,
+                allOk ? "" : " *", EquipNameKnown(mn) ? " [nome-ok]" : "", pb);
+            if (++shown >= 48) break;
+        }
+        if (!shown) Log("[equip]   (nenhum metodo com enum/valuetype)");
+    }
+
+    static void DumpEquipAllClasses() {
+        static const char* cls[] = {
+            "PlayerScript", "LoadoutManager", "LoadoutGuns",
+            "FirstPersonGunView", "GunCustomizeScript", "PlayerLoadoutContainer"
+        };
+        for (size_t i = 0; i < sizeof(cls) / sizeof(cls[0]); ++i) {
+            Il2CppClass* k = SDK::FindClass(cls[i]);
+            if (k) DumpEquipCandidates(k);
+        }
+    }
+
+    static MethodInfo* FindEquipLoose(Il2CppClass* k) {
+        if (!k || !p_classGetMethods || !p_epParam || !p_epParamCount) return nullptr;
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+            void* it = nullptr;
+            for (;;) {
+                MethodInfo* m = p_classGetMethods(c, &it);
+                if (!m) break;
+                const uint32_t np = p_epParamCount(m);
+                if (np < 1 || np > 3) continue;
+                const char* mn = p_methodGetName ? p_methodGetName(m) : "";
+                if (EquipNameBlacklisted(mn)) continue;
+                bool hasEnum = false, allOk = true;
+                for (uint32_t i = 0; i < np; ++i) {
+                    const Il2CppType* pt = p_epParam(m, i);
+                    if (EquipIsEnumParam(pt)) hasEnum = true;
+                    if (!EquipParamOk(pt)) allOk = false;
+                }
+                if (hasEnum && allOk) return m;
+            }
+        }
+        return nullptr;
+    }
+
+    static void ResolveSlotEquipNames(Il2CppClass* lm) {
+        if (!lm) return;
+        static const char* primNames[] = { "SetGunAsPrimary", "SetPrimary", "SetPrimaryGun" };
+        static const char* secNames[] = { "SetGunAsSecondary", "SetSecondary", "SetSecondaryGun" };
+        static const char* gadNames[] = { "SetAsGadget", "SetGadget", "SetGunAsGadget", "EquipGadget" };
+        for (size_t i = 0; i < sizeof(primNames) / sizeof(primNames[0]) && !g_mEquipPrim; ++i)
+            g_mEquipPrim = FindMethodAnyArgc(lm, primNames[i], 1, 2);
+        for (size_t i = 0; i < sizeof(secNames) / sizeof(secNames[0]) && !g_mEquipSec; ++i)
+            g_mEquipSec = FindMethodAnyArgc(lm, secNames[i], 1, 2);
+        for (size_t i = 0; i < sizeof(gadNames) / sizeof(gadNames[0]) && !g_mEquipGad; ++i)
+            g_mEquipGad = FindMethodAnyArgc(lm, gadNames[i], 1, 2);
+    }
 
     static void ResolveEquipMethod() {
         if (g_equipResolved) return;
         g_equipResolved = true;
         if (!SDK::kPlayerScript) return;
+        ResolveEquipProcs();
+
+        if (kEquipForceName && kEquipForceName[0]) {
+            Il2CppClass* fk = (kEquipForceClass && kEquipForceClass[0])
+                ? SDK::FindClass(kEquipForceClass) : SDK::kPlayerScript;
+            if (fk) {
+                MethodInfo* m = nullptr;
+                if (kEquipForceArgc >= 0)
+                    m = il2cpp_class_get_method_from_name(fk, kEquipForceName, kEquipForceArgc);
+                else
+                    for (int a = 1; a <= 4 && !m; ++a)
+                        m = il2cpp_class_get_method_from_name(fk, kEquipForceName, a);
+                if (m) {
+                    g_mEquipForce = m;
+                    const bool st = MethodIsStatic(m);
+                    g_equipForceObj = st ? nullptr : StaticInstanceOf(fk);
+                    if (!st && !g_equipForceObj && fk == SDK::kPlayerScript)
+                        g_equipForceObj = SDK::g_localPlayer;
+                    Log("[unlock] equip: %s::%s argc=%u (FORCADO%s)",
+                        il2cpp_class_get_name(fk), kEquipForceName,
+                        p_epParamCount ? p_epParamCount(m) : 0, st ? ", static" : "");
+                    return;
+                }
+            }
+            Log("[unlock] equip: forca \"%s::%s\" NAO achou, seguindo automatico",
+                kEquipForceClass, kEquipForceName);
+        }
+
+        Il2CppClass* lm = SDK::FindClass("LoadoutManager");
+        ResolveSlotEquipNames(lm);
+        if (g_mEquipPrim || g_mEquipSec || g_mEquipGad) {
+            Log("[unlock] equip POR SLOT: primary=%s secondary=%s gadget=%s (LoadoutManager)",
+                g_mEquipPrim ? "OK" : "-", g_mEquipSec ? "OK" : "-", g_mEquipGad ? "OK" : "-");
+            for (int s = 0; s < 3; ++s) {
+                MethodInfo* m = (s == 0) ? g_mEquipPrim : (s == 1) ? g_mEquipSec : g_mEquipGad;
+                if (!m) continue;
+                Log("[unlock]   slot%d: %s argc=%u %s", s,
+                    p_methodGetName ? p_methodGetName(m) : "?",
+                    p_epParamCount ? p_epParamCount(m) : 0,
+                    MethodIsStatic(m) ? "[static]" : "[inst]");
+            }
+            if (!g_mEquip) g_mEquip = g_mEquipPrim ? g_mEquipPrim
+                : (g_mEquipSec ? g_mEquipSec : g_mEquipGad);
+            Log("[unlock] equip fallback = %s (%s)",
+                g_mEquip ? (p_methodGetName ? p_methodGetName(g_mEquip) : "?") : "-",
+                MethodIsStatic(g_mEquip) ? "static" : "inst");
+            return;
+        }
+
         static const char* names[] = {
             "ServerSetWeapon", "RpcSetWeapon", "SetWeaponType", "SetWeapon",
             "EquipWeapon", "ChangeWeapon", "SetCurrentWeapon", "CmdSetWeapon",
@@ -1144,26 +1699,144 @@ namespace Unlock {
             "ServerSetLoadout", "ApplyLoadout", "SetClassWeapon", "SetPrimary",
             "SetSecondary", "SetGadget", "Equip", "SetIndex", "SetWeaponIndex"
         };
+
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !g_mEquip; ++i) {
             for (Il2CppClass* c = SDK::kPlayerScript; c && !g_mEquip; c = il2cpp_class_get_parent(c)) {
-                for (int argc = 1; argc <= 2 && !g_mEquip; ++argc) {
+                for (int argc = 1; argc <= 3 && !g_mEquip; ++argc) {
                     MethodInfo* m = il2cpp_class_get_method_from_name(c, names[i], argc);
-                    if (m) { g_mEquip = m; Log("[unlock] equip: %s argc=%d", names[i], argc); }
+                    if (!m) continue;
+                    bool ok = true;
+                    for (int a = 0; a < argc && ok; ++a) {
+                        const Il2CppType* pt = p_epParam ? p_epParam(m, (uint32_t)a) : nullptr;
+                        if (!EquipParamOk(pt)) ok = false;
+                    }
+                    if (ok) { g_mEquip = m; Log("[unlock] equip: %s argc=%d", names[i], argc); }
                 }
             }
         }
+        if (!g_mEquip) {
+            for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !g_mEquip; ++i) {
+                for (Il2CppClass* c = SDK::kPlayerScript; c && !g_mEquip; c = il2cpp_class_get_parent(c)) {
+                    for (int argc = 1; argc <= 2 && !g_mEquip; ++argc) {
+                        MethodInfo* m = il2cpp_class_get_method_from_name(c, names[i], argc);
+                        if (m) { g_mEquip = m; Log("[unlock] equip: %s argc=%d (fallback)", names[i], argc); }
+                    }
+                }
+            }
+        }
+
+        if (!g_mEquip) {
+            if (!g_equipDumped) { g_equipDumped = true; DumpEquipAllClasses(); }
+
+            static const char* clsW[] = {
+                "PlayerScript", "LoadoutManager", "LoadoutGuns", "FirstPersonGunView"
+            };
+            static const char* want[] = {
+                "EFIPOFGCOKN", "WeaponType", "weaponType", "GunType", "EnumWeapon",
+                "Weapons", "GunTypeEnum", "WeaponEnum"
+            };
+            static EquipCand cands[128];
+            for (size_t ci = 0; ci < sizeof(clsW) / sizeof(clsW[0]) && !g_mEquip; ++ci) {
+                Il2CppClass* k = SDK::FindClass(clsW[ci]);
+                if (!k) continue;
+                for (size_t w = 0; w < sizeof(want) / sizeof(want[0]) && !g_mEquip; ++w) {
+                    int n = CollectEquipCands(k, cands, 128, want[w], false);
+                    if (n <= 0) n = CollectEquipCands(k, cands, 128, want[w], true);
+                    if (n <= 0) continue;
+                    if (n > 128) n = 128;
+
+                    int best = 0;
+                    for (int i = 1; i < n; ++i) if (cands[i].score > cands[best].score) best = i;
+
+                    g_mEquip = cands[best].m;
+                    Log("[unlock] equip: %s::%s argc=%u (pass3 classe=%s tipo \"%s\" score=%d, %d cands)",
+                        clsW[ci], cands[best].name, cands[best].np, clsW[ci], want[w],
+                        cands[best].score, n);
+                    for (int i = 0; i < n && i < 48; ++i)
+                        Log("[equip]   cand score=%4d %s argc=%u", cands[i].score, cands[i].name, cands[i].np);
+                }
+            }
+        }
+        if (!g_mEquip) {
+            MethodInfo* m = FindEquipLoose(SDK::kPlayerScript);
+            if (m) {
+                g_mEquip = m;
+                Log("[unlock] equip: %s argc=%u (pass3b candidato solto)",
+                    p_methodGetName ? p_methodGetName(m) : "?", p_epParamCount(m));
+            }
+        }
+        if (!g_mEquip) Log("[unlock] equip: nenhuma assinatura valida encontrada");
     }
 
-    static void CallEquip(int weaponIdx) {
-        if (!g_mEquip || !SDK::g_localPlayer) return;
-        union { int i; long long l; } v;
-        v.l = 0; v.i = weaponIdx;
-        void* args[2] = { &v, nullptr };
-        InvokeSafe(g_mEquip, SDK::g_localPlayer, args);
+    static void InvokeEquipOn(MethodInfo* m, void* obj, int slot, int weaponIdx, int weaponType) {
+        if (!m) return;
+        const uint32_t np = p_epParamCount ? p_epParamCount(m) : 1;
+        if (np == 0 || np > 8) return;
+
+        int   ibuf[8] = {};
+        void* refbuf[8] = {};
+        void* args[8] = {};
+
+        for (uint32_t i = 0; i < np; ++i) {
+            const Il2CppType* t = p_epParam ? p_epParam(m, i) : nullptr;
+            const char* tn = TN(t);
+            if (tn && strstr(tn, "Boolean")) { ibuf[i] = 1; args[i] = &ibuf[i]; }
+            else if (EquipIsEnumParam(t)) { ibuf[i] = weaponType; args[i] = &ibuf[i]; }
+            else if (tn && (strstr(tn, "Int32") || strstr(tn, "Byte") || strstr(tn, "Int16") ||
+                strstr(tn, "UInt16") || strstr(tn, "UInt32") || strstr(tn, "SByte"))) {
+                ibuf[i] = (i == 0) ? weaponIdx : slot;
+                args[i] = &ibuf[i];
+            }
+            else { refbuf[i] = nullptr; args[i] = &refbuf[i]; }
+        }
+        InvokeSafe(m, obj, args);
+    }
+
+    static void CallEquip(int slot, int weaponIdx, int weaponType) {
+        if (!SDK::g_localPlayer) return;
+        if (slot < 0) slot = 0;
+        if (slot > 2) slot = 2;
+
+        if (g_mEquipForce) {
+            InvokeEquipOn(g_mEquipForce, g_equipForceObj, slot, weaponIdx, weaponType);
+            Log("[unlock] equip FORCADO slot=%d idx=%d tipo=%d obj=%p",
+                slot, weaponIdx, weaponType, g_equipForceObj);
+            return;
+        }
+
+        MethodInfo* m = (slot == 0) ? g_mEquipPrim : (slot == 1) ? g_mEquipSec : g_mEquipGad;
+        if (m) {
+            const bool st = MethodIsStatic(m);
+            void* obj = st ? nullptr : LoadoutMgr();
+            if (st || obj) {
+                InvokeEquipOn(m, obj, slot, weaponIdx, weaponType);
+                Log("[unlock] equip POR SLOT: slot=%d metodo=%s argc=%u %s idx=%d tipo=%d obj=%p",
+                    slot, p_methodGetName ? p_methodGetName(m) : "?",
+                    p_epParamCount ? p_epParamCount(m) : 0,
+                    st ? "[static]" : "[inst]", weaponIdx, weaponType, obj);
+                return;
+            }
+            if (!g_equipSlotWarned) {
+                g_equipSlotWarned = true;
+                Log("[unlock] equip slot%d: %s sem instancia do LoadoutManager",
+                    slot, p_methodGetName ? p_methodGetName(m) : "?");
+            }
+        }
+
+        if (g_mEquip) {
+            const bool st = MethodIsStatic(g_mEquip);
+            void* o2 = nullptr;
+            if (!st) { o2 = LoadoutMgr(); if (!o2) o2 = SDK::g_localPlayer; }
+            InvokeEquipOn(g_mEquip, o2, slot, weaponIdx, weaponType);
+            Log("[unlock] equip FALLBACK: %s argc=%u slot=%d idx=%d tipo=%d obj=%p%s",
+                p_methodGetName ? p_methodGetName(g_mEquip) : "?",
+                p_epParamCount ? p_epParamCount(g_mEquip) : 0, slot, weaponIdx, weaponType,
+                o2, st ? " [static]" : "");
+        }
     }
 
     // =====================================================================
-    //  v24 — PlayerPrefs
+    //  PlayerPrefs
     // =====================================================================
     typedef void* (*fn_dom_get)();
     typedef const void** (*fn_dom_asms)(void*, size_t*);
@@ -1190,6 +1863,8 @@ namespace Unlock {
     static bool         g_ppOk = false;
     static bool         g_ppProbed = false;
     static int          g_ppRetry = 0;
+
+    static Il2CppClass* g_strCls = nullptr;
 
     static void* InvokeRet(MethodInfo* m, void* obj, void** args) {
         void* r = nullptr;
@@ -1245,7 +1920,7 @@ namespace Unlock {
         g_ppGetStr = il2cpp_class_get_method_from_name(g_ppCls, "GetString", 2);
         g_ppHasKey = il2cpp_class_get_method_from_name(g_ppCls, "HasKey", 1);
         g_ppSave = il2cpp_class_get_method_from_name(g_ppCls, "Save", 0);
-        g_ppOk = (g_ppSetInt && g_ppGetInt && g_ppGetStr);
+        g_ppOk = (g_ppSetInt && g_ppGetInt && g_ppSetStr);
         Log("[p] PlayerPrefs=%p setInt=%p getInt=%p setStr=%p getStr=%p hasKey=%p save=%p -> %s",
             (void*)g_ppCls, (void*)g_ppSetInt, (void*)g_ppGetInt, (void*)g_ppSetStr,
             (void*)g_ppGetStr, (void*)g_ppHasKey, (void*)g_ppSave, g_ppOk ? "OK" : "FALHOU");
@@ -1262,6 +1937,30 @@ namespace Unlock {
             strstr(low, "primary") || strstr(low, "secondary") || strstr(low, "gadget") ||
             strstr(low, "gun") || strstr(low, "index") || strstr(low, "camo") ||
             strstr(low, "skin") || strstr(low, "class") || strstr(low, "type");
+    }
+
+    static bool PrefIsPrefix(const char* k) {
+        if (!k) return true;
+        const size_t n = strlen(k);
+        if (!n) return true;
+        if (k[0] == '_' || k[n - 1] == '_') return true;
+        if (strchr(k, '/') || strchr(k, '.')) return true;
+        return false;
+    }
+
+    static bool PrefClassRelevant(const char* name) {
+        if (!name || !name[0]) return false;
+        static const char* w[] = {
+            "pref","setting","config","stat","loadout","camo","skin","manager","client",
+            "deep","chat","popup","anim","page","weapon","gun","map","bot","game","script",
+            "data","profile","account","store","shop","save","slot","class","view",
+            "control","handler","service","util","table","menu","inventory","item",
+            "player","bf_","equip","unlock"
+        };
+        char l[96]; Lower(l, sizeof(l), name);
+        for (size_t i = 0; i < sizeof(w) / sizeof(w[0]); ++i)
+            if (strstr(l, w[i])) return true;
+        return false;
     }
 
     static void PpAdd(void* s, const char* field, const char* val) {
@@ -1281,6 +1980,10 @@ namespace Unlock {
 
         const ULONGLONG t0 = GetTickCount64();
         int logged = 0;
+        int clsSeen = 0, clsKept = 0, fldSeen = 0, strSeen = 0;
+
+        if (!g_strCls) g_strCls = SDK::FindClass("System.String");
+
         if (p_domGet && p_domAsms && p_asmImage && p_imgCnt && p_imgCls) {
             void* dom = p_domGet();
             size_t nAsm = 0;
@@ -1293,32 +1996,44 @@ namespace Unlock {
                 for (size_t i = 0; i < nc; ++i) {
                     Il2CppClass* k = p_imgCls(img, i);
                     if (!k) continue;
-                    for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
-                        void* it = nullptr;
-                        for (;;) {
-                            FieldInfo* f = il2cpp_class_get_fields(c, &it);
-                            if (!f) break;
-                            if (!IsStatic(f)) continue;
-                            const Il2CppType* t = il2cpp_field_get_type(f);
-                            if (!t) continue;
-                            const char* tn = il2cpp_type_get_name ? il2cpp_type_get_name(t) : nullptr;
-                            if (!tn || !strstr(tn, "String")) continue;
-                            const char* fn = il2cpp_field_get_name(f);
-                            if (!fn) continue;
-                            char fl[80]; Lower(fl, sizeof(fl), fn);
-                            void* s = nullptr; StaticGetSafe(f, &s);
-                            if (!LooksLikeObj(s)) continue;
-                            char v[96]; v[0] = 0; CStr(s, v, sizeof(v));
-                            if (!v[0] || strlen(v) > 80) continue;
-                            char vl[96]; Lower(vl, sizeof(vl), v);
-                            const bool nameHit = strstr(fl, "pref") || strstr(fl, "key");
-                            if (!nameHit && !PrefWord(vl)) continue;
-                            if (logged < 60) {
-                                Log("[p] chave %s::%s = \"%s\"", il2cpp_class_get_name(k), fn, v);
-                                ++logged;
-                            }
-                            PpAdd(s, fn, v);
+                    ++clsSeen;
+                    const char* kn = il2cpp_class_get_name(k);
+                    if (!PrefClassRelevant(kn)) continue;
+                    ++clsKept;
+
+                    void* it = nullptr;
+                    for (;;) {
+                        FieldInfo* f = il2cpp_class_get_fields(k, &it);
+                        if (!f) break;
+                        ++fldSeen;
+                        if (!IsStatic(f)) continue;
+                        const Il2CppType* t = il2cpp_field_get_type(f);
+                        if (!t) continue;
+
+                        if (p_classFromType && g_strCls) {
+                            if (p_classFromType(t) != g_strCls) continue;
                         }
+                        else {
+                            const char* tn = TN(t);
+                            if (!tn || !strstr(tn, "String") || strstr(tn, "[]")) continue;
+                        }
+                        ++strSeen;
+
+                        const char* fn = il2cpp_field_get_name(f);
+                        if (!fn) continue;
+                        char fl[80]; Lower(fl, sizeof(fl), fn);
+                        void* s = nullptr; StaticGetSafe(f, &s);
+                        if (!LooksLikeObj(s)) continue;
+                        char v[96]; v[0] = 0; CStr(s, v, sizeof(v));
+                        if (!v[0] || strlen(v) > 80) continue;
+                        char vl[96]; Lower(vl, sizeof(vl), v);
+                        const bool nameHit = strstr(fl, "pref") || strstr(fl, "key");
+                        if (!nameHit && !PrefWord(vl)) continue;
+                        if (logged < 60) {
+                            Log("[p] chave %s::%s = \"%s\"", il2cpp_class_get_name(k), fn, v);
+                            ++logged;
+                        }
+                        PpAdd(s, fn, v);
                     }
                 }
             }
@@ -1339,7 +2054,8 @@ namespace Unlock {
                 if (r) { Log("[p] LITERAL existe: \"%s\"", lit[i]); PpAdd(ks, lit[i], lit[i]); }
             }
         }
-        Log("[p] chaves de prefs uteis: %d (scan %llu ms)", g_ppKN, GetTickCount64() - t0);
+        Log("[p] chaves de prefs uteis: %d (scan %llu ms | cls %d/%d fld %d str %d)",
+            g_ppKN, GetTickCount64() - t0, clsKept, clsSeen, fldSeen, strSeen);
     }
 
     static void PrefsApply(int weaponType, void* nameStr) {
@@ -1362,7 +2078,10 @@ namespace Unlock {
 
         bool changed = false;
         for (int i = 0; i < g_ppKN; ++i) {
-            char kl[96]; Lower(kl, sizeof(kl), g_ppK[i].key);
+            const char* kk = g_ppK[i].key;
+            if (PrefIsPrefix(kk)) continue;
+
+            char kl[96]; Lower(kl, sizeof(kl), kk);
             if (!PrefWord(kl)) continue;
 
             int before = -777777;
@@ -1372,7 +2091,7 @@ namespace Unlock {
                 if (before != weaponType) {
                     int v = weaponType; void* a[2] = { g_ppK[i].str, &v };
                     InvokeRet(g_ppSetInt, nullptr, a);
-                    Log("[p] SETINT \"%s\" = %d (era %d)", g_ppK[i].key, weaponType, before);
+                    Log("[p] SETINT \"%s\" = %d (era %d)", kk, weaponType, before);
                     changed = true;
                 }
                 continue;
@@ -1388,7 +2107,7 @@ namespace Unlock {
                     if (nb[0] && _stricmp(cb, nb) != 0) {
                         void* a2[2] = { g_ppK[i].str, nameStr };
                         InvokeRet(g_ppSetStr, nullptr, a2);
-                        Log("[p] SETSTR \"%s\" = \"%s\" (era \"%s\")", g_ppK[i].key, nb, cb);
+                        Log("[p] SETSTR \"%s\" = \"%s\" (era \"%s\")", kk, nb, cb);
                         changed = true;
                     }
                 }
@@ -1397,9 +2116,8 @@ namespace Unlock {
         if (changed && g_ppSave) { void* a[1] = { nullptr }; InvokeRet(g_ppSave, nullptr, a); Log("[p] Save()"); }
     }
 
-    // =========================================================================
-    //  >>> v43 — prefs de dinheiro + tick da carteira
-    // =========================================================================
+    static int g_mnyPrefLastN = -1;
+
     void MoneyWritePrefs() {
         if (!ResolvePlayerPrefs()) return;
         if (g_ppKN <= 0) CollectPrefsKeys(true);
@@ -1407,6 +2125,7 @@ namespace Unlock {
         static const char* keys[] = { "gold", "money", "credit", "cash", "coin", "case", "caixa" };
         int n = 0;
         for (int i = 0; i < g_ppKN; ++i) {
+            if (PrefIsPrefix(g_ppK[i].key)) continue;
             char kl[96]; Lower(kl, sizeof(kl), g_ppK[i].key);
             bool hit = false;
             for (size_t q = 0; q < sizeof(keys) / sizeof(keys[0]) && !hit; ++q)
@@ -1418,7 +2137,10 @@ namespace Unlock {
             ++n;
         }
         if (n && g_ppSave) { void* a[1] = { nullptr }; InvokeRet(g_ppSave, nullptr, a); }
-        Log("[mirror] prefs: %d chave(s) escritas", n);
+        if (n != g_mnyPrefLastN) {
+            g_mnyPrefLastN = n;
+            Log("[mirror] prefs: %d chave(s) escritas", n);
+        }
     }
 
     static ULONGLONG g_mnyTickNext = 0;
@@ -1426,14 +2148,16 @@ namespace Unlock {
     static void MnyApplyLocks() {
         const long long cred = MnyCfgValue();
         const long long gold = (C.accGold > 0) ? (long long)C.accGold : cred;
-        const long long cases = (C.accCases > 0) ? (long long)C.accCases : 500LL;
+        const long long cases = (C.accCases > 0) ? (long long)C.accCases : gold;
 
         for (int i = 0; i < g_mnyN; ++i) {
             MnyMirror& m = g_mny[i];
             if (!m.ok || !m.lock) continue;
             long long v = cred;
-            if (strstr(m.cls, "CamoCase")) v = cases;
-            else if (m.kind == 0 && strstr(m.label, "gold")) v = gold;
+            if (strstr(m.cls, "CamoCase"))       v = cases;
+            else if (strstr(m.label, "gold"))    v = gold;
+            else if (strstr(m.label, "case"))    v = cases;
+            else if (strstr(m.label, "xp")) { if (C.unlockLevel <= 0) continue; v = (long long)C.unlockLevel; }
             MnyWriteOne(m, v);
         }
         if (!C.moneyOnlyWallet) {
@@ -1471,6 +2195,13 @@ namespace Unlock {
             SafeRead<int>((uintptr_t)SDK::g_localPlayer + kLoGad, -1),
             fv ? SafeRead<void*>((uintptr_t)fv + kFvHeld, nullptr) : nullptr,
             fv ? SafeRead<int>((uintptr_t)fv + kFvSlot, -1) : -1);
+        void* lm = LoadoutMgr();
+        if (lm) Log("[r] LM: currentGunType=%d sel1=%d sel2=%d sel3=%d activeLoadout=%d",
+            SafeRead<int>((uintptr_t)lm + kLmCurType, -1),
+            SafeRead<int>((uintptr_t)lm + kLmSel1, -1),
+            SafeRead<int>((uintptr_t)lm + kLmSel2, -1),
+            SafeRead<int>((uintptr_t)lm + kLmSel3, -1),
+            SafeRead<int>((uintptr_t)lm + kLmActive, -1));
         for (int i = 0; i < g_loCN; ++i) {
             const LoCand& c = g_loC[i];
             if (c.kind != 1 || c.type != 3) continue;
@@ -1492,7 +2223,15 @@ namespace Unlock {
         if (!g_dupeEnsured) { Dupe::EnsureLoaded(); g_dupeEnsured = true; }
 
         const int listIdx = C.selWeapon;
-        if (listIdx < 0 || listIdx >= Dupe::WeaponCount()) return;
+        const int wcount = Dupe::WeaponCount();
+        if (listIdx < 0 || listIdx >= wcount) {
+            static int lastN = -2;
+            if (wcount != lastN) {
+                lastN = wcount;
+                Log("[unlock] applySelection: armas=%d (aperte Build) selecao=%d", wcount, listIdx);
+            }
+            return;
+        }
 
         int slot = C.loadoutSlot;
         if (slot < 0) slot = 0;
@@ -1551,7 +2290,11 @@ namespace Unlock {
         }
 
         Log("[w] passo %d/%d: equip+prefs (fim)", g_selStep, total);
-        if (g_lastEquip != live) { g_lastEquip = live; CallEquip(live); }
+        if (g_lastEquip != live || g_lastEquipSlot != slot) {
+            g_lastEquip = live;
+            g_lastEquipSlot = slot;
+            CallEquip(slot, live, wtype);
+        }
         PrefsApply(wtype, nameStr);
         LogLoadoutReadback();
         g_selStep = -1;
@@ -1660,7 +2403,7 @@ namespace Unlock {
                     if (!f) break;
                     if (!IsStatic(f)) continue;
                     const Il2CppType* t = il2cpp_field_get_type(f);
-                    const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                    const char* tn = TN(t);
                     if (!tn || !strstr(tn, "String")) continue;
                     if (!strstr(tn, "[]") && !strstr(tn, "List<")) continue;
                     void* v = nullptr;
@@ -1718,6 +2461,7 @@ namespace Unlock {
         const int st = Dupe::Stage();
         Log("[dupe] etapa %d", st);
         switch (st) {
+        case 0: Dupe::SetStage(1); break;
         case 1: CollectWeapons(); Dupe::SetStage(2); break;
         case 2: CollectAttachs(); Dupe::SetStage(3); break;
         case 3: CollectCamos();   Dupe::SetStage(4); break;
@@ -1759,6 +2503,7 @@ namespace Unlock {
         ResolveLoadoutFields();
         ResolveEquipMethod();
         ResolvePlayerPrefs();
+        CollectPrefsKeys(false);
         Dupe::EnsureLoaded();
         g_dupeEnsured = true;
         g_installed = true;
@@ -1766,6 +2511,46 @@ namespace Unlock {
             BFI_UNLOCK_VER, g_offArr, g_arrLen,
             (int)Dupe::g_weapons.size(), (int)Dupe::g_camos.size(), (int)Dupe::g_chars.size());
         return true;
+    }
+
+    // >>> v43.16: BUILD numa chamada so (o botao da aba Dupe chama isto).
+    //     Nao depende da maquina de estagios nem da ordem do Tick.
+    void BuildAllNow() {
+        ResolveExtra();
+        Dupe::g_wantBuild.store(false);
+        Dupe::SetStage(0);
+
+        if (!SDK::g_localPlayer || !SDK::kPlayerScript || !SDK::kGunStats) {
+            Dupe::SetStatus("sem player - entre numa partida");
+            Log("[dupe] build direta: sem player");
+            return;
+        }
+        if (!g_installed || !g_arr || g_arrLen <= 0) {
+            if (!Install()) {
+                Dupe::SetStatus("sem armas - entre numa partida");
+                Log("[dupe] build direta: install falhou");
+                return;
+            }
+        }
+
+        __try {
+            Log("[dupe] build direta: inicio (arr len=%d)", g_arrLen);
+            CollectWeapons();
+            CollectAttachs();
+            CollectCamos();
+            CollectChars();
+            if (Dupe::Save())
+                Dupe::SetStatus("salvo: %d armas, %d camos, %d chars",
+                    (int)Dupe::g_weapons.size(), (int)Dupe::g_camos.size(), (int)Dupe::g_chars.size());
+            else
+                Dupe::SetStatus("falha ao salvar");
+            Log("[dupe] build direta: armas=%d camos=%d chars=%d",
+                (int)Dupe::g_weapons.size(), (int)Dupe::g_camos.size(), (int)Dupe::g_chars.size());
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            Dupe::SetStatus("erro na build direta");
+            Log("[dupe] build direta: EXCECAO");
+        }
     }
 
     static bool EnsureInstalled() {
@@ -1782,13 +2567,14 @@ namespace Unlock {
     }
 
     void Tick() {
+        SyncCfg();
+
         const bool anyMoney = C.accAuto || C.moneyApplyNow || C.moneyRescan || C.moneyWritePrefs;
         const bool any = C.unlockAll || C.unlockWeapons || C.unlockSkins || C.unlockAttachments ||
             C.unlockCurrency || C.unlockLevel || C.unlockChars || C.applySelection ||
             C.skinChanger || C.applySlots || C.fillLoadoutSlots || anyMoney;
         if (!any && !Dupe::Wants()) return;
 
-        // carteira: vale ate' no menu, nao depende do array de armas
         __try { MoneyTick(); }
         __except (EXCEPTION_EXECUTE_HANDLER) { Log("[unlock] AV contido no MoneyTick"); }
 
@@ -1817,7 +2603,7 @@ namespace Unlock {
                 FieldInfo* f = il2cpp_class_get_fields(c, &it);
                 if (!f) break;
                 const Il2CppType* t = il2cpp_field_get_type(f);
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : "?";
+                const char* tn = TN(t);
                 Log("[dump]   %s::%s %s @0x%X%s",
                     il2cpp_class_get_name(c), il2cpp_field_get_name(f), tn,
                     (unsigned)il2cpp_field_get_offset(f), IsStatic(f) ? " [static]" : "");
@@ -1828,6 +2614,7 @@ namespace Unlock {
     static void DumpObjFields(void* o, const char* tag, int maxFields) {
         if (!LooksLikeObj(o)) return;
         Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)o);
+        Log("[loja] %s: obj %p classe=%s", tag, o, k ? il2cpp_class_get_name(k) : "?");
         int n = 0;
         for (Il2CppClass* c = k; c && n < maxFields; c = il2cpp_class_get_parent(c)) {
             void* it = nullptr;
@@ -1837,49 +2624,161 @@ namespace Unlock {
                 if (IsStatic(f)) continue;
                 if (n++ >= maxFields) break;
                 const Il2CppType* t = il2cpp_field_get_type(f);
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : "?";
+                const char* tn = TN(t);
                 uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
                 if (!off) continue;
                 const char* fn = il2cpp_field_get_name(f);
                 char tl[96]; Lower(tl, sizeof(tl), tn);
                 if (strstr(tn, "String")) {
-                    char s[64]; s[0] = 0;
+                    char s[256]; s[0] = 0;
                     CStr(SafeRead<void*>((uintptr_t)o + off, nullptr), s, sizeof(s));
-                    Log("[lod]   %s.%s = \"%s\"", tag, fn, s);
+                    Log("[loja]   %s.%s = \"%s\"", tag, fn, s);
                 }
                 else if (strstr(tn, "[]") || strstr(tn, "List<")) {
                     void* a = SafeRead<void*>((uintptr_t)o + off, nullptr);
-                    Log("[lod]   %s.%s %s len=%d", tag, fn, tn, LooksLikeObj(a) ? ArrLen((Il2CppArray*)a) : -1);
+                    Log("[loja]   %s.%s %s len=%d", tag, fn, tn, LooksLikeObj(a) ? ArrLen((Il2CppArray*)a) : -1);
                 }
                 else if (strstr(tl, "single") || strstr(tl, "double"))
-                    Log("[lod]   %s.%s %s = %.4f", tag, fn, tn, SafeRead<float>((uintptr_t)o + off, -999.f));
+                    Log("[loja]   %s.%s %s = %.4f", tag, fn, tn, SafeRead<float>((uintptr_t)o + off, -999.f));
                 else if (strstr(tl, "boolean"))
-                    Log("[lod]   %s.%s %s = %d", tag, fn, tn, SafeRead<unsigned char>((uintptr_t)o + off, 0));
+                    Log("[loja]   %s.%s %s = %d", tag, fn, tn, SafeRead<unsigned char>((uintptr_t)o + off, 0));
                 else if (strstr(tl, "int32") || strstr(tl, "byte"))
-                    Log("[lod]   %s.%s %s = %d", tag, fn, tn, SafeRead<int>((uintptr_t)o + off, -999));
+                    Log("[loja]   %s.%s %s = %d", tag, fn, tn, SafeRead<int>((uintptr_t)o + off, -999));
+                else if (strstr(tn, "ObscuredInt")) {
+                    const int key = SafeRead<int>((uintptr_t)o + off + 0, 0);
+                    const int hid = SafeRead<int>((uintptr_t)o + off + 4, 0);
+                    Log("[loja]   %s.%s %s = %d (obf)", tag, fn, tn, hid ^ key);
+                }
                 else {
                     void* p = SafeRead<void*>((uintptr_t)o + off, nullptr);
-                    if (LooksLikeObj(p)) Log("[lod]   %s.%s %s = OBJ %p", tag, fn, tn, p);
-                    else                 Log("[lod]   %s.%s %s = raw %d", tag, fn, tn, SafeRead<int>((uintptr_t)o + off, -999));
+                    if (LooksLikeObj(p)) Log("[loja]   %s.%s %s = OBJ %p", tag, fn, tn, p);
+                    else                 Log("[loja]   %s.%s %s = raw %d", tag, fn, tn, SafeRead<int>((uintptr_t)o + off, -999));
                 }
             }
         }
     }
 
+    static void DumpAccountChain() {
+        Il2CppClass* ak = SDK::FindClass("AccountManager");
+        if (!ak) { Log("[loja] AccountManager NAO achado"); return; }
+        void* am = StaticInstanceOf(ak);
+        if (!LooksLikeObj(am)) { Log("[loja] AccountManager::Instance ausente"); return; }
+
+        char js[4096]; js[0] = 0;
+        if (AccountJson(js, sizeof(js))) {
+            Log("[loja] JSON conta (%d chars): %s", (int)strlen(js), js);
+        }
+        else Log("[loja] JSON conta: campo EIMOMMHLNPO vazio/nao achado");
+
+        AccountJsonRefresh();
+        Log("[loja] JSON -> money=%lld gold=%lld xp=%lld", g_accMoney, g_accGold, g_accXp);
+
+        uint32_t off = MnyOffExact(am, "accountInfo");
+        if (!off) off = 0x58;
+        void* ai = off ? SafeRead<void*>((uintptr_t)am + off, nullptr) : nullptr;
+        if (LooksLikeObj(ai)) {
+            Log("[loja] accountInfo off=0x%X -> %p", off, ai);
+            DumpObjFields(ai, "accountInfo", 32);
+            uint32_t ci = MnyOffExact(ai, "customInfo");
+            if (!ci) ci = 0x18;
+            void* cst = ci ? SafeRead<void*>((uintptr_t)ai + ci, nullptr) : nullptr;
+            if (LooksLikeObj(cst)) {
+                Log("[loja] accountInfo.customInfo off=0x%X -> %p", ci, cst);
+                DumpObjFields(cst, "customInfo", 64);
+                uint32_t bo = MnyOffExact(cst, "bfAccountInfo");
+                if (!bo) bo = 0x10;
+                void* bf = bo ? SafeRead<void*>((uintptr_t)cst + bo, nullptr) : nullptr;
+                if (LooksLikeObj(bf)) {
+                    Log("[loja] customInfo.bfAccountInfo off=0x%X -> %p", bo, bf);
+                    Log("[loja]   bfAccountInfo: money=%d gold=%d cases=%d xp=%d",
+                        SafeRead<int>((uintptr_t)bf + 0x14, -1),
+                        SafeRead<int>((uintptr_t)bf + 0x44, -1),
+                        SafeRead<int>((uintptr_t)bf + 0x30, -1),
+                        SafeRead<int>((uintptr_t)bf + 0x18, -1));
+                    DumpObjFields(bf, "bfAccountInfo", 48);
+                }
+                else Log("[loja] customInfo.bfAccountInfo off=0x%X = %p (nao obj)", bo, bf);
+            }
+            else Log("[loja] accountInfo.customInfo off=0x%X = %p (nao obj)", ci, cst);
+        }
+        else Log("[loja] accountInfo off=0x%X = %p (nao obj)", off, ai);
+
+        static const char* cf[] = { "accountCustomInfoJSON", "BMJJMJJIKPB" };
+        for (int i = 0; i < 2; ++i) {
+            uint32_t o2 = MnyOffExact(am, cf[i]);
+            void* c2 = o2 ? SafeRead<void*>((uintptr_t)am + o2, nullptr) : nullptr;
+            if (LooksLikeObj(c2)) {
+                Log("[loja] %s off=0x%X -> %p", cf[i], o2, c2);
+                DumpObjFields(c2, cf[i], 48);
+            }
+        }
+        Il2CppClass* mk = SDK::FindClass("AS_MySQLField");
+        if (mk) DumpClassFields("AS_MySQLField");
+    }
+
+    static void DumpMoneyObjects() {
+        DumpAccountChain();
+
+        Il2CppClass* ck = SDK::FindClass("CreditsManager");
+        if (ck) {
+            void* cm = StaticInstanceOf(ck);
+            if (LooksLikeObj(cm)) DumpObjFields(cm, "CreditsManager", 24);
+        }
+        Il2CppClass* sk = SDK::FindClass("Sidebar");
+        if (sk) {
+            void* sb = StaticInstanceOf(sk);
+            if (LooksLikeObj(sb)) DumpObjFields(sb, "Sidebar", 32);
+        }
+        Il2CppClass* bk = SDK::FindClass("BF_AccountInfo");
+        if (bk) {
+            int len = 0;
+            void* arr = FindObjsOfType(bk, len);
+            Log("[loja] BF_AccountInfo: %d instancia(s)", len);
+            for (int e = 0; e < len && e < 2; ++e) {
+                void* o = ArrElem((Il2CppArray*)arr, e);
+                if (LooksLikeObj(o)) DumpObjFields(o, "BF_AccountInfo", 40);
+            }
+        }
+    }
+
+    static void* AccountBfObj() {
+        Il2CppClass* ak = SDK::FindClass("AccountManager");
+        if (!ak) return nullptr;
+        void* am = StaticInstanceOf(ak);
+        if (!LooksLikeObj(am)) return nullptr;
+        uint32_t o = MnyOffExact(am, "accountInfo"); if (!o) o = 0x58;
+        void* ai = SafeRead<void*>((uintptr_t)am + o, nullptr);
+        if (!LooksLikeObj(ai)) return nullptr;
+        o = MnyOffExact(ai, "customInfo"); if (!o) o = 0x18;
+        void* ci = SafeRead<void*>((uintptr_t)ai + o, nullptr);
+        if (!LooksLikeObj(ci)) return nullptr;
+        o = MnyOffExact(ci, "bfAccountInfo"); if (!o) o = 0x10;
+        void* bf = SafeRead<void*>((uintptr_t)ci + o, nullptr);
+        return LooksLikeObj(bf) ? bf : nullptr;
+    }
+
     void DumpMirrors() {
         ResolveExtra();
+        AccountJsonRefresh();
         Log("=== ESPELHOS DA CARTEIRA (%d) ===", g_mnyN);
         MoneyRefresh();
         for (int i = 0; i < g_mnyN; ++i) {
             const MnyMirror& m = g_mny[i];
             if (!m.ok) { Log("[mirror]   [%d] %s = NAO RESOLVIDO", i, m.label); continue; }
-            uintptr_t a = (uintptr_t)m.base + m.off;
-            const int key = SafeRead<int>(a + 0, 0);
-            const int hid = SafeRead<int>(a + 4, 0);
-            Log("[mirror]   [%d] %s %s::%s kind=%d base=%p off=0x%X | int=%d obscured=%d inited=%d",
-                i, m.label, m.cls, m.fld, m.kind, m.base, m.off,
-                key, hid ^ key, SafeRead<int>(a + 0xC, -1));
+            const long long v = MnyRead(m);
+            Log("[mirror]   [%d] %s %s::%s tipo=%s kind=%d %s | valor=%lld",
+                i, m.label, m.cls, m.fld, m.typeName ? m.typeName : "?", m.kind,
+                m.isStatic ? "[static]" : "inst", v);
         }
+        Log("[mirror]   REAL (json conta): money=%lld gold=%lld xp=%lld",
+            g_accMoney, g_accGold, g_accXp);
+        void* bf = AccountBfObj();
+        if (bf) Log("[mirror]   REAL (bfAccountInfo): money=%d gold=%d cases=%d xp=%d",
+            SafeRead<int>((uintptr_t)bf + 0x14, -1),
+            SafeRead<int>((uintptr_t)bf + 0x44, -1),
+            SafeRead<int>((uintptr_t)bf + 0x30, -1),
+            SafeRead<int>((uintptr_t)bf + 0x18, -1));
+        else    Log("[mirror]   REAL (bfAccountInfo): ausente");
         Log("=== FIM ESPELHOS ===");
     }
 
@@ -1887,10 +2786,100 @@ namespace Unlock {
         ResolveExtra();
         static const char* cls[] = {
             "CreditsManager", "AccountManager", "CamoCaseManager",
-            "LoadoutManager", "LoadoutAndShop", "Sidebar", "BF_AccountInfo"
+            "LoadoutManager", "LoadoutAndShop", "Sidebar", "BF_AccountInfo",
+            "AS_AccountInfo", "AS_CustomInfo", "AS_MySQLField"
         };
         for (size_t i = 0; i < sizeof(cls) / sizeof(cls[0]); ++i) DumpClassFields(cls[i]);
+        DumpMoneyObjects();
         DumpMirrors();
+    }
+
+    static void DumpMySqlFields(void* list) {
+        if (!LooksLikeObj(list)) return;
+        void* items = ListItems(list);
+        const int n = ListSize(list);
+        Log("[credit] accountInfo.fields: %d entrada(s)", n);
+        for (int i = 0; i < n && i < 24; ++i) {
+            void* e = LooksLikeObj(items)
+                ? SafeRead<void*>((uintptr_t)items + 0x20 + (size_t)i * 8, nullptr) : nullptr;
+            if (!LooksLikeObj(e)) continue;
+            DumpObjFields(e, "mysqlField", 12);
+        }
+    }
+
+    void DumpCredits() {
+        ResolveExtra();
+        Log("=== DUMP CREDITOS %s ===", BFI_UNLOCK_VER);
+        DumpClassFields("CreditsManager");
+        DumpClassFields("AccountManager");
+        DumpClassFields("AS_AccountInfo");
+        DumpClassFields("AS_MySQLField");
+        DumpClassFields("BF_AccountInfo");
+        DumpClassFields("Sidebar");
+
+        Il2CppClass* ak = SDK::FindClass("AccountManager");
+        if (ak) {
+            void* am = StaticInstanceOf(ak);
+            if (LooksLikeObj(am)) {
+                DumpObjFields(am, "AccountManager", 64);
+                Log("[credit] JBNJGEGJGAD=%d FIOMIPONAAM=%d GEEFAPKBHJO(obf)=%d",
+                    SafeRead<int>((uintptr_t)am + 0x34, -1),
+                    SafeRead<int>((uintptr_t)am + 0xA4, -1),
+                    (SafeRead<int>((uintptr_t)am + 0x20, 0) ^ SafeRead<int>((uintptr_t)am + 0x24, 0)));
+                uint32_t o = MnyOffExact(am, "accountInfo"); if (!o) o = 0x58;
+                void* ai = SafeRead<void*>((uintptr_t)am + o, nullptr);
+                if (LooksLikeObj(ai)) {
+                    uint32_t fo = MnyOffExact(ai, "fields");
+                    if (fo) DumpMySqlFields(SafeRead<void*>((uintptr_t)ai + fo, nullptr));
+                }
+            }
+        }
+
+        Il2CppClass* ck = SDK::FindClass("CreditsManager");
+        if (ck) {
+            void* o = StaticInstanceOf(ck);
+            if (LooksLikeObj(o)) DumpObjFields(o, "CreditsManager", 64);
+            else Log("[credit] CreditsManager sem instancia estatica");
+            for (Il2CppClass* c = ck; c; c = il2cpp_class_get_parent(c)) {
+                void* it = nullptr;
+                for (;;) {
+                    FieldInfo* f = il2cpp_class_get_fields(c, &it);
+                    if (!f) break;
+                    if (!IsStatic(f)) continue;
+                    const Il2CppType* t = il2cpp_field_get_type(f);
+                    const char* tn = TN(t);
+                    if (!tn) continue;
+                    if (!strstr(tn, "Int32") && !strstr(tn, "ObscuredInt") && !strstr(tn, "Int64")) continue;
+                    int v = 0; StaticGetRaw(f, &v, sizeof(int));
+                    Log("[credit] STATIC %s::%s %s = %d",
+                        il2cpp_class_get_name(c), il2cpp_field_get_name(f), tn, v);
+                }
+            }
+        }
+
+        Il2CppClass* sk = SDK::FindClass("Sidebar");
+        if (sk) {
+            void* sb = StaticInstanceOf(sk);
+            if (LooksLikeObj(sb)) DumpObjFields(sb, "Sidebar", 48);
+            for (Il2CppClass* c = sk; c; c = il2cpp_class_get_parent(c)) {
+                void* it = nullptr;
+                for (;;) {
+                    FieldInfo* f = il2cpp_class_get_fields(c, &it);
+                    if (!f) break;
+                    if (!IsStatic(f)) continue;
+                    const Il2CppType* t = il2cpp_field_get_type(f);
+                    const char* tn = TN(t);
+                    if (!tn) continue;
+                    if (!strstr(tn, "Int32") && !strstr(tn, "ObscuredInt") && !strstr(tn, "Int64")) continue;
+                    int v = 0; StaticGetRaw(f, &v, sizeof(int));
+                    Log("[credit] STATIC %s::%s %s = %d",
+                        il2cpp_class_get_name(c), il2cpp_field_get_name(f), tn, v);
+                }
+            }
+        }
+
+        DumpMirrors();
+        Log("=== FIM DUMP CREDITOS ===");
     }
 
     void Dump() {
@@ -1902,6 +2891,7 @@ namespace Unlock {
         ScanLoadoutContainers();
         ResolvePlayerPrefs();
         CollectPrefsKeys(false);
+        DumpMoneyObjects();
         DumpMirrors();
         Log("=== FIM DUMP UNLOCK ===");
     }

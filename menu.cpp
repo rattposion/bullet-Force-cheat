@@ -1,7 +1,9 @@
 // ============================================================
 //  menu.cpp - bfi / Bullet Force (ImGui)
-//  v43: aba Conta com espelhos DIRETOS (ForceMirrors/DumpMirrors)
-//       + "So carteira" ligado ao forcar (nao quebra o FishNet)
+//  v43.16: slots e anexos por NOME (WeaponCombo/AttachCombo) em vez
+//          de numero. Botao BUILD chama Unlock::BuildAllNow() direto.
+//  v43.15: botoes do log em 2 linhas. Sem Hooks::g_imguiGeneration
+//          nem AntiCheat::RiskLevel. #error se o config.h estiver velho.
 // ============================================================
 #include "common.h"
 #include "config.h"
@@ -19,10 +21,17 @@
 
 #pragma comment(lib, "shell32.lib")
 
+#ifndef BFI_CONFIG_VER
+#error "config.h ANTIGO sendo incluido (sem BFI_CONFIG_VER). Substitua o config.h da pasta do projeto."
+#elif BFI_CONFIG_VER < 4315
+#error "config.h desatualizado (BFI_CONFIG_VER < 4315). Substitua o config.h da pasta do projeto."
+#endif
+
 namespace Unlock {
     void        DumpShop();
-    int         ShopForceAll(long long money, long long gold);
-    int         ForceMirrors(long long credits, long long gold);
+    void        DumpCredits();
+    void        ShopForceAll();
+    int         ForceMirrors(long long value, long long mode);
     void        DumpMirrors();
 
     int         MoneyCount();
@@ -35,6 +44,9 @@ namespace Unlock {
     void        MoneyUnlockAll();
     void        MoneyRefresh();
     bool        MoneyReady();
+    long long   MoneyReal();
+
+    void        BuildAllNow();          // <<< v43.16
 }
 
 namespace Menu {
@@ -80,12 +92,11 @@ namespace Menu {
 
     static void ApplyStyleOnce()
     {
-        static uint32_t styledGen = 0;
-        const uint32_t gen = Hooks::g_imguiGeneration.load(std::memory_order_acquire);
-        if (gen == styledGen) return;
-        if (!ImGui::GetCurrentContext()) return;
+        static void* lastCtx = nullptr;
+        void* ctx = (void*)ImGui::GetCurrentContext();
+        if (!ctx || ctx == lastCtx) return;
+        lastCtx = ctx;
         ApplyStyle();
-        styledGen = gen;
     }
 
     // ==========================================================
@@ -159,7 +170,7 @@ namespace Menu {
     static ULONGLONG   g_logNext = 0;
     static std::string g_logText;
     static int         g_logErr = 0;
-    static int         g_logType = 0;   // 0=todos 1=info 2=ok 3=warn 4=erro 5=money 6=shop
+    static int         g_logType = 0;
 
     static void DirOfModule(char* out, size_t n)
     {
@@ -186,11 +197,14 @@ namespace Menu {
 
     static bool TypeMatch(const char* line, int type)
     {
+        if (C.logFilter[0] && !strstr(line, C.logFilter)) return false;
         if (type == 0) return true;
         if (type == 5) return strstr(line, "[money]") != nullptr ||
             strstr(line, "[mirror]") != nullptr ||
-            strstr(line, "[conta]") != nullptr;
-        if (type == 6) return strstr(line, "[shop]") != nullptr;
+            strstr(line, "[conta]") != nullptr ||
+            strstr(line, "[credit]") != nullptr;
+        if (type == 6) return strstr(line, "[shop]") != nullptr ||
+            strstr(line, "[loja]") != nullptr;
         if (type == 1) return strstr(line, "[info]") != nullptr;
         if (type == 2) return strstr(line, "[ok]") != nullptr;
         if (type == 3) return strstr(line, "[warn]") != nullptr || strstr(line, "[w]") != nullptr;
@@ -246,9 +260,6 @@ namespace Menu {
         fclose(f);
     }
 
-    // ----------------------------------------------------------
-    //  COPIAR - via Win32 (nao depende do backend do ImGui)
-    // ----------------------------------------------------------
     static bool CopyToClipboard(const char* text, size_t len)
     {
         if (!text || !len) return false;
@@ -301,22 +312,32 @@ namespace Menu {
     static void TabTrigger();
     static void TabVisual();
     static void TabWeapon();
+    static void TabDupe();
     static void TabMovement();
     static void TabUnlock();
     static void TabConta();
     static void TabMisc();
     static void TabLog();
 
+    static int RiskLevelLocal()
+    {
+        if (!C.antiCheat) return 0;
+        const bool muitoDinheiro = (C.currencyValue >= 999999) ||
+            (C.accGold >= 999999) || (C.accCases >= 999999);
+        if (C.unlockCurrency && muitoDinheiro) return 2;
+        return 1;
+    }
+
     static void RiskBanner()
     {
         if (!C.showRiskAlert) return;
 
-        const int lvl = AntiCheat::RiskLevel();
+        const int lvl = RiskLevelLocal();
         ImVec4 col;
         const char* txt;
         switch (lvl) {
-        case 2:  col = ImVec4(0.90f, 0.25f, 0.25f, 1.f); txt = "RISCO ALTO - anti-cheat ativo"; break;
-        case 1:  col = ImVec4(0.90f, 0.70f, 0.20f, 1.f); txt = "RISCO MEDIO - valores fora do normal"; break;
+        case 2:  col = ImVec4(0.90f, 0.25f, 0.25f, 1.f); txt = "RISCO ALTO - valores fora do padrao"; break;
+        case 1:  col = ImVec4(0.90f, 0.70f, 0.20f, 1.f); txt = "RISCO MEDIO - anti-cheat ativo"; break;
         default: col = ImVec4(0.35f, 0.80f, 0.45f, 1.f); txt = "OK - sem risco aparente"; break;
         }
 
@@ -348,6 +369,16 @@ namespace Menu {
         ImGui::Checkbox("Silent aim", &C.silentAim);
         ImGui::SameLine(); ImGui::Checkbox("Balas magicas", &C.magicBullets);
         ImGui::ColorEdit4("Cor do FOV", C.aimColor, ImGuiColorEditFlags_NoInputs);
+
+        ImGui::Separator();
+        ImGui::Checkbox("Aimbot (alias)", &C.aimEnabled);
+        ImGui::SameLine(); ImGui::Checkbox("Alternar (alias)", &C.aimToggle);
+        ImGui::Checkbox("Ignorar time (alias)", &C.aimTeamCheck);
+        ImGui::SameLine(); ImGui::Checkbox("Checar visao (alias)", &C.aimVisCheck);
+        ImGui::Combo("Selecao", &C.aimSelect, "Distancia\0Menor FOV\0Menor vida\0");
+        ImGui::Checkbox("Auto fire", &C.aimAutoFire);
+        ImGui::SameLine(); ImGui::SliderInt("Delay tiro (ms)", &C.aimFireDelayMs, 0, 300);
+        ImGui::Checkbox("Mostrar nome do alvo", &C.showAimTargetName);
     }
 
     // ========================================================== TRIGGER
@@ -355,8 +386,12 @@ namespace Menu {
     {
         ImGui::Checkbox("Triggerbot", &C.triggerbot);
         ImGui::SameLine(); KeyButton("Tecla", &C.triggerKey);
-        ImGui::SliderFloat("Delay (s)", &C.triggerDelay, 0.f, 0.5f, "%.3f");
+        ImGui::SliderFloat("Delay (ms)", &C.triggerDelay, 0.f, 500.f, "%.0f");
         ImGui::SliderFloat("Raio (px)", &C.triggerRadius, 0.f, 60.f, "%.0f");
+        ImGui::SliderFloat("FOV", &C.triggerFov, 1.f, 30.f, "%.0f");
+        ImGui::SliderInt("Burst (rajada)", &C.triggerBurst, 0, 10);
+        ImGui::Separator();
+        ImGui::SliderInt("Burst (alias)", &C.trigBurst, 0, 10);
     }
 
     // ========================================================== VISUAL
@@ -381,6 +416,15 @@ namespace Menu {
         ImGui::Checkbox("Checar visao", &C.espVisCheck);
         ImGui::SameLine(); ImGui::Checkbox("Linha de visao", &C.espVisLine);
         ImGui::SliderInt("LOS por frame", &C.losPerFrame, 1, 32);
+
+        ImGui::Separator();
+        ImGui::Checkbox("Tracer", &C.tracer);
+        ImGui::SameLine();
+        ImGui::ColorEdit4("Cor tracer", C.tracerColor, ImGuiColorEditFlags_NoInputs);
+        ImGui::SliderFloat("Espessura tracer", &C.tracerWidth, 0.01f, 8.0f, "%.2f");
+        ImGui::Checkbox("Radar", &C.radar);
+        ImGui::SameLine();
+        ImGui::SliderFloat("Tam. radar", &C.radarSize, 50.f, 400.f, "%.0f");
 
         ImGui::Separator();
         ImGui::SliderFloat("Espessura", &C.espThickness, 0.5f, 5.0f, "%.1f");
@@ -408,12 +452,68 @@ namespace Menu {
     }
 
     // ========================================================== ARMA
+    //  v43.16: combos por NOME (em vez de numero)
+    static bool WeaponCombo(const char* label, int* idx)
+    {
+        const int n = Dupe::WeaponCount();
+        const char* cur = (*idx >= 0 && *idx < n) ? Dupe::WeaponName(*idx) : "(nenhuma)";
+        bool changed = false;
+        if (ImGui::BeginCombo(label, cur ? cur : "(nenhuma)")) {
+            if (ImGui::Selectable("(nenhuma)", *idx < 0)) { *idx = -1; changed = true; }
+            for (int i = 0; i < n; ++i) {
+                ImGui::PushID(i);
+                const char* nm = Dupe::WeaponName(i);
+                if (ImGui::Selectable(nm ? nm : "?", *idx == i)) { *idx = i; changed = true; }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        return changed;
+    }
+
+    static bool AttachCombo(const char* label, int slot, int* idx)
+    {
+        const int n = Dupe::AttachCount(slot);
+        const char* const* list = Dupe::AttachList(slot);
+        const char* cur = (list && *idx >= 0 && *idx < n) ? list[*idx] : "(nenhum)";
+        bool changed = false;
+        if (ImGui::BeginCombo(label, cur ? cur : "(nenhum)")) {
+            if (ImGui::Selectable("(nenhum)", *idx < 0)) { *idx = -1; changed = true; }
+            for (int i = 0; i < n; ++i) {
+                ImGui::PushID(i);
+                const char* nm = (list && i < n) ? list[i] : nullptr;
+                if (ImGui::Selectable(nm ? nm : "?", *idx == i)) { *idx = i; changed = true; }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        return changed;
+    }
+
     static void TabWeapon()
     {
+        ImGui::Checkbox("Sem recuo (no recoil)", &C.noRecoil);
+        ImGui::SameLine(); ImGui::Checkbox("Sem dispersao", &C.noSpread);
+        ImGui::Checkbox("Municao infinita", &C.infAmmo);
+        ImGui::SameLine(); ImGui::Checkbox("Sem recarregar", &C.noReload);
+        ImGui::Checkbox("Tiro rapido", &C.rapidFire);
+
+        ImGui::Separator();
         ImGui::Checkbox("Skin changer", &C.skinChanger);
         ImGui::SameLine(); ImGui::SliderInt("Skin", &C.skinIndex, 0, 64);
         ImGui::Checkbox("Aplicar selecao (a cada 4s)", &C.applySelection);
 
+        ImGui::Separator();
+        ImGui::Checkbox("Liberar customizacao", &C.gunCustomizeUnlock);
+        ImGui::SameLine(); ImGui::Checkbox("Todos os slots", &C.gunCustomizeAllSlots);
+
+        ImGui::Separator();
+        ImGui::Checkbox("Forcar nomes", &C.forceNames);
+        ImGui::InputText("Nome arma", C.weaponName, sizeof(C.weaponName));
+        ImGui::InputText("Nome skin", C.skinName, sizeof(C.skinName));
+        ImGui::InputText("Nome anexo", C.attachName, sizeof(C.attachName));
+
+        ImGui::Separator();
         const int wc = Dupe::WeaponCount();
         if (wc > 0) {
             if (C.selWeapon >= wc) C.selWeapon = 0;
@@ -425,7 +525,7 @@ namespace Menu {
             }
         }
         else {
-            ImGui::TextDisabled("(armas: entre numa partida)");
+            ImGui::TextDisabled("(armas: aperte Build na aba Dupe)");
         }
 
         const int cc = Dupe::CamoCount();
@@ -455,15 +555,75 @@ namespace Menu {
         }
 
         ImGui::Separator();
-        ImGui::SliderInt("Slot", &C.loadoutSlot, 0, 2);
-        ImGui::SliderInt("Slot 1", &C.slotWeapon[0], -1, 64);
-        ImGui::SliderInt("Slot 2", &C.slotWeapon[1], -1, 64);
-        ImGui::SliderInt("Slot 3", &C.slotWeapon[2], -1, 64);
+        ImGui::Text("Loadout (por nome)");
 
+        static const char* kSlotTxt[3] = { "1 - Primaria", "2 - Secundaria", "3 - Gadget" };
+        if (C.loadoutSlot < 0 || C.loadoutSlot > 2) C.loadoutSlot = 0;
+        if (ImGui::BeginCombo("Slot alvo", kSlotTxt[C.loadoutSlot])) {
+            for (int s = 0; s < 3; ++s)
+                if (ImGui::Selectable(kSlotTxt[s], C.loadoutSlot == s)) C.loadoutSlot = s;
+            ImGui::EndCombo();
+        }
+
+        WeaponCombo("Slot 1", &C.slotWeapon[0]);
+        WeaponCombo("Slot 2", &C.slotWeapon[1]);
+        WeaponCombo("Slot 3", &C.slotWeapon[2]);
+
+        ImGui::Separator();
+        ImGui::Text("Anexos (por nome)");
+        AttachCombo("Mira", 0, &C.selAttach[0]);
+        AttachCombo("Acessorio", 1, &C.selAttach[1]);
+        AttachCombo("Cano", 2, &C.selAttach[2]);
+
+        ImGui::Separator();
         if (ImGui::Button("Aplicar loadout agora")) {
             C.applySelection = true;
             Log("[menu] loadout marcado para aplicar (lista=%d slot=%d)", C.selWeapon, C.loadoutSlot);
         }
+    }
+
+    // ========================================================== DUPE / BUILD
+    static void TabDupe()
+    {
+        ImGui::Text("Coleta de armas / camos / personagens");
+        ImGui::TextDisabled("1) Build  2) escolha na aba Arma  3) Aplicar loadout");
+        ImGui::Separator();
+
+        if (ImGui::Button("BUILD (coletar agora)", ImVec2(230, 0))) {
+            Unlock::BuildAllNow();             // <<< v43.16: coleta tudo numa chamada
+            Log("[menu] dupe: build pedida");
+        }
+        ImGui::SameLine();
+        if (Dupe::Building())
+            ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.40f, 1.f), "construindo...");
+        else if (Dupe::WeaponCount() > 0)
+            ImGui::TextColored(ImVec4(0.35f, 0.80f, 0.45f, 1.f), "OK: %d armas", Dupe::WeaponCount());
+        else
+            ImGui::TextColored(ImVec4(0.90f, 0.45f, 0.45f, 1.f), "vazio - aperte Build");
+
+        ImGui::Separator();
+        ImGui::Text("armas=%d  camos=%d  chars=%d  epoch=%d  stage=%d",
+            Dupe::WeaponCount(), Dupe::CamoCount(), Dupe::CharCount(),
+            (int)Dupe::g_epoch.load(), Dupe::Stage());
+
+        ImGui::Separator();
+        ImGui::Text("Anexos:");
+        for (int s = 0; s < 3; ++s) {
+            static const char* kn[3] = { "Mira", "Acessorios", "Cano" };
+            ImGui::Text("%s: %d", kn[s], Dupe::AttachCount(s));
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Armas:");
+        ImGui::BeginChild("##dupeWpn", ImVec2(0, 220), true);
+        const int wc = Dupe::WeaponCount();
+        for (int i = 0; i < wc; ++i) {
+            ImGui::PushID(1000 + i);
+            if (ImGui::Selectable(Dupe::WeaponName(i), i == C.selWeapon)) C.selWeapon = i;
+            ImGui::PopID();
+        }
+        if (!wc) ImGui::TextDisabled("(sem armas - entre numa partida e aperte Build)");
+        ImGui::EndChild();
     }
 
     // ========================================================== MOVIMENTO
@@ -472,11 +632,22 @@ namespace Menu {
         ImGui::Checkbox("Godmode", &C.godmode);
         ImGui::SameLine(); ImGui::SliderFloat("Vida", &C.godmodeValue, 1.f, 1000.f, "%.0f");
         ImGui::Separator();
-        ImGui::Checkbox("Bhop", &C.bhopSkipMenu);
+        ImGui::Checkbox("Speed hack", &C.speedHack);
+        ImGui::SameLine(); ImGui::SliderFloat("Velocidade", &C.speedValue, 1.f, 30.f, "%.1f");
+        ImGui::Checkbox("Voar", &C.fly);
+        ImGui::SameLine(); ImGui::SliderFloat("Vel. voo", &C.flySpeed, 1.f, 30.f, "%.1f");
+        ImGui::Checkbox("Super pulo", &C.superJump);
+        ImGui::SameLine(); ImGui::SliderFloat("Forca pulo", &C.jumpPower, 1.f, 20.f, "%.1f");
+        ImGui::Checkbox("Teleporte", &C.teleport);
+        ImGui::Separator();
+        ImGui::Checkbox("Bhop", &C.bhop);
+        ImGui::SameLine(); KeyButton("Tecla", &C.bhopKey);
+        ImGui::Checkbox("Manter velocidade", &C.bhopKeepSpeed);
+        ImGui::Checkbox("Bhop (so fora do menu)", &C.bhopSkipMenu);
         ImGui::SliderInt("Modo", &C.bhopMode, 0, 2);
         ImGui::SliderInt("Hold (ms)", &C.bhopHoldMs, 10, 300);
         ImGui::SliderInt("Re-press (ms)", &C.bhopRePressMs, 10, 300);
-        ImGui::SliderFloat("Vel. pulo", &C.bhopJumpSpeed, 0.5f, 2.f, "%.2f");
+        ImGui::SliderFloat("Vel. pulo", &C.bhopJumpSpeed, 0.0f, 3.f, "%.2f");
         ImGui::Separator();
         ImGui::Checkbox("Atirar no ar", &C.shootInAir);
         ImGui::SameLine(); KeyButton("Tecla", &C.airFireKey);
@@ -509,44 +680,51 @@ namespace Menu {
     static void TabConta()
     {
         ImGui::Text("Carteira / conta");
-        ImGui::TextDisabled("Entre numa partida. Use os espelhos DIRETOS abaixo.");
+        ImGui::TextDisabled("Alvo real: accountInfo -> customInfo -> bfAccountInfo");
         ImGui::Separator();
 
         ImGui::Checkbox("So carteira (evita quebrar FishNet)", &C.moneyOnlyWallet);
         ImGui::SameLine();
         ImGui::Checkbox("Auto (trava)", &C.accAuto);
 
+        ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.f, 1.f),
+            "Creditos reais (JSON da conta): %lld", Unlock::MoneyReal());
+
         ImGui::PushItemWidth(150);
 
         ImGui::InputInt("Creditos", &C.currencyValue);
         ImGui::SameLine();
         if (ImGui::Button("Aplicar##cr")) {
-            int n = Unlock::ForceMirrors((long long)C.currencyValue, (long long)C.accGold);
-            n += Unlock::MoneyLockByName("BF_AccountInfo", "money", (long long)C.currencyValue);
+            const long long v = (long long)C.currencyValue;
+            int n = 0;
+            n += Unlock::MoneyLockByName("CreditsManager", "LDOGMJMLIOP", v);
+            n += Unlock::MoneyLockByName("AccountManager", "money", v);
             Log("[conta] creditos=%d -> %d campo(s)", C.currencyValue, n);
         }
 
         ImGui::InputInt("Ouro", &C.accGold);
         ImGui::SameLine();
         if (ImGui::Button("Aplicar##ou")) {
-            int n = Unlock::ForceMirrors((long long)C.currencyValue, (long long)C.accGold);
-            n += Unlock::MoneyLockByName("BF_AccountInfo", "gold", (long long)C.accGold);
-            n += Unlock::MoneyLockByName("LoadoutManager", "goldAmount", (long long)C.accGold);
-            n += Unlock::MoneyLockByName("Sidebar", "goldAmount", (long long)C.accGold);
+            const long long v = (long long)C.accGold;
+            int n = 0;
+            n += Unlock::MoneyLockByName("AccountManager", "gold", v);
+            n += Unlock::MoneyLockByName("CamoCaseManager", "goldCases", v);
+            n += Unlock::MoneyLockByName("LoadoutManager", "goldAmount", v);
+            n += Unlock::MoneyLockByName("LoadoutAndShop", "goldAmount", v);
             Log("[conta] ouro=%d -> %d campo(s)", C.accGold, n);
         }
 
         ImGui::InputInt("Nivel (xp)", &C.unlockLevel);
         ImGui::SameLine();
         if (ImGui::Button("Aplicar##lv")) {
-            const int n = Unlock::MoneyLockByName("BF_AccountInfo", "xp", (long long)C.unlockLevel);
-            Log("[conta] nivel=%d -> %d alvo(s)", C.unlockLevel, n);
+            const int n = Unlock::MoneyLockByName("AccountManager", "xp", (long long)C.unlockLevel);
+            Log("[conta] xp=%d -> %d alvo(s)", C.unlockLevel, n);
         }
 
         ImGui::InputInt("Caixas (cases)", &C.accCases);
         ImGui::SameLine();
         if (ImGui::Button("Aplicar##cs")) {
-            const int n = Unlock::MoneyLockByName("BF_AccountInfo", "cases_CREDIT", (long long)C.accCases);
+            const int n = Unlock::MoneyLockByName("AccountManager", "cases", (long long)C.accCases);
             Log("[conta] cases=%d -> %d alvo(s)", C.accCases, n);
         }
 
@@ -554,14 +732,29 @@ namespace Menu {
 
         ImGui::Separator();
 
-        // ---- ESPELHOS DIRETOS (nao dependem do walk) ----
-        if (ImGui::Button("FORCAR espelhos (creditos/ouro)")) {
+        if (ImGui::Button("FORCAR todos os espelhos")) {
             C.moneyOnlyWallet = true;
-            const int n = Unlock::ForceMirrors((long long)C.currencyValue, (long long)C.accGold);
-            Log("[conta] espelhos diretos: %d campo(s)", n);
+            const int n = Unlock::ForceMirrors((long long)C.currencyValue, 0);
+            Log("[conta] ForceMirrors(todos): %d campo(s)", n);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("FORCAR so travados")) {
+            const int n = Unlock::ForceMirrors((long long)C.currencyValue, 1);
+            Log("[conta] ForceMirrors(travados): %d campo(s)", n);
         }
         ImGui::SameLine();
         if (ImGui::Button("Ver espelhos no log")) Unlock::DumpMirrors();
+
+        ImGui::Separator();
+
+        if (ImGui::Button("Forcar loja (ShopForceAll)")) {
+            Unlock::ShopForceAll();
+            Log("[conta] ShopForceAll()");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Dump loja no log")) Unlock::DumpShop();
+        ImGui::SameLine();
+        if (ImGui::Button("Dump CREDITOS no log")) Unlock::DumpCredits();
 
         ImGui::Separator();
 
@@ -571,10 +764,8 @@ namespace Menu {
         ImGui::SameLine();
         if (ImGui::Button("Destravar tudo")) Unlock::MoneyUnlockAll();
 
-        if (ImGui::Button("Dump loja no log")) Unlock::DumpShop();
-
         ImGui::Separator();
-        ImGui::Text("Alvos do walk: %d (a maioria e' lixo)", Unlock::MoneyCount());
+        ImGui::Text("Alvos do walk: %d", Unlock::MoneyCount());
         if (!Unlock::MoneyReady())
             ImGui::TextDisabled("(vazio - entre numa partida ou clique Re-detectar)");
 
@@ -619,6 +810,18 @@ namespace Menu {
         ImGui::Separator();
         ImGui::Checkbox("Log do probe", &C.probeLog);
         ImGui::SameLine(); ImGui::Checkbox("Log de beat", &C.beatLog);
+        ImGui::Checkbox("Verbose unlock", &C.verboseUnlock);
+        ImGui::SameLine(); ImGui::SliderInt("Linhas watch", &C.watchMaxLines, 1, 40);
+        ImGui::Checkbox("Dump automatico", &C.dumpOnce);
+        ImGui::SameLine(); ImGui::SliderInt("Intervalo dump (ms)", &C.dumpIntervalMs, 500, 30000);
+        ImGui::Separator();
+        KeyButton("Menu", &C.menuKey);
+        ImGui::SameLine(); KeyButton("Panico", &C.panicKey);
+        ImGui::SameLine(); KeyButton("Salvar cfg", &C.saveKey);
+        ImGui::SameLine(); KeyButton("Descarregar", &C.unloadKey);
+        if (ImGui::Button("Salvar config agora")) ConfigIO::Save();
+        ImGui::SameLine();
+        if (ImGui::Button("Carregar config")) ConfigIO::Load();
     }
 
     // ========================================================== LOG
@@ -637,12 +840,15 @@ namespace Menu {
             const int n = CopyLogToClipboard(true);
             Log("[log] copiado (filtro): %d linha(s)%s", n, n < 0 ? " (FALHOU)" : "");
         }
-        ImGui::SameLine();
+
         if (ImGui::Button("Salvar copia")) SaveLogCopy();
         ImGui::SameLine();
         if (ImGui::Button("Ver espelhos")) Unlock::DumpMirrors();
         ImGui::SameLine();
         ImGui::Checkbox("Auto-scroll", &C.logAutoScroll);
+
+        ImGui::SetNextItemWidth(240);
+        ImGui::InputText("Filtro", C.logFilter, sizeof(C.logFilter));
 
         ImGui::TextDisabled("%s", LogPath());
         if (g_logErr) ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.4f, 1.f), "falha ao ler o log");
@@ -665,8 +871,8 @@ namespace Menu {
             const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
             const size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
             if (len && TypeMatch(p, g_logType)) {
-                if (strstr(p, "[money]") || strstr(p, "[mirror]") ||
-                    strstr(p, "[shop]") || strstr(p, "[conta]"))
+                if (strstr(p, "[money]") || strstr(p, "[mirror]") || strstr(p, "[credit]") ||
+                    strstr(p, "[shop]") || strstr(p, "[loja]") || strstr(p, "[conta]"))
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.85f, 1.f, 1.f));
                 else if (strstr(p, "[err]") || strstr(p, "[erro]") || strstr(p, "!!!!"))
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.45f, 0.45f, 1.f));
@@ -687,13 +893,12 @@ namespace Menu {
     }
 
     // ========================================================== DRAW
-    //  Menu::Render() fica no features.cpp - nao definir aqui.
     void Draw()
     {
         if (!g_open) return;
         ApplyStyleOnce();
 
-        ImGui::SetNextWindowSize(ImVec2(690, 680), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(720, 700), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
 
         if (!ImGui::Begin("bfi - Bullet Force", &g_open)) {
@@ -708,6 +913,7 @@ namespace Menu {
             if (ImGui::BeginTabItem("Trigger")) { TabTrigger();  ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Visual")) { TabVisual();   ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Arma")) { TabWeapon();   ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Dupe")) { TabDupe();     ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Movimento")) { TabMovement(); ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Unlock")) { TabUnlock();   ImGui::EndTabItem(); }
             if (ImGui::BeginTabItem("Conta")) { TabConta();    ImGui::EndTabItem(); }

@@ -1,4 +1,7 @@
 #pragma once
+#ifndef BFI_UNLOCK_H
+#define BFI_UNLOCK_H
+
 // ============================================================================
 //  unlock.h — API de unlock/catalogo + CARTEIRA, consumida pelo menu.
 //  DONO UNICO do namespace Unlock.
@@ -9,6 +12,9 @@
 //
 //  Instalacao: Tick() e' o unico ponto de escrita. Dump()/MoneyRefresh() podem
 //  ser chamados de qualquer thread/estado.
+//
+//  REGRA: qualquer declaracao de Install() em QUALQUER .cpp/.h do projeto tem
+//  que ser 'bool Install();' — senao E0311 (diferem so pelo retorno).
 // ============================================================================
 
 namespace Unlock {
@@ -21,6 +27,11 @@ namespace Unlock {
 
     void Tick();
     void Dump();
+
+    // Passo da build do catalogo (armas -> anexos -> camos -> chars).
+    // Chamado pelo Tick() enquanto Dupe::Wants() for true; pode ser chamado
+    // direto pelo menu para forcar o proximo passo.
+    void BuildStep();
 
     bool Ready();       // catalogo publicado
     int  Generation();  // muda a cada reconstrucao
@@ -77,7 +88,10 @@ namespace Unlock {
     void        MoneyTick();             // chamado pelo Tick()
     void        MoneyWritePrefs();       // grava tambem nos PlayerPrefs
     void        ShopForceAll();          // so gold/caixas/loja
-
+    
     void        DumpMirrors();
     void        DumpShop();
-}
+    long long   MoneyReal();             // valor REAL da conta (JSON), -1 se nao leu
+} // namespace Unlock
+
+#endif // BFI_UNLOCK_H

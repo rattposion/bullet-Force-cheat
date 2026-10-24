@@ -1,6 +1,9 @@
 // ============================================================================
-//  hooks.cpp  (v37)
+//  hooks.cpp  (v38)
 //   * hk_fire7: silent aim + MAGIC BULLETS + hitmarker num unico bloco
+//   * R8: LoadGlExt() tenta sufixos ARB/EXT e e' RETENTADO quando o contexto GL
+//         muda (no Init ainda nao ha' contexto corrente -> wglGetProcAddress
+//         devolvia NULL e o save/restore de FBO ficava quebrado).
 //   * R7: LoadGlExt no Init, corpo do swap sob __try, fases finas
 // ============================================================================
 #include <windows.h>
@@ -80,14 +83,33 @@ namespace Hooks {
     static PFN_glBindFramebuffer p_glBindFramebuffer = nullptr;
     static PFN_glActiveTexture   p_glActiveTexture = nullptr;
 
+    // ------------------------------------------------------------------------
+    //  >>> v38 — retenta com sufixos ARB/EXT e loga SO' quando o estado muda.
+    //  wglGetProcAddress exige contexto corrente: no Init ele pode devolver NULL.
+    //  Chame de novo depois que um contexto estiver ativo (SwapBody).
+    // ------------------------------------------------------------------------
     static bool LoadGlExt() {
-        if (!p_glBindFramebuffer)
-            p_glBindFramebuffer = (PFN_glBindFramebuffer)wglGetProcAddress("glBindFramebuffer");
-        if (!p_glBindFramebuffer)
-            p_glBindFramebuffer = (PFN_glBindFramebuffer)wglGetProcAddress("glBindFramebufferEXT");
-        if (!p_glActiveTexture)
-            p_glActiveTexture = (PFN_glActiveTexture)wglGetProcAddress("glActiveTexture");
-        return p_glBindFramebuffer != nullptr && p_glActiveTexture != nullptr;
+        if (!p_glBindFramebuffer) {
+            static const char* n[] = { "glBindFramebuffer", "glBindFramebufferEXT",
+                                       "glBindFramebufferARB", "glBindFramebufferOES" };
+            for (size_t i = 0; i < 4 && !p_glBindFramebuffer; ++i)
+                p_glBindFramebuffer = (PFN_glBindFramebuffer)wglGetProcAddress(n[i]);
+        }
+        if (!p_glActiveTexture) {
+            static const char* n[] = { "glActiveTexture", "glActiveTextureARB" };
+            for (size_t i = 0; i < 2 && !p_glActiveTexture; ++i)
+                p_glActiveTexture = (PFN_glActiveTexture)wglGetProcAddress(n[i]);
+        }
+        const bool ok = p_glBindFramebuffer != nullptr && p_glActiveTexture != nullptr;
+        static int last = -1;
+        if ((int)ok != last) {
+            last = (int)ok;
+            if (ok) Log("[gl] extensoes GL ok: bindFbo=%p activeTex=%p",
+                (void*)p_glBindFramebuffer, (void*)p_glActiveTexture);
+            else    Log("[gl] extensoes GL parciais: bindFbo=%p activeTex=%p",
+                (void*)p_glBindFramebuffer, (void*)p_glActiveTexture);
+        }
+        return ok;
     }
 
     std::atomic<bool>     g_hooksLive{ false };
@@ -990,6 +1012,7 @@ namespace Hooks {
                 Log("[render] CONTEXTO GL MUDOU %p -> %p — recriando backend GL3", g_glrc, rc);
                 g_glrc = rc;
                 g_ctxChanges.fetch_add(1, std::memory_order_relaxed);
+                LoadGlExt();                    // >>> NOVO: agora ha' contexto corrente
                 ReinitGlBackend("contexto GL mudou");
             }
         }
@@ -1207,12 +1230,9 @@ namespace Hooks {
         SetStage(Stage::Init);
         Log("[input] INPUT_TEST_LEVEL=%d", INPUT_TEST_LEVEL);
 
-        if (!LoadGlExt())
-            Log("[gl] extensoes GL parciais: bindFbo=%p activeTex=%p",
-                (void*)p_glBindFramebuffer, (void*)p_glActiveTexture);
-        else
-            Log("[gl] extensoes GL ok: bindFbo=%p activeTex=%p",
-                (void*)p_glBindFramebuffer, (void*)p_glActiveTexture);
+        // >>> v38: aqui ainda pode nao haver contexto corrente. LoadGlExt loga
+        //          o estado e e' retentado no primeiro SwapBody.
+        LoadGlExt();
 
         if (!g_veh) g_veh = AddVectoredExceptionHandler(1, VehHandler);
 
