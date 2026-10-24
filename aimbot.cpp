@@ -31,10 +31,8 @@
 
 #include <cmath>
 #include <cstring>
-#include <string>
 #include <vector>
 #include <algorithm>
-#include <unordered_map>
 
 extern HMODULE g_hModule;
 
@@ -53,8 +51,6 @@ namespace Aimbot {
     static ULONGLONG s_lastTargetSwitch = 0;
     static float s_curAngle = 999.f;
     static int   s_curBone = -1;
-
-    static std::unordered_map<std::string, float> s_weaponStats;
 
     // =======================================================================
     //  snapshot de alvo
@@ -648,7 +644,6 @@ namespace Aimbot {
     }
 
     void Tick() { CoreTick(); }
-    void Update() { CoreTick(); }
 
     bool IsActive() { return s_active; }
 
@@ -743,7 +738,6 @@ namespace Aimbot {
         s_bestFrame = ~0ull;
         s_bestPlayer = nullptr;
         memset(s_vel, 0, sizeof(s_vel));
-        s_weaponStats.clear();
     }
 
     void Shutdown() {
@@ -755,7 +749,6 @@ namespace Aimbot {
         s_active = false;
         s_aimLocked = false;
         s_installed = false;
-        s_weaponStats.clear();
     }
 
     void DumpWeapon() {

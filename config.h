@@ -78,8 +78,6 @@ struct Config {
     bool  silentAim = false;
     bool  magicBullets = false;
 
-    // ---- ALIASES / CAMPOS NOVOS ----
-    bool  aimEnabled = true;
     bool  aimTeamCheck = false;
     int   aimSelect = 0;             // 0=angulo 1=dist 2=hibrido 3=tela
     bool  aimToggle = false;
@@ -101,9 +99,7 @@ struct Config {
     bool  triggerbot = false;
     int   triggerKey = VK_MENU;
     float triggerDelay = 30.f;
-    float triggerFov = 10.f;
     float triggerRadius = 10.f;
-    int   triggerBurst = 0;
 
     // ---- ARMA ----
     bool  noRecoil = false;
@@ -225,26 +221,8 @@ struct Config {
     bool  gunCustomizeUnlock = true;
     bool  gunCustomizeAllSlots = true;
 
-    bool  showAimTargetName = false;
     bool  showFpsGraph = false;
 
-    // ========================================================================
-    //  >>> v42 — campos referenciados pelo unlock.cpp (bloco de sync)
-    // ========================================================================
-    bool  aimVisOnly = true;
-    float espDist = 300.f;
-    float espFov = 90.f;
-    bool  fovCircle = false;
-    float fovCircleSize = 8.f;
-    bool  tracer = false;
-    float tracerColor[4] = { 0.f, 1.f, 0.f, 1.f };
-    float tracerWidth = 1.5f;
-    bool  radar = false;
-    float radarSize = 150.f;
-    int   trigKey = VK_MENU;
-    float trigDelay = 30.f;
-    float trigFov = 10.f;
-    int   trigBurst = 0;
 
     // ========================================================================
     //  >>> v42 — carteira / conta / janela de log
@@ -270,8 +248,6 @@ extern Config  g_cfg;
 #undef C
 #endif
 extern Config& C;
-
-#define C(f) g_cfg.f
 
 namespace ConfigIO {
     void Init();

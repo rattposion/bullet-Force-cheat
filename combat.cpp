@@ -11,9 +11,6 @@
 #include <atomic>
 #include <string.h>
 
-extern "C" int bfi_anticheat_obj;
-extern "C" int bfi_weapons_obj;
-
 namespace Combat {
 
     // ---------------------------------------------------------------- estado

@@ -667,16 +667,6 @@ namespace Unlock {
         return (C.currencyValue > 0) ? (long long)C.currencyValue : 999999LL;
     }
 
-    static void SyncCfg() {
-        C.aimVisOnly = C.aimVisible;
-        C.espDist = C.espMaxDist;
-        C.espFov = C.camFov;
-        C.fovCircle = C.showFovCircle;
-        C.trigKey = C.triggerKey;
-        C.trigDelay = C.triggerDelay;
-        C.trigFov = C.aimFov;
-        C.fovCircleSize = C.crosshairSize;
-    }
 
     // =========================================================================
     //  JSON da conta
@@ -2742,6 +2732,25 @@ namespace Unlock {
         Log("[unlock] install %s: arr@0x%X len=%d | armas=%d camos=%d chars=%d",
             BFI_UNLOCK_VER, g_offArr, g_arrLen,
             (int)Dupe::g_weapons.size(), (int)Dupe::g_camos.size(), (int)Dupe::g_chars.size());
+        if (g_arrLen > 0 && Dupe::WeaponCount() == 0) {
+            Log("[unlock] auto-build: armas no jogo=%d, lista vazia -> coletando", g_arrLen);
+            __try {
+                CollectWeapons();
+                CollectAttachs();
+                CollectCamos();
+                CollectChars();
+                Dupe::Save();
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                Log("[unlock] auto-build: EXCECAO durante coleta");
+            }
+            Log("[unlock] auto-build: armas=%d camos=%d chars=%d",
+                (int)Dupe::g_weapons.size(), (int)Dupe::g_camos.size(), (int)Dupe::g_chars.size());
+        }
+        if (C.accAuto && g_mnyN > 0) {
+            MoneyUnlockAll();
+            Log("[unlock] install: mirrors travados e forcados (%d espelhos)", g_mnyN);
+        }
         return true;
     }
 
@@ -2800,8 +2809,6 @@ namespace Unlock {
 
     // >>> v43.22: Tick separado em TickBody para o perfil medir o total real.
     static void TickBody() {
-        SyncCfg();
-
         const bool anyMoney = C.accAuto || C.moneyApplyNow || C.moneyRescan || C.moneyWritePrefs;
         const bool any = C.unlockAll || C.unlockWeapons || C.unlockSkins || C.unlockAttachments ||
             C.unlockCurrency || C.unlockLevel || C.unlockChars || C.applySelection ||

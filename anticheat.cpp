@@ -26,8 +26,6 @@
 #include <initializer_list>
 #include <vector>
 
-extern "C" int bfi_anticheat_obj = 0xACE;
-
 namespace {
 
     typedef uint32_t(*t_field_get_flags)(FieldInfo*);

@@ -219,8 +219,5 @@
     <ClCompile Include="unlock.cpp">
       <Filter>core\features.h</Filter>
     </ClCompile>
-    <ClCompile Include="recoil.cpp">
-      <Filter>core\features.h</Filter>
-    </ClCompile>
   </ItemGroup>
 </Project>

@@ -23,7 +23,8 @@ namespace Triggerbot {
         if (!SDK::g_localPlayer) return;
 
         if (SDK::M_shoot) {
-            il2cpp_runtime_invoke(SDK::M_shoot, SDK::g_localPlayer, nullptr, nullptr);
+            __try { il2cpp_runtime_invoke(SDK::M_shoot, SDK::g_localPlayer, nullptr, nullptr); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] Triggerbot::Fire(shoot)"); }
             return;
         }
         if (!SDK::M_FireBullet) return;
@@ -51,12 +52,14 @@ namespace Triggerbot {
             else if (strstr(tn, "Boolean")) args[k] = &b[k];
         }
 
-        il2cpp_runtime_invoke(SDK::M_FireBullet, SDK::g_localPlayer, args, nullptr);
+        __try { il2cpp_runtime_invoke(SDK::M_FireBullet, SDK::g_localPlayer, args, nullptr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] Triggerbot::Fire(bullet)"); }
     }
 
     void Tick() {
         if (!C.triggerbot) return;
         if (!SDK::g_localPlayer) return;
+        if (C.triggerKey && !(GetAsyncKeyState(C.triggerKey) & 0x8000)) return;
         if (GetTickCount64() < g_next) return;
 
         if (!SDK::M_shoot && !SDK::M_FireBullet) {

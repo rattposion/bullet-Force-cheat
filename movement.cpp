@@ -62,7 +62,8 @@ namespace Movement {
         if (!SDK::M_set_position || !tf) return;
         void* a[1];
         a[0] = &pos;
-        il2cpp_runtime_invoke(SDK::M_set_position, tf, a, nullptr);
+        __try { il2cpp_runtime_invoke(SDK::M_set_position, tf, a, nullptr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] Movement::SetPosition"); }
     }
 
     static bool IsGrounded(Il2CppObject* p, float dt) {

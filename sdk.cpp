@@ -447,6 +447,13 @@ namespace SDK {
     int    dbg_drawn = 0;
     Vec3   g_localPos{ 0.f, 0.f, 0.f };
     CRITICAL_SECTION g_targetCs;
+    struct CsGuard {
+        CRITICAL_SECTION* cs;
+        CsGuard(CRITICAL_SECTION* c) : cs(c) { EnterCriticalSection(cs); }
+        ~CsGuard() { LeaveCriticalSection(cs); }
+        CsGuard(const CsGuard&) = delete;
+        CsGuard& operator=(const CsGuard&) = delete;
+    };
     uint64_t g_frameId = 0;
 
     std::atomic<int> g_cursorState{ -1 };
@@ -1532,25 +1539,6 @@ namespace SDK {
         return true;
     }
 
-    bool VisibleLine(Vec3 a, Vec3 b) {
-        Vec2 sb;
-        if (!WorldToScreen(b, sb)) return false;
-
-        Vec3 a2 = a + (b - a) * 0.01f;
-        Vec2 sa;
-        if (!WorldToScreen(a2, sa)) {
-            sa.x = (float)ScreenW() * 0.5f;
-            sa.y = (float)ScreenH() * 0.5f;
-        }
-
-        const float W = (float)ScreenW();
-        const float H = (float)ScreenH();
-        auto inside = [&](const Vec2& p) {
-            return p.x > -W * 0.25f && p.x < W * 1.25f && p.y > -H * 0.25f && p.y < H * 1.25f;
-            };
-        return inside(sa) && inside(sb);
-    }
-
     // ======================= LINE OF SIGHT =======================
     static MethodInfo* FindPhysicsRay(const char* name, int nParams, int kind,
         const char* t0, const char* t1, const char* t2) {
@@ -1625,8 +1613,6 @@ namespace SDK {
                 kPhysics, M_raycast, kRayNames[g_rayKind], O_hitDist, O_hitCollider, (int)g_hitColIsId);
         }
     }
-
-    static MethodInfo* FindRaycast4() { ResolveRaycast(); return M_raycast; }
 
     bool LosReady() { if (!M_raycast) ResolveRaycast(); return M_raycast != nullptr; }
 
@@ -1939,29 +1925,6 @@ namespace SDK {
         return vis;
     }
 
-    bool RaycastTest(Vec3 from, Vec3 to, float& outHitDist) {
-        outHitDist = -1.f;
-        if (!M_raycast) ResolveRaycast();
-        if (!M_raycast) return false;
-        if (!O_hitDist) HitDistOffset();
-
-        Vec3 d = to - from;
-        float len = d.len();
-        if (len < 0.01f) return false;
-        Vec3 dir{ d.x / len, d.y / len, d.z / len };
-
-        alignas(16) unsigned char hitBuf[160];
-        memset(hitBuf, 0, sizeof(hitBuf));
-        if (!ShootRay(from, dir, len, hitBuf)) return false;
-
-        Vec3 hitPoint{ 0.f, 0.f, 0.f };
-        se_read_bytes(hitBuf, &hitPoint, sizeof(Vec3));
-        outHitDist = (hitPoint - from).len();
-        if (outHitDist < 0.01f)
-            se_read_bytes(hitBuf + O_hitDist, &outHitDist, sizeof(float));
-        return true;
-    }
-
     float CameraCotHalfFovY() {
         if (!g_camera) return 1.732f;
         Il2CppClass* ck = SafeClass(g_camera);
@@ -2000,17 +1963,20 @@ namespace SDK {
 
     Vec3 TargetAimPos(Il2CppObject* p, int boneMode) {
         if (!p) return Vec3();
-        EnterCriticalSection(&g_targetCs);
-        for (int i = 0; i < g_targetCount; ++i) {
-            if (g_targets[i].player != p) continue;
-            Target& t = g_targets[i];
-            Vec3 h = t.headBone ? GetPos(t.headBone) : t.head;
-            Vec3 f = t.footBone ? GetPos(t.footBone) : t.feet;
-            LeaveCriticalSection(&g_targetCs);
-            return BonePoint(h, f, boneMode);
+        Vec3 h{}, f{};
+        bool found = false;
+        {
+            CsGuard lock(&g_targetCs);
+            for (int i = 0; i < g_targetCount; ++i) {
+                if (g_targets[i].player != p) continue;
+                Target& t = g_targets[i];
+                h = t.headBone ? GetPos(t.headBone) : t.head;
+                f = t.footBone ? GetPos(t.footBone) : t.feet;
+                found = true;
+                break;
+            }
         }
-        LeaveCriticalSection(&g_targetCs);
-        return Vec3();
+        return found ? BonePoint(h, f, boneMode) : Vec3();
     }
 
     void LockTargets() { EnterCriticalSection(&g_targetCs); }
@@ -2452,38 +2418,39 @@ namespace SDK {
         std::sort(found.begin(), found.end(),
             [](const FoundEnt& a, const FoundEnt& b) { return a.slot < b.slot; });
 
-        EnterCriticalSection(&g_targetCs);
-        int c = 0;
-        for (auto& f : found) {
-            if (c >= kMaxTargets || f.slot < 0) break;
+        {
+            CsGuard lock(&g_targetCs);
+            int c = 0;
+            for (auto& f : found) {
+                if (c >= kMaxTargets || f.slot < 0) break;
 
-            Target& tgt = g_targets[c];
-            if (tgt.player != f.e) {
-                memset(&tgt, 0, sizeof(Target));
-                tgt.player = f.e;
-                tgt.obj = f.e;
-                tgt.slot = (uint32_t)f.slot;
-                tgt.team = ReadTeam(f.e);
-                tgt.pos = GetPos(f.e);
-                GetNameBuf(f.e, tgt.name, sizeof(tgt.name));
-                if (O_weapon) se_read_int(f.e, O_weapon, &tgt.weapon);
+                Target& tgt = g_targets[c];
+                if (tgt.player != f.e) {
+                    memset(&tgt, 0, sizeof(Target));
+                    tgt.player = f.e;
+                    tgt.obj = f.e;
+                    tgt.slot = (uint32_t)f.slot;
+                    tgt.team = ReadTeam(f.e);
+                    tgt.pos = GetPos(f.e);
+                    GetNameBuf(f.e, tgt.name, sizeof(tgt.name));
+                    if (O_weapon) se_read_int(f.e, O_weapon, &tgt.weapon);
 
-                Il2CppClass* ek = SafeClass(f.e);
-                const char* en = ek ? se_class_name(ek) : nullptr;
-                tgt.npc = (en && strstr(en, "NPC") != nullptr);
+                    Il2CppClass* ek = SafeClass(f.e);
+                    const char* en = ek ? se_class_name(ek) : nullptr;
+                    tgt.npc = (en && strstr(en, "NPC") != nullptr);
 
-                ResolveBones(tgt, f.e);
+                    ResolveBones(tgt, f.e);
+                }
+
+                tgt.health = ReadHealth(f.e);
+                tgt.alive = (tgt.health > 0.5f);
+                ResolveHeadFeet(tgt);
+                tgt.onScreen = false;
+                SyncAliases(tgt);
+                ++c;
             }
-
-            tgt.health = ReadHealth(f.e);
-            tgt.alive = (tgt.health > 0.5f);
-            ResolveHeadFeet(tgt);
-            tgt.onScreen = false;
-            SyncAliases(tgt);
-            ++c;
+            g_targetCount = c;
         }
-        g_targetCount = c;
-        LeaveCriticalSection(&g_targetCs);
 
         static ULONGLONG lastScan2 = 0;
         ULONGLONG nows = GetTickCount64();
@@ -2536,32 +2503,33 @@ namespace SDK {
         Vec3 eye = camTf ? GetPos(camTf) : g_localPos;
         if (eye.zero()) eye = Vec3(g_localPos.x, g_localPos.y + 1.6f, g_localPos.z);
 
-        EnterCriticalSection(&g_targetCs);
-        for (int i = 0; i < g_targetCount; ++i) {
-            Target& t = g_targets[i];
-            if (!t.player) continue;
-            if (!PlausibleObj(t.player)) { t.player = nullptr; t.obj = nullptr; continue; }
+        {
+            CsGuard lock(&g_targetCs);
+            for (int i = 0; i < g_targetCount; ++i) {
+                Target& t = g_targets[i];
+                if (!t.player) continue;
+                if (!PlausibleObj(t.player)) { t.player = nullptr; t.obj = nullptr; continue; }
 
-            t.health = ReadHealth(t.player);
-            t.alive = (t.health > 0.5f);
-            t.pos = GetPos(t.player);
-            ResolveHeadFeet(t);
+                t.health = ReadHealth(t.player);
+                t.alive = (t.health > 0.5f);
+                t.pos = GetPos(t.player);
+                ResolveHeadFeet(t);
 
-            float dx = t.head.x - g_localPos.x, dy = t.head.y - g_localPos.y, dz = t.head.z - g_localPos.z;
-            t.dist = sqrtf(dx * dx + dy * dy + dz * dz);
+                float dx = t.head.x - g_localPos.x, dy = t.head.y - g_localPos.y, dz = t.head.z - g_localPos.z;
+                t.dist = sqrtf(dx * dx + dy * dy + dz * dz);
 
-            const bool okH = WorldToScreen(t.head, t.scrHead);
-            const bool okF = WorldToScreen(t.feet, t.scrFeet);
+                const bool okH = WorldToScreen(t.head, t.scrHead);
+                const bool okF = WorldToScreen(t.feet, t.scrFeet);
 
-            const float h = (okH && okF) ? (t.scrFeet.y - t.scrHead.y) : 0.f;
-            t.onScreen = okH && okF
-                && (h > 1.f)
-                && t.scrFeet.y > -64.f
-                && t.scrHead.y < (float)ScreenH() + 64.f;
+                const float h = (okH && okF) ? (t.scrFeet.y - t.scrHead.y) : 0.f;
+                t.onScreen = okH && okF
+                    && (h > 1.f)
+                    && t.scrFeet.y > -64.f
+                    && t.scrHead.y < (float)ScreenH() + 64.f;
 
-            SyncAliases(t);
+                SyncAliases(t);
+            }
         }
-        LeaveCriticalSection(&g_targetCs);
 
         if ((C.espVisCheck || C.aimVisCheck) && LosReady()) {
             float cap = C.espMaxDist > C.aimMaxDist ? C.espMaxDist : C.aimMaxDist;
@@ -2570,7 +2538,7 @@ namespace SDK {
 
             Il2CppObject* localTf = g_localPlayer ? CachedTransform(g_localPlayer) : nullptr;
 
-            EnterCriticalSection(&g_targetCs);
+            CsGuard lock(&g_targetCs);
             const int n = g_targetCount;
             int budget = C.losPerFrame > 0 ? C.losPerFrame : 8;
             if (budget > n) budget = n;
@@ -2593,19 +2561,17 @@ namespace SDK {
                 ++done;
             }
             if (n > 0) losCursor = (losCursor + budget) % n;
-            LeaveCriticalSection(&g_targetCs);
         }
 
         PublishFrame();
     }
 
     void SnapshotInto(std::vector<Target>& out) {
-        EnterCriticalSection(&g_targetCs);
+        CsGuard lock(&g_targetCs);
         const int count = (g_targetCount < 0) ? 0 :
             ((g_targetCount > MAX_TARGETS) ? MAX_TARGETS : g_targetCount);
         out.resize((size_t)count);
         if (count > 0) memcpy(out.data(), g_targets, (size_t)count * sizeof(Target));
-        LeaveCriticalSection(&g_targetCs);
     }
 
     std::vector<Target> Snapshot() {
@@ -3057,9 +3023,5 @@ namespace SDK {
         int t = -1;
         if (!ReadTeamEx(o, t)) return -1;
         return t;
-    }
-
-    int GetLocalTeam() {
-        return g_localTeam;
     }
 } // namespace SDK

@@ -361,19 +361,34 @@ namespace ESP
                 const ImU32 boxCol = e.aim ? IM_COL32(255, 255, 60, 255)
                     : (e.visible ? Col(C.espBoxColor) : Col(C.noVisColor));
                 const ImU32 txtCol = e.visible ? Col(C.visColor) : Col(C.noVisColor);
+                const float thick = C.espThickness;
 
-                dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), boxCol, 0.0f, 0, 1.6f);
+                if (C.espBox) {
+                    dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), boxCol, 0.0f, 0, thick);
+                    if (C.espFill)
+                        dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
+                            (boxCol & 0x00FFFFFFu) | 0x1E000000u);
+                }
 
-                const float cx = (x0 + x1) * 0.5f;
-                dl->AddLine(ImVec2(W * 0.5f, H - 2.0f), ImVec2(cx, y1), boxCol, 1.0f);
+                if (C.espSnapline) {
+                    const float cx = (x0 + x1) * 0.5f;
+                    dl->AddLine(ImVec2(W * 0.5f, H - 2.0f), ImVec2(cx, y1), boxCol, 1.0f);
+                }
 
-                dl->AddText(ImVec2(x0, y0 - 13.0f), txtCol, e.name);
+                float textY = y0 - C.espFontSize - 1.0f + C.espOffY;
 
-                char buf[24];
-                sprintf_s(buf, "%.0fm", static_cast<double>(e.dist));
-                dl->AddText(ImVec2(x0, y1 + 2.0f), txtCol, buf);
+                if (C.espName) {
+                    dl->AddText(ImVec2(x0, textY), txtCol, e.name);
+                    textY -= C.espFontSize;
+                }
 
-                if (e.health > 0.0f)
+                if (C.espDistance) {
+                    char buf[24];
+                    sprintf_s(buf, "%.0fm", static_cast<double>(e.dist));
+                    dl->AddText(ImVec2(x0, y1 + 2.0f), txtCol, buf);
+                }
+
+                if (C.espHealth && e.health > 0.0f)
                 {
                     float frac = e.health / 100.0f;
                     if (frac < 0.0f) frac = 0.0f;
@@ -384,6 +399,13 @@ namespace ESP
                         IM_COL32(0, 0, 0, 140));
                     dl->AddRectFilled(ImVec2(x0 - 5.0f, y1 - bh * frac), ImVec2(x0 - 2.0f, y1),
                         ImColor::HSV(frac * 0.33f, 0.85f, 1.0f));
+
+                    if (C.espHealthNum) {
+                        char hpBuf[16];
+                        sprintf_s(hpBuf, "%.0f", static_cast<double>(e.health));
+                        dl->AddText(ImVec2(x0 - 18.0f, y1 - bh * frac - 6.0f),
+                            IM_COL32(255, 255, 255, 200), hpBuf);
+                    }
                 }
 
                 ++desenhados;

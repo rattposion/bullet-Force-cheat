@@ -32,7 +32,6 @@ namespace Aimbot {
     // -----------------------------------------------------------------------
     bool  Install();            // chamado por Hooks::Init
     void  Tick();               // chamado por Combat::S_Aimbot
-    void  Update();             // alias interno (mesmo que Tick)
     void  Shutdown();
     void  OnDomainReload();
 

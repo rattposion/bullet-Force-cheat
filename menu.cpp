@@ -37,27 +37,7 @@
 #error "config.h desatualizado (BFI_CONFIG_VER < 4315). Substitua o config.h da pasta do projeto."
 #endif
 
-namespace Unlock {
-    void        DumpShop();
-    void        DumpCredits();
-    void        ShopForceAll();
-    int         ForceMirrors(long long value, long long mode);
-    void        DumpMirrors();
-
-    int         MoneyCount();
-    const char* MoneyName(int i);
-    long long   MoneyValue(int i);
-    void        MoneySet(int i, long long v);
-    bool        MoneyLocked(int i);
-    void        MoneySetLock(int i, bool on);
-    int         MoneyLockByName(const char* cls, const char* fld, long long v);
-    void        MoneyUnlockAll();
-    void        MoneyRefresh();
-    bool        MoneyReady();
-    long long   MoneyReal();
-
-    void        BuildAllNow();          // <<< v43.16
-}
+// Unlock API agora inteiramente exportada pelo unlock.h
 
 namespace Menu {
 
@@ -413,14 +393,13 @@ namespace Menu {
         ImGui::ColorEdit4("Cor do FOV", C.aimColor, ImGuiColorEditFlags_NoInputs);
 
         ImGui::Separator();
-        ImGui::Checkbox("Aimbot (alias)", &C.aimEnabled);
-        ImGui::SameLine(); ImGui::Checkbox("Alternar (alias)", &C.aimToggle);
-        ImGui::Checkbox("Ignorar time (alias)", &C.aimTeamCheck);
-        ImGui::SameLine(); ImGui::Checkbox("Checar visao (alias)", &C.aimVisCheck);
+        ImGui::Checkbox("Alternar", &C.aimToggle);
+        ImGui::SameLine(); ImGui::Checkbox("Ignorar time", &C.aimTeamCheck);
+        ImGui::Checkbox("Checar visao", &C.aimVisCheck);
+        ImGui::SameLine(); ImGui::Checkbox("Visao estrita", &C.aimStrictVis);
         ImGui::Combo("Selecao", &C.aimSelect, "Distancia\0Menor FOV\0Menor vida\0");
         ImGui::Checkbox("Auto fire", &C.aimAutoFire);
         ImGui::SameLine(); ImGui::SliderInt("Delay tiro (ms)", &C.aimFireDelayMs, 0, 300);
-        ImGui::Checkbox("Mostrar nome do alvo", &C.showAimTargetName);
     }
 
     // ========================================================== TRIGGER
@@ -430,10 +409,6 @@ namespace Menu {
         ImGui::SameLine(); KeyButton("Tecla", &C.triggerKey);
         ImGui::SliderFloat("Delay (ms)", &C.triggerDelay, 0.f, 500.f, "%.0f");
         ImGui::SliderFloat("Raio (px)", &C.triggerRadius, 0.f, 60.f, "%.0f");
-        ImGui::SliderFloat("FOV", &C.triggerFov, 1.f, 30.f, "%.0f");
-        ImGui::SliderInt("Burst (rajada)", &C.triggerBurst, 0, 10);
-        ImGui::Separator();
-        ImGui::SliderInt("Burst (alias)", &C.trigBurst, 0, 10);
     }
 
     // ========================================================== VISUAL
@@ -458,15 +433,6 @@ namespace Menu {
         ImGui::Checkbox("Checar visao", &C.espVisCheck);
         ImGui::SameLine(); ImGui::Checkbox("Linha de visao", &C.espVisLine);
         ImGui::SliderInt("LOS por frame", &C.losPerFrame, 1, 32);
-
-        ImGui::Separator();
-        ImGui::Checkbox("Tracer", &C.tracer);
-        ImGui::SameLine();
-        ImGui::ColorEdit4("Cor tracer", C.tracerColor, ImGuiColorEditFlags_NoInputs);
-        ImGui::SliderFloat("Espessura tracer", &C.tracerWidth, 0.01f, 8.0f, "%.2f");
-        ImGui::Checkbox("Radar", &C.radar);
-        ImGui::SameLine();
-        ImGui::SliderFloat("Tam. radar", &C.radarSize, 50.f, 400.f, "%.0f");
 
         ImGui::Separator();
         ImGui::SliderFloat("Espessura", &C.espThickness, 0.5f, 5.0f, "%.1f");

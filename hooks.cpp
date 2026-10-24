@@ -273,17 +273,6 @@ namespace Hooks {
         return sqrtf(dx * dx + dy * dy + dz * dz);
     }
 
-    static bool Writable(const void* p) {
-        uintptr_t a = (uintptr_t)p;
-        if (a < 0x10000 || a > 0x00007FFFFFFFFFFFULL) return false;
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
-        if (mbi.State != MEM_COMMIT) return false;
-        const DWORD ruim = PAGE_NOACCESS | PAGE_GUARD | PAGE_READONLY |
-            PAGE_EXECUTE | PAGE_EXECUTE_READ;
-        return (mbi.Protect & ruim) == 0;
-    }
-
     static uint32_t DrainGlErrors(const char* tag) {
         uint32_t n = 0;
         GLenum e;
@@ -572,19 +561,6 @@ namespace Hooks {
         }
         static ImFont s_dummy;
         return s_dummy;
-    }
-
-    [[maybe_unused]] static void ApplyNoRecoil() {
-        if (!C.noRecoil || !SDK::g_localPlayer) return;
-        __try {
-            Il2CppObject* ct = SDK::CamTfObj();
-            if (!ct || !Writable(ct)) return;
-            void* dst = (uint8_t*)ct + SDK::O_rotation;
-            if (!Writable(dst)) return;
-            ::Quat pr = SDK::GetPlayerRot(SDK::g_localPlayer);
-            SDK::SetRot(ct, pr);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) { g_avCount.fetch_add(1, std::memory_order_relaxed); }
     }
 
     static bool g_cursorFreed = false;

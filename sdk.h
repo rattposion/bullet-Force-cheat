@@ -74,7 +74,6 @@ namespace SDK {
     bool  IsEnemy(Il2CppObject* o);
     int   TeamRelation(Il2CppObject* o);
     int   GetTeamId(Il2CppObject* o);
-    int   GetLocalTeam();
     float GetHealth(Il2CppObject* o);
     float GetHealthRaw(Il2CppObject* o);            // NOVO — sem normalizar
     bool  SetHealth(Il2CppObject* o, float value);  // NOVO — respeita SyncVar
@@ -91,7 +90,6 @@ namespace SDK {
     std::string GetName(Il2CppObject* o);
 
     bool  WorldToScreen(Vec3 w, Vec2& s);
-    bool  VisibleLine(Vec3 a, Vec3 b);
     Vec3  TargetAimPos(Il2CppObject* p, int boneMode);
     Vec3  BonePoint(Vec3 head, Vec3 feet, int boneMode);
 
@@ -124,8 +122,6 @@ namespace SDK {
     bool  HasLineOfSightExRaw(Vec3 eye, Vec3 aim,
         Il2CppObject* localTf, Il2CppObject* targetTf);
     bool  TargetVisible(int idx, Vec3 eye, Vec3 aim);
-    bool  RaycastTest(Vec3 from, Vec3 to, float& outHitDist);
-
     void  LosInvalidate();
     bool  LosReady();
     const char* LosBackend();
@@ -194,7 +190,6 @@ using SDK::SafeReadObjPub;
 using SDK::ValidInstance;
 using SDK::SafeClass;
 
-using SDK::VisibleLine;
 using SDK::HasLineOfSight;
 using SDK::HasLineOfSightEx;
 using SDK::HasLineOfSightExRaw;
@@ -202,8 +197,6 @@ using SDK::LosInvalidate;
 using SDK::LosReady;
 using SDK::LosBackend;
 using SDK::TargetVisible;
-using SDK::RaycastTest;
-
 using SDK::BonePoint;
 using SDK::FindBoneContains;
 using SDK::GetBonePos;
@@ -219,7 +212,6 @@ using SDK::SetHealth;
 using SDK::IsA;
 using SDK::IsEnemy;
 using SDK::GetTeamId;
-using SDK::GetLocalTeam;
 using SDK::TeamRelation;
 using SDK::GetName;
 using SDK::GetNameBuf;

@@ -133,7 +133,6 @@ namespace Aimbot {
     namespace Silent { bool Override(Vec3 origin, Vec3& dir); }
 }
 
-namespace Recoil { void Install(); void Tick(); }
 namespace Triggerbot { bool Install(); void Tick(); }
 
 namespace AntiCheat {

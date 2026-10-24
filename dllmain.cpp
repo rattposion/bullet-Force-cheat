@@ -205,7 +205,6 @@ static DWORD WINAPI Main(LPVOID)
     Aimbot::Install();
     Triggerbot::Install();
     AntiCheat::Install();
-    Recoil::Install();
     Log("[bfi] modulos de feature inicializados");
 
     g_phase = "done";

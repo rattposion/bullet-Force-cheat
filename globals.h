@@ -36,13 +36,3 @@ void   Log(VN_PRINTF_FMT const char* fmt, ...);
 size_t LogSnapshot(char* dst, size_t cap);
 void   LogClearRing();
 
-// =====================================================================
-//  Macro C - ACESSO DUPLO AO MESMO OBJETO
-// =====================================================================
-//      C.esp   -> usa a REFERENCIA global "Config& C"
-//      C(esp)  -> usa esta MACRO, que expande para g_cfg.esp
-// =====================================================================
-#ifdef C
-#undef C
-#endif
-#define C(...) g_cfg.__VA_ARGS__

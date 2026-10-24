@@ -60,7 +60,8 @@ namespace Misc {
         float v = C.camFov;
         void* a[1];
         a[0] = &v;
-        il2cpp_runtime_invoke(SDK::M_set_fov, cam, a, nullptr);
+        __try { il2cpp_runtime_invoke(SDK::M_set_fov, cam, a, nullptr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] Misc::set_fov"); }
     }
 
 } // namespace Misc

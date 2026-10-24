@@ -20,7 +20,7 @@
 namespace Unlock {
 
     // ------------------------------------------------------------------------
-    //  Install() — RETORNO bool (igual em todo o projeto: unlock.cpp, recoil.cpp)
+    //  Install() — RETORNO bool (idempotente: 2a chamada -> false)
     //  Idempotente: 2a chamada -> false.
     // ------------------------------------------------------------------------
     bool Install();
@@ -91,7 +91,12 @@ namespace Unlock {
     
     void        DumpMirrors();
     void        DumpShop();
+    void        DumpCredits();
     long long   MoneyReal();             // valor REAL da conta (JSON), -1 se nao leu
+
+    void        BuildAllNow();           // coleta direta (armas+camos+chars+anexos)
+    void        RequestApply();          // forca re-aplicacao do loadout selecionado
+    void        RequestApplySlot(int slot);
 } // namespace Unlock
 
 #endif // BFI_UNLOCK_H

@@ -1,9 +1,6 @@
 // ============================================================================
 //  weapons.cpp — stats de arma + anti-recoil por neutralizacao de campos
 // ============================================================================
-#ifndef BFI_WEAPONS_CPP
-#define BFI_WEAPONS_CPP
-
 #include "features.h"
 #include "sdk.h"
 #include "hooks.h"
@@ -14,8 +11,6 @@
 #include <cstring>
 #include <vector>
 #include <atomic>
-
-extern "C" __declspec(selectany) int bfi_weapons_obj = 0xBF;
 
 namespace Weapons {
 
@@ -446,5 +441,3 @@ namespace Weapons {
 #undef W_DIAG
 
 } // namespace Weapons
-
-#endif // BFI_WEAPONS_CPP
