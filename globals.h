@@ -5,11 +5,10 @@
 // =====================================================================
 
 #include "deps.h"
+#include <cstddef>
 
 // ---------------------------------------------------------------------
 //  Config
-//  A definicao completa de Config vive em outro arquivo. Aqui apenas a
-//  declaracao antecipada, suficiente para os simbolos abaixo.
 // ---------------------------------------------------------------------
 struct Config;
 
@@ -28,32 +27,20 @@ extern HMODULE g_hModule;
 #  define VN_PRINTF_FMT
 #endif
 
-void LogInit();
-void Log(VN_PRINTF_FMT const char* fmt, ...);
+void   LogInit();
+void   Log(VN_PRINTF_FMT const char* fmt, ...);
+
+// Ring buffer em memoria: o menu le o log daqui (sem tocar no arquivo).
+// LogSnapshot escreve o texto das ultimas linhas em 'dst' (NUL-terminated)
+// e devolve o numero de bytes escritos.
+size_t LogSnapshot(char* dst, size_t cap);
+void   LogClearRing();
 
 // =====================================================================
 //  Macro C - ACESSO DUPLO AO MESMO OBJETO
 // =====================================================================
-//
-//  Existem DUAS formas de tocar os mesmos campos de g_cfg:
-//
-//      C.esp        -> usa a REFERENCIA global "Config& C"
-//      C(esp)       -> usa esta MACRO, que expande para g_cfg.esp
-//
-//  Como a macro e "function-like", ela so expande quando "C" e seguido
-//  de "(". Portanto "C.esp" NAO e tocado pela macro e resolve para a
-//  referencia. As duas formas apontam para o MESMO objeto (g_cfg).
-//
-//  Regras praticas:
-//    - Qualquer sintaxe que precise do valor/referencia do objeto usa
-//      "C" (sem parenteses): &C, sizeof(C), f(C), C.esp = 1.f;
-//    - A forma curta de campo e C(campo).
-//    - "C" seguido de "(" SEMPRE expande. Nao existe uso de C como
-//      algo chamavel, entao nao ha ambiguidade.
-//
-//  ATENCAO: a macro e definida aqui, DEPOIS de todos os includes de
-//  terceiros. Assim "imgui.h"/"MinHook.h" nao enxergam "C" como macro.
-//  Se algum header posterior definir "C", ele sobrescreveria esta macro.
+//      C.esp   -> usa a REFERENCIA global "Config& C"
+//      C(esp)  -> usa esta MACRO, que expande para g_cfg.esp
 // =====================================================================
 #ifdef C
 #undef C

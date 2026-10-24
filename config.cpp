@@ -1,6 +1,6 @@
 // ============================================================================
-//  config.cpp — ini texto (chave=valor). Campo novo = chave nova; se a chave
-//  nao existir no arquivo, o valor PADRAO do struct e' mantido.
+//  config.cpp — ini texto (chave=valor) via TABELA PLANA (sem C1061).
+//  Campo novo = 1 linha na tabela. Chave ausente no arquivo = padrao mantido.
 // ============================================================================
 #include "config.h"
 #include "common.h"
@@ -13,7 +13,6 @@ extern HMODULE g_hModule;
 Config  g_cfg;
 Config& C = g_cfg;
 
-// ---------------------------------------------------------------------
 static const char* CfgPath() {
     static char buf[MAX_PATH] = { 0 };
     if (!buf[0]) {
@@ -25,91 +24,129 @@ static const char* CfgPath() {
     return buf;
 }
 
-static void WCol(FILE* f, const char* k, const float c[4]) {
-    fprintf(f, "%s=%.4f %.4f %.4f %.4f\n", k, c[0], c[1], c[2], c[3]);
-}
-static void RCol(const char* v, float c[4]) {
-    sscanf_s(v, "%f %f %f %f", &c[0], &c[1], &c[2], &c[3]);
-}
+// t: 0=bool 1=int 2=float 3=float[4] 4=char[n]
+struct CfgE { const char* k; int t; void* p; int n; };
+
+static CfgE kCfg[] = {
+    { "menuOpen", 0, &g_cfg.menuOpen, 0 },{ "menuKey", 1, &g_cfg.menuKey, 0 },
+    { "panicKey", 1, &g_cfg.panicKey, 0 },{ "saveKey", 1, &g_cfg.saveKey, 0 },
+    { "unloadKey", 1, &g_cfg.unloadKey, 0 },
+
+    { "esp", 0, &g_cfg.esp, 0 },{ "espBox", 0, &g_cfg.espBox, 0 },
+    { "espFill", 0, &g_cfg.espFill, 0 },{ "espName", 0, &g_cfg.espName, 0 },
+    { "espHealth", 0, &g_cfg.espHealth, 0 },{ "espHealthNum", 0, &g_cfg.espHealthNum, 0 },
+    { "espWeapon", 0, &g_cfg.espWeapon, 0 },{ "espDistance", 0, &g_cfg.espDistance, 0 },
+    { "espSnapline", 0, &g_cfg.espSnapline, 0 },{ "espSkeleton", 0, &g_cfg.espSkeleton, 0 },
+    { "espNpc", 0, &g_cfg.espNpc, 0 },{ "teamCheck", 0, &g_cfg.teamCheck, 0 },
+    { "fps", 0, &g_cfg.fps, 0 },
+    { "espVisCheck", 0, &g_cfg.espVisCheck, 0 },{ "espVisLine", 0, &g_cfg.espVisLine, 0 },
+    { "losPerFrame", 1, &g_cfg.losPerFrame, 0 },
+    { "espThickness", 2, &g_cfg.espThickness, 0 },{ "espMaxDist", 2, &g_cfg.espMaxDist, 0 },
+    { "espFontSize", 2, &g_cfg.espFontSize, 0 },{ "espOffY", 2, &g_cfg.espOffY, 0 },
+    { "espScaleY", 2, &g_cfg.espScaleY, 0 },{ "espBodyH", 2, &g_cfg.espBodyH, 0 },
+    { "espColor", 3, g_cfg.espColor, 0 },{ "espBoxColor", 3, g_cfg.espBoxColor, 0 },
+    { "espTextColor", 3, g_cfg.espTextColor, 0 },{ "espSkelColor", 3, g_cfg.espSkelColor, 0 },
+    { "visColor", 3, g_cfg.visColor, 0 },{ "noVisColor", 3, g_cfg.noVisColor, 0 },
+
+    { "aimbot", 0, &g_cfg.aimbot, 0 },{ "aimKey", 1, &g_cfg.aimKey, 0 },
+    { "aimFov", 2, &g_cfg.aimFov, 0 },{ "aimSmooth", 2, &g_cfg.aimSmooth, 0 },
+    { "aimBone", 1, &g_cfg.aimBone, 0 },{ "aimMode", 1, &g_cfg.aimMode, 0 },
+    { "aimVisible", 0, &g_cfg.aimVisible, 0 },
+    { "aimVisCheck", 0, &g_cfg.aimVisCheck, 0 },{ "aimStrictVis", 0, &g_cfg.aimStrictVis, 0 },
+    { "aimTeam", 0, &g_cfg.aimTeam, 0 },{ "aimRotate", 0, &g_cfg.aimRotate, 0 },
+    { "showFovCircle", 0, &g_cfg.showFovCircle, 0 },{ "aimMaxDist", 2, &g_cfg.aimMaxDist, 0 },
+    { "aimColor", 3, g_cfg.aimColor, 0 },
+    { "aimSelect", 1, &g_cfg.aimSelect, 0 },{ "aimToggle", 0, &g_cfg.aimToggle, 0 },
+    { "aimAutoFire", 0, &g_cfg.aimAutoFire, 0 },{ "aimFireDelayMs", 1, &g_cfg.aimFireDelayMs, 0 },
+    { "silentAim", 0, &g_cfg.silentAim, 0 },{ "magicBullets", 0, &g_cfg.magicBullets, 0 },
+
+    { "triggerbot", 0, &g_cfg.triggerbot, 0 },{ "triggerKey", 1, &g_cfg.triggerKey, 0 },
+    { "triggerDelay", 2, &g_cfg.triggerDelay, 0 },{ "triggerRadius", 2, &g_cfg.triggerRadius, 0 },
+
+    { "noRecoil", 0, &g_cfg.noRecoil, 0 },{ "noSpread", 0, &g_cfg.noSpread, 0 },
+    { "infAmmo", 0, &g_cfg.infAmmo, 0 },{ "noReload", 0, &g_cfg.noReload, 0 },
+    { "rapidFire", 0, &g_cfg.rapidFire, 0 },
+
+    { "speedHack", 0, &g_cfg.speedHack, 0 },{ "speedValue", 2, &g_cfg.speedValue, 0 },
+    { "fly", 0, &g_cfg.fly, 0 },{ "flySpeed", 2, &g_cfg.flySpeed, 0 },
+    { "superJump", 0, &g_cfg.superJump, 0 },{ "jumpPower", 2, &g_cfg.jumpPower, 0 },
+    { "teleport", 0, &g_cfg.teleport, 0 },
+
+    { "bhop", 0, &g_cfg.bhop, 0 },{ "bhopKey", 1, &g_cfg.bhopKey, 0 },
+    { "bhopKeepSpeed", 0, &g_cfg.bhopKeepSpeed, 0 },{ "bhopSkipMenu", 0, &g_cfg.bhopSkipMenu, 0 },
+    { "bhopMode", 1, &g_cfg.bhopMode, 0 },{ "bhopHoldMs", 1, &g_cfg.bhopHoldMs, 0 },
+    { "bhopRePressMs", 1, &g_cfg.bhopRePressMs, 0 },{ "bhopJumpSpeed", 2, &g_cfg.bhopJumpSpeed, 0 },
+    { "shootInAir", 0, &g_cfg.shootInAir, 0 },{ "airFireKey", 1, &g_cfg.airFireKey, 0 },
+    { "airFireDelayMs", 1, &g_cfg.airFireDelayMs, 0 },
+
+    { "godmode", 0, &g_cfg.godmode, 0 },{ "godmodeValue", 2, &g_cfg.godmodeValue, 0 },
+    { "hitmarker", 0, &g_cfg.hitmarker, 0 },{ "camFov", 2, &g_cfg.camFov, 0 },
+    { "crosshair", 0, &g_cfg.crosshair, 0 },{ "crosshairSize", 2, &g_cfg.crosshairSize, 0 },
+    { "crosshairColor", 3, g_cfg.crosshairColor, 0 },{ "watermark", 0, &g_cfg.watermark, 0 },
+
+    { "showRiskAlert", 0, &g_cfg.showRiskAlert, 0 },{ "riskAlertBlink", 0, &g_cfg.riskAlertBlink, 0 },
+
+    { "antiCheat", 0, &g_cfg.antiCheat, 0 },{ "blockedNoZone", 0, &g_cfg.blockedNoZone, 0 },
+    { "blockedUnlock", 0, &g_cfg.blockedUnlock, 0 },{ "stage", 1, &g_cfg.stage, 0 },
+
+    { "unlockAll", 0, &g_cfg.unlockAll, 0 },{ "unlockWeapons", 0, &g_cfg.unlockWeapons, 0 },
+    { "unlockSkins", 0, &g_cfg.unlockSkins, 0 },{ "unlockAttachments", 0, &g_cfg.unlockAttachments, 0 },
+    { "unlockCurrency", 0, &g_cfg.unlockCurrency, 0 },{ "unlockChars", 0, &g_cfg.unlockChars, 0 },
+    { "fillLoadoutSlots", 0, &g_cfg.fillLoadoutSlots, 0 },{ "applySlots", 0, &g_cfg.applySlots, 0 },
+    { "slotWeapon[0]", 1, &g_cfg.slotWeapon[0], 0 },
+    { "slotWeapon[1]", 1, &g_cfg.slotWeapon[1], 0 },
+    { "slotWeapon[2]", 1, &g_cfg.slotWeapon[2], 0 },
+    { "currencyValue", 1, &g_cfg.currencyValue, 0 },{ "unlockInterval", 2, &g_cfg.unlockInterval, 0 },
+    { "skinChanger", 0, &g_cfg.skinChanger, 0 },{ "skinIndex", 1, &g_cfg.skinIndex, 0 },
+    { "unlockLevel", 1, &g_cfg.unlockLevel, 0 },
+
+    { "forceNames", 0, &g_cfg.forceNames, 0 },
+    { "weaponName", 4, g_cfg.weaponName, (int)sizeof(g_cfg.weaponName) },
+    { "skinName", 4, g_cfg.skinName, (int)sizeof(g_cfg.skinName) },
+    { "attachName", 4, g_cfg.attachName, (int)sizeof(g_cfg.attachName) },
+
+    { "applySelection", 0, &g_cfg.applySelection, 0 },{ "loadoutSlot", 1, &g_cfg.loadoutSlot, 0 },
+    { "selWeapon", 1, &g_cfg.selWeapon, 0 },{ "selCamo", 1, &g_cfg.selCamo, 0 },
+    { "selChar", 1, &g_cfg.selChar, 0 },
+    { "selAttach[0]", 1, &g_cfg.selAttach[0], 0 },
+    { "selAttach[1]", 1, &g_cfg.selAttach[1], 0 },
+    { "selAttach[2]", 1, &g_cfg.selAttach[2], 0 },
+    { "charName", 4, g_cfg.charName, (int)sizeof(g_cfg.charName) },
+
+    { "probeLog", 0, &g_cfg.probeLog, 0 },{ "beatLog", 0, &g_cfg.beatLog, 0 },
+    { "showFpsGraph", 0, &g_cfg.showFpsGraph, 0 },
+
+    // ---- CONTA / DINHEIRO ----
+    { "moneyOnlyWallet", 0, &g_cfg.moneyOnlyWallet, 0 },
+    { "moneyWritePrefs", 0, &g_cfg.moneyWritePrefs, 0 },
+    { "moneyMode", 1, &g_cfg.moneyMode, 0 },
+    { "moneyIntervalMs", 1, &g_cfg.moneyIntervalMs, 0 },
+    { "accAuto", 0, &g_cfg.accAuto, 0 },
+    { "accGold", 1, &g_cfg.accGold, 0 },
+    { "accCases", 1, &g_cfg.accCases, 0 },
+
+    { "logAutoScroll", 0, &g_cfg.logAutoScroll, 0 },
+    { "logFilter", 1, &g_cfg.logFilter, 0 },
+};
 
 namespace ConfigIO {
 
     void Save() {
         FILE* f = nullptr;
         if (fopen_s(&f, CfgPath(), "w") != 0 || !f) return;
-
-#define S_B(v) fprintf(f, #v "=%d\n", g_cfg.v ? 1 : 0)
-#define S_I(v) fprintf(f, #v "=%d\n", g_cfg.v)
-#define S_F(v) fprintf(f, #v "=%.4f\n", g_cfg.v)
-
-        S_B(menuOpen); S_I(menuKey); S_I(panicKey); S_I(saveKey); S_I(unloadKey);
-
-        S_B(esp); S_B(espBox); S_B(espFill); S_B(espName); S_B(espHealth);
-        S_B(espHealthNum); S_B(espWeapon); S_B(espDistance); S_B(espSnapline);
-        S_B(espSkeleton); S_B(espNpc); S_B(teamCheck); S_B(fps);
-        S_B(espVisCheck); S_B(espVisLine);
-        S_I(losPerFrame);
-        S_F(espThickness); S_F(espMaxDist); S_F(espFontSize);
-        S_F(espOffY); S_F(espScaleY); S_F(espBodyH);
-        WCol(f, "espColor", g_cfg.espColor);
-        WCol(f, "espBoxColor", g_cfg.espBoxColor);
-        WCol(f, "espTextColor", g_cfg.espTextColor);
-        WCol(f, "espSkelColor", g_cfg.espSkelColor);
-        WCol(f, "visColor", g_cfg.visColor);
-        WCol(f, "noVisColor", g_cfg.noVisColor);
-
-        S_B(aimbot); S_I(aimKey); S_F(aimFov); S_F(aimSmooth); S_I(aimBone);
-        S_I(aimMode); S_B(aimVisible); S_B(aimVisCheck); S_B(aimStrictVis);
-        S_B(aimTeam); S_B(aimRotate);
-        S_B(showFovCircle); S_F(aimMaxDist);
-        WCol(f, "aimColor", g_cfg.aimColor);
-
-        S_I(aimSelect); S_B(aimToggle); S_B(aimAutoFire); S_I(aimFireDelayMs);
-
-        S_B(silentAim); S_B(magicBullets);
-
-        S_B(triggerbot); S_I(triggerKey); S_F(triggerDelay); S_F(triggerRadius);
-
-        S_B(noRecoil); S_B(noSpread); S_B(infAmmo); S_B(noReload); S_B(rapidFire);
-
-        S_B(speedHack); S_F(speedValue); S_B(fly); S_F(flySpeed);
-        S_B(superJump); S_F(jumpPower); S_B(teleport);
-
-        // ---- BUNNYHOP / TIRO NO AR ----
-        S_B(bhop); S_I(bhopKey); S_B(bhopKeepSpeed); S_B(bhopSkipMenu);
-        S_I(bhopMode); S_I(bhopHoldMs); S_I(bhopRePressMs); S_F(bhopJumpSpeed);
-        S_B(shootInAir); S_I(airFireKey); S_I(airFireDelayMs);
-
-        S_B(godmode); S_F(godmodeValue);
-        S_B(hitmarker); S_F(camFov);
-        S_B(crosshair); S_F(crosshairSize);
-        WCol(f, "crosshairColor", g_cfg.crosshairColor);
-        S_B(watermark);
-
-        // ---- ALERTA DE RISCO ----
-        S_B(showRiskAlert); S_B(riskAlertBlink);
-
-        S_B(antiCheat); S_B(blockedNoZone); S_B(blockedUnlock); S_I(stage);
-
-        // ---- UNLOCK ----
-        S_B(unlockAll); S_B(unlockWeapons); S_B(unlockSkins);
-        S_B(unlockAttachments); S_B(unlockCurrency);
-        S_B(unlockChars);
-        S_B(fillLoadoutSlots); S_B(applySlots);
-        S_I(slotWeapon[0]); S_I(slotWeapon[1]); S_I(slotWeapon[2]);
-        S_I(currencyValue); S_F(unlockInterval);
-        S_B(skinChanger); S_I(skinIndex); S_I(unlockLevel);
-
-        // ---- SELECAO / LOG ----
-        S_B(applySelection); S_I(loadoutSlot);
-        S_I(selWeapon); S_I(selCamo); S_I(selChar);
-        S_I(selAttach[0]); S_I(selAttach[1]); S_I(selAttach[2]);
-        S_B(probeLog); S_B(beatLog); S_B(showFpsGraph);
-
-#undef S_B
-#undef S_I
-#undef S_F
-
+        for (size_t i = 0; i < sizeof(kCfg) / sizeof(kCfg[0]); ++i) {
+            CfgE& e = kCfg[i];
+            switch (e.t) {
+            case 0: fprintf(f, "%s=%d\n", e.k, (*(bool*)e.p) ? 1 : 0); break;
+            case 1: fprintf(f, "%s=%d\n", e.k, *(int*)e.p); break;
+            case 2: fprintf(f, "%s=%.4f\n", e.k, *(float*)e.p); break;
+            case 3: {
+                float* c = (float*)e.p;
+                fprintf(f, "%s=%.4f %.4f %.4f %.4f\n", e.k, c[0], c[1], c[2], c[3]); break;
+            }
+            case 4: fprintf(f, "%s=%s\n", e.k, (const char*)e.p); break;
+            }
+        }
         fclose(f);
         Log("[cfg] salvo em %s", CfgPath());
     }
@@ -117,8 +154,7 @@ namespace ConfigIO {
     void Load() {
         FILE* f = nullptr;
         if (fopen_s(&f, CfgPath(), "r") != 0 || !f) { Log("[cfg] sem arquivo, usando padroes"); return; }
-
-        char line[256];
+        char line[512];
         while (fgets(line, sizeof(line), f)) {
             char* nl = strpbrk(line, "\r\n");
             if (nl) *nl = 0;
@@ -127,74 +163,21 @@ namespace ConfigIO {
             *eq = 0;
             const char* k = line;
             const char* v = eq + 1;
-
-#define L_B(x) else if (!strcmp(k, #x)) g_cfg.x = (atoi(v) != 0)
-#define L_I(x) else if (!strcmp(k, #x)) g_cfg.x = atoi(v)
-#define L_F(x) else if (!strcmp(k, #x)) g_cfg.x = (float)atof(v)
-#define L_C(x) else if (!strcmp(k, #x)) RCol(v, g_cfg.x)
-
-            if (0) {}
-
-            L_B(menuOpen); L_I(menuKey); L_I(panicKey); L_I(saveKey); L_I(unloadKey);
-
-            L_B(esp); L_B(espBox); L_B(espFill); L_B(espName); L_B(espHealth);
-            L_B(espHealthNum); L_B(espWeapon); L_B(espDistance); L_B(espSnapline);
-            L_B(espSkeleton); L_B(espNpc); L_B(teamCheck); L_B(fps);
-            L_B(espVisCheck); L_B(espVisLine);
-            L_I(losPerFrame);
-            L_F(espThickness); L_F(espMaxDist); L_F(espFontSize);
-            L_F(espOffY); L_F(espScaleY); L_F(espBodyH);
-            L_C(espColor); L_C(espBoxColor); L_C(espTextColor); L_C(espSkelColor);
-            L_C(visColor); L_C(noVisColor);
-
-            L_B(aimbot); L_I(aimKey); L_F(aimFov); L_F(aimSmooth); L_I(aimBone);
-            L_I(aimMode); L_B(aimVisible); L_B(aimVisCheck); L_B(aimStrictVis);
-            L_B(aimTeam); L_B(aimRotate);
-            L_B(showFovCircle); L_F(aimMaxDist);
-            L_C(aimColor);
-
-            L_I(aimSelect); L_B(aimToggle); L_B(aimAutoFire); L_I(aimFireDelayMs);
-
-            L_B(silentAim); L_B(magicBullets);
-
-            L_B(triggerbot); L_I(triggerKey); L_F(triggerDelay); L_F(triggerRadius);
-
-            L_B(noRecoil); L_B(noSpread); L_B(infAmmo); L_B(noReload); L_B(rapidFire);
-
-            L_B(speedHack); L_F(speedValue); L_B(fly); L_F(flySpeed);
-            L_B(superJump); L_F(jumpPower); L_B(teleport);
-
-            L_B(bhop); L_I(bhopKey); L_B(bhopKeepSpeed); L_B(bhopSkipMenu);
-            L_I(bhopMode); L_I(bhopHoldMs); L_I(bhopRePressMs); L_F(bhopJumpSpeed);
-            L_B(shootInAir); L_I(airFireKey); L_I(airFireDelayMs);
-
-            L_B(godmode); L_F(godmodeValue);
-            L_B(hitmarker); L_F(camFov);
-            L_B(crosshair); L_F(crosshairSize);
-            L_C(crosshairColor);
-            L_B(watermark);
-
-            L_B(showRiskAlert); L_B(riskAlertBlink);
-
-            L_B(antiCheat); L_B(blockedNoZone); L_B(blockedUnlock); L_I(stage);
-
-            L_B(unlockAll); L_B(unlockWeapons); L_B(unlockSkins);
-            L_B(unlockAttachments); L_B(unlockCurrency);
-            L_B(unlockChars);
-            L_B(fillLoadoutSlots); L_B(applySlots);
-            L_I(slotWeapon[0]); L_I(slotWeapon[1]); L_I(slotWeapon[2]);
-            L_I(currencyValue); L_F(unlockInterval);
-            L_B(skinChanger); L_I(skinIndex); L_I(unlockLevel);
-
-            L_B(applySelection); L_I(loadoutSlot);
-            L_I(selWeapon); L_I(selCamo); L_I(selChar);
-            L_I(selAttach[0]); L_I(selAttach[1]); L_I(selAttach[2]);
-            L_B(probeLog); L_B(beatLog); L_B(showFpsGraph);
-
-#undef L_B
-#undef L_I
-#undef L_F
-#undef L_C
+            for (size_t i = 0; i < sizeof(kCfg) / sizeof(kCfg[0]); ++i) {
+                CfgE& e = kCfg[i];
+                if (strcmp(e.k, k) != 0) continue;
+                switch (e.t) {
+                case 0: *(bool*)e.p = (atoi(v) != 0); break;
+                case 1: *(int*)e.p = atoi(v); break;
+                case 2: *(float*)e.p = (float)atof(v); break;
+                case 3: {
+                    float* c = (float*)e.p;
+                    sscanf_s(v, "%f %f %f %f", &c[0], &c[1], &c[2], &c[3]); break;
+                }
+                case 4: strncpy_s((char*)e.p, (size_t)e.n, v, _TRUNCATE); break;
+                }
+                break;
+            }
         }
         fclose(f);
         Log("[cfg] carregado de %s", CfgPath());

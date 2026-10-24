@@ -1,20 +1,30 @@
 // ============================================================================
-//  unlock.cpp — bfi (v25)
+//  unlock.cpp — bfi (v43.1)
 //
-//  >>> v25 (FPS): o Install() era RETENTADO TODO FRAME enquanto falhava (ex.:
-//      fora de partida) e o FindWeaponArray varre todos os campos do
-//      PlayerScript chamando il2cpp_type_get_name em cada um. Agora o retry e'
-//      no maximo 2x/s. Tambem: Dupe::EnsureLoaded() nao roda mais por frame.
+//  >>> v43.1
+//    * ESPELHO DA LOJA: a busca de campo ficou CASE-INSENSITIVE
+//      (il2cpp_class_get_field_from_name e' case-sensitive, 'GoldAmount' nao
+//      casava com 'goldAmount'), ganhou fallback por palavra-chave e o salto
+//      'sidebar' ganhou fallback por offset (0x20).
+//    * Quando um espelho falha, MnyDumpObj joga no log a classe real e TODOS
+//      os campos do objeto (nome/tipo/offset) para voce corrigir a tabela.
+//    * O resumo "[mirror] N/M espelhos resolvidos" so' loga quando muda.
 //
-//  >>> v24: a tela SELECIONE LOADOUT nao le o que pokeamos em memoria. O
-//  loadout de ALFA/BRAVO/CHARLIE vem dos PlayerPrefs do jogo. Entao agora:
-//   1) Resolve UnityEngine.PlayerPrefs e DESCOBRE as chaves de prefs.
-//   2) Escreve o weaponType (chave int) ou o nome da arma (chave string).
-//   3) PROBE 1x o formato de cada chave (int ou string).
+//  >>> v43
+//    * Define a API da CARTEIRA que o Menu::TabConta consome (assinaturas
+//      exatas: MoneyCount/MoneyName/MoneyLocked/MoneySetLock/MoneyValue/
+//      MoneySet/MoneyRefresh/MoneyLockByName/ForceMirrors/MoneyUnlockAll).
+//    * Install() e' bool (sem E0311).
+//    * Os espelhos sao campos de INSTANCIA alcancados pelo singleton
+//      ESTATICO da classe (bug da v40: procurava-se campo static).
+//      kind 0 = int, 1 = ObscuredInt (hidden = v ^ key, +0xC inited=1).
+//    * MoneyTick consome C.accAuto, C.moneyIntervalMs, C.moneyApplyNow,
+//      C.moneyRescan, C.moneyWritePrefs, C.moneyOnlyWallet, C.accGold,
+//      C.accCases.
+//    * Tick(): o tick da carteira roda ANTES do check de g_localPlayer.
 //
-//  >>> v23: reaplica a cada 4s (sobrevive a respawn) e LOGA o readback [r].
-//  >>> v22: as escritas do loadout sao uma por FRAME, logadas "[w] passo N/M".
-//  v21 mantido: is_valuetype no ELEMENTO do array (nao na classe do array).
+//  >>> v25 (mantido): retry de Install no maximo 2x/s.
+//  >>> v24 (mantido): loadout de ALFA/BRAVO/CHARLIE vem dos PlayerPrefs.
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -31,7 +41,7 @@
 #include <string>
 #include <vector>
 
-#define BFI_UNLOCK_VER "v25"
+#define BFI_UNLOCK_VER "v43.1"
 
 namespace Unlock {
 
@@ -57,11 +67,6 @@ namespace Unlock {
     static bool   g_installed = false;
     static const char* kSlotNames[3] = { "Mira (sights)", "Acessorios", "Cano (barrels)" };
 
-    static void* g_charArr = nullptr;
-    static int   g_charLen = 0;
-    static bool  g_charIsList = false;
-
-    // >>> v25: throttle do retry de Install + guarda do EnsureLoaded
     static ULONGLONG g_nextInstallTry = 0;
     static bool      g_dupeEnsured = false;
 
@@ -241,6 +246,311 @@ namespace Unlock {
             ++n;
         }
         return n;
+    }
+
+    // =========================================================================
+    //  >>> v43.1 — MODULO CARTEIRA / ESPELHOS
+    //  kind: 0 = int, 1 = ObscuredInt.
+    //  A busca de campo e' CASE-INSENSITIVE e tem fallback por palavra-chave.
+    //  hopFld/hopOff = salto intermediario (nome com fallback por offset).
+    // =========================================================================
+    struct MnyMirror {
+        const char* cls;      // classe dona do campo
+        const char* fld;      // campo do espelho (INSTANCIA)
+        const char* fldKey;   // palavra-chave alternativa (substring, CI)
+        const char* hopFld;   // campo intermediario (0 = nenhum)
+        uint32_t    hopOff;   // fallback do salto por offset (0 = nenhum)
+        const char* label;    // nome amigavel (MoneyName)
+        int         kind;     // 0 = int, 1 = ObscuredInt
+        bool        lock;
+        bool        ok;
+        void* base;
+        uint32_t    off;
+    };
+
+    static MnyMirror g_mny[] = {
+        { "CreditsManager",  "LDOGMJMLIOP", "credit", 0,         0,    "Creditos (UI)",  1, true, false, 0, 0 },
+        { "AccountManager",  "GEEFAPKBHJO", "gold",   0,         0,    "Conta (gold)",   1, true, false, 0, 0 },
+        { "CamoCaseManager", "goldCases",   "case",   0,         0,    "Caixas (gold)",  0, true, false, 0, 0 },
+        { "LoadoutManager",  "goldAmount",  "gold",   0,         0,    "Loadout (gold)", 0, true, false, 0, 0 },
+        { "LoadoutAndShop",  "goldAmount",  "gold",   "sidebar", 0x20, "Loja (sidebar)", 0, true, false, 0, 0 },
+    };
+    static const int g_mnyN = (int)(sizeof(g_mny) / sizeof(g_mny[0]));
+
+    static bool      g_mnyDone = false;
+    static ULONGLONG g_mnyNext = 0;
+    static int       g_mnyLastOk = -1;
+
+    static bool MnyIn(int i) { return i >= 0 && i < g_mnyN; }
+
+    // singleton: por nome (varias grafias) e, se falhar, varredura CI
+    static void* MnyStaticObj(const char* cls, const char* f1, const char* f2) {
+        Il2CppClass* k = cls ? SDK::FindClass(cls) : nullptr;
+        if (!k) return nullptr;
+        const char* cands[4] = { f1, f2, "singleton", "Instance" };
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+            for (int i = 0; i < 4; ++i) {
+                if (!cands[i]) continue;
+                FieldInfo* f = il2cpp_class_get_field_from_name(c, cands[i]);
+                if (!f || !IsStatic(f)) continue;
+                void* o = nullptr; StaticGetSafe(f, &o);
+                if (LooksLikeObj(o)) return o;
+            }
+        }
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+            void* it = nullptr;
+            for (;;) {
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
+                if (!f) break;
+                if (!IsStatic(f)) continue;
+                const char* fn = il2cpp_field_get_name(f);
+                if (!fn) continue;
+                if (_stricmp(fn, "singleton") != 0 && _stricmp(fn, "instance") != 0) continue;
+                void* o = nullptr; StaticGetSafe(f, &o);
+                if (LooksLikeObj(o)) return o;
+            }
+        }
+        return nullptr;
+    }
+
+    // campo por nome EXATO, case-insensitive
+    // (il2cpp_class_get_field_from_name e' case-sensitive: 'GoldAmount' != 'goldAmount')
+    static uint32_t MnyOffExact(void* obj, const char* fld) {
+        if (!LooksLikeObj(obj) || !fld) return 0;
+        Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)obj);
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+            void* it = nullptr;
+            for (;;) {
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
+                if (!f) break;
+                if (IsStatic(f)) continue;
+                const char* fn = il2cpp_field_get_name(f);
+                if (!fn || _stricmp(fn, fld) != 0) continue;
+                uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
+                if (off) return off;
+            }
+        }
+        return 0;
+    }
+
+    // fallback: primeiro campo inteiro cujo nome contenha a palavra-chave
+    static uint32_t MnyOffKey(void* obj, const char* key) {
+        if (!LooksLikeObj(obj) || !key) return 0;
+        char kl[40]; Lower(kl, sizeof(kl), key);
+        Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)obj);
+        for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
+            void* it = nullptr;
+            for (;;) {
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
+                if (!f) break;
+                if (IsStatic(f)) continue;
+                const Il2CppType* t = il2cpp_field_get_type(f);
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                if (!tn) continue;
+                if (!strstr(tn, "Int32") && !strstr(tn, "ObscuredInt") && !strstr(tn, "Int64")) continue;
+                const char* fn = il2cpp_field_get_name(f);
+                if (!fn) continue;
+                char nl[80]; Lower(nl, sizeof(nl), fn);
+                if (!strstr(nl, kl)) continue;
+                uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
+                if (off) return off;
+            }
+        }
+        return 0;
+    }
+
+    // diagnostico: joga no log a classe e os campos do objeto que falhou
+    static void MnyDumpObj(void* o, const char* tag, int max) {
+        if (!LooksLikeObj(o)) return;
+        Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)o);
+        Log("[mirror] %s: objeto classe=%s %p", tag, k ? il2cpp_class_get_name(k) : "?", o);
+        int n = 0;
+        for (Il2CppClass* c = k; c && n < max; c = il2cpp_class_get_parent(c)) {
+            void* it = nullptr;
+            for (;;) {
+                FieldInfo* f = il2cpp_class_get_fields(c, &it);
+                if (!f) break;
+                if (IsStatic(f)) continue;
+                if (n++ >= max) break;
+                const Il2CppType* t = il2cpp_field_get_type(f);
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : "?";
+                Log("[mirror]   %s::%s %s @0x%X", il2cpp_class_get_name(c),
+                    il2cpp_field_get_name(f), tn, (unsigned)il2cpp_field_get_offset(f));
+            }
+        }
+    }
+
+    static void MnyResolve() {
+        if (g_mnyDone) return;
+        const ULONGLONG now = GetTickCount64();
+        if (now < g_mnyNext) return;
+        g_mnyNext = now + 2000;                 // retry no maximo 1x/2s
+        int ok = 0;
+        for (int i = 0; i < g_mnyN; ++i) {
+            MnyMirror& m = g_mny[i];
+            m.ok = false; m.base = nullptr; m.off = 0;
+
+            void* base = MnyStaticObj(m.cls, "singleton", "Instance");
+            if (!base) base = MnyStaticObj(m.cls, "instance", "s_instance");
+            if (!base) { Log("[mirror] %s: singleton ausente", m.label); continue; }
+
+            if (m.hopFld || m.hopOff) {
+                uint32_t ho = MnyOffExact(base, m.hopFld);
+                if (!ho) ho = m.hopOff;         // fallback por offset
+                void* mid = ho ? SafeRead<void*>((uintptr_t)base + ho, nullptr) : nullptr;
+                if (!LooksLikeObj(mid)) {
+                    Log("[mirror] %s: salto falhou (off=0x%X)", m.label, ho);
+                    continue;
+                }
+                base = mid;
+            }
+
+            uint32_t off = MnyOffExact(base, m.fld);
+            if (!off && m.fldKey) off = MnyOffKey(base, m.fldKey);
+            if (!off) {
+                Log("[mirror] %s: campo '%s' nao achado", m.label, m.fld);
+                MnyDumpObj(base, m.label, 48);
+                continue;
+            }
+            m.base = base; m.off = off; m.ok = true;
+            ++ok;
+        }
+        if (ok == g_mnyN) g_mnyDone = true;
+        if (ok != g_mnyLastOk) {                // nao spamma o log a cada 2s
+            g_mnyLastOk = ok;
+            Log("[mirror] %d/%d espelhos resolvidos", ok, g_mnyN);
+        }
+    }
+
+    static long long MnyRead(const MnyMirror& m) {
+        if (!m.ok || !m.base || !m.off) return 0;
+        uintptr_t a = (uintptr_t)m.base + m.off;
+        if (m.kind == 0) return (long long)SafeRead<int>(a, 0);
+        const int key = SafeRead<int>(a + 0, 0);
+        const int hid = SafeRead<int>(a + 4, 0);
+        return (long long)(int)(hid ^ key);
+    }
+
+    static void MnyWriteOne(MnyMirror& m, long long v) {
+        if (!m.ok || !m.base || !m.off) return;
+        uintptr_t a = (uintptr_t)m.base + m.off;
+        const int iv = (int)v;
+        if (m.kind == 0) { SafeWrite<int>(a, iv); return; }
+        const int key = SafeRead<int>(a + 0, 0);
+        SafeWrite<int>(a + 4, iv ^ key);   // ObscuredInt: +0 key, +4 hidden
+        SafeWrite<int>(a + 8, iv);         //               +8 fake
+        SafeWrite<int>(a + 0xC, 1);        //               +0xC inited
+    }
+
+    static bool MnyMatch(const MnyMirror& m, const char* cls, const char* fld) {
+        if (cls && cls[0]) {
+            const char* sep = strstr(cls, "::");
+            if (sep) {
+                const size_t n = (size_t)(sep - cls);
+                if (n && !(m.cls && _strnicmp(m.cls, cls, n) == 0)) return false;
+                const char* f = sep + 2;
+                if (f[0] && !(m.fld && _stricmp(m.fld, f) == 0)) return false;
+            }
+            else {
+                if (!(m.cls && _strnicmp(m.cls, cls, strlen(cls)) == 0)) return false;
+            }
+        }
+        if (fld && fld[0]) {
+            if (!(m.fld && _stricmp(m.fld, fld) == 0)) return false;
+        }
+        return true;
+    }
+
+    static long long MnyCfgValue() {
+        return (C.currencyValue > 0) ? (long long)C.currencyValue : 999999LL;
+    }
+
+    // =========================== API publica da carteira =====================
+    int MoneyCount() { return g_mnyN; }
+
+    const char* MoneyName(int idx) {
+        return MnyIn(idx) ? g_mny[idx].label : "";
+    }
+
+    bool MoneyLocked(int idx) {
+        return MnyIn(idx) ? g_mny[idx].lock : false;
+    }
+
+    void MoneySetLock(int idx, bool on) {
+        if (MnyIn(idx)) g_mny[idx].lock = on;
+    }
+
+    long long MoneyValue(int idx) {
+        if (!MnyIn(idx)) return 0;
+        MnyResolve();
+        return MnyRead(g_mny[idx]);
+    }
+
+    void MoneySet(int idx, long long value) {
+        if (!MnyIn(idx)) return;
+        MnyResolve();
+        MnyWriteOne(g_mny[idx], value);
+        Log("[mirror] %s <- %lld", g_mny[idx].label, value);
+    }
+
+    void MoneyRefresh() {
+        g_mnyDone = false;
+        g_mnyNext = 0;
+        g_mnyLastOk = -1;
+        MnyResolve();
+    }
+
+    bool MoneyReady() {
+        MnyResolve();
+        for (int i = 0; i < g_mnyN; ++i) if (!g_mny[i].ok) return false;
+        return true;
+    }
+
+    int MoneyLockByName(const char* cls, const char* field, long long value) {
+        MnyResolve();
+        int n = 0;
+        for (int i = 0; i < g_mnyN; ++i) {
+            MnyMirror& m = g_mny[i];
+            if (!m.ok) continue;
+            if (!MnyMatch(m, cls, field)) continue;
+            m.lock = true;
+            MnyWriteOne(m, value);
+            ++n;
+        }
+        Log("[mirror] LockByName(\"%s\", \"%s\", %lld): %d espelho(s)",
+            cls ? cls : "", field ? field : "", value, n);
+        return n;
+    }
+
+    int ForceMirrors(long long value, long long mode) {
+        MnyResolve();
+        int n = 0;
+        for (int i = 0; i < g_mnyN; ++i) {
+            MnyMirror& m = g_mny[i];
+            if (!m.ok) continue;
+            if (mode == 1 && !m.lock) continue;
+            if (mode == 2 && m.lock) continue;
+            MnyWriteOne(m, value);
+            ++n;
+        }
+        Log("[mirror] ForceMirrors(%lld, mode=%lld): %d/%d escritos",
+            value, mode, n, g_mnyN);
+        return n;
+    }
+
+    void MoneyUnlockAll() {
+        const long long v = MnyCfgValue();
+        for (int i = 0; i < g_mnyN; ++i) g_mny[i].lock = true;
+        ForceMirrors(v, 0);
+    }
+
+    void ShopForceAll() {
+        const long long gold = (C.accGold > 0) ? (long long)C.accGold : MnyCfgValue();
+        const long long cases = (C.accCases > 0) ? (long long)C.accCases : 500LL;
+        MoneyLockByName("AccountManager", "GEEFAPKBHJO", gold);
+        MoneyLockByName("CamoCaseManager", "goldCases", cases);
+        MoneyLockByName("LoadoutManager", "goldAmount", gold);
+        MoneyLockByName("LoadoutAndShop", "goldAmount", gold);
     }
 
     // =============================================================== descoberta
@@ -853,7 +1163,7 @@ namespace Unlock {
     }
 
     // =====================================================================
-    //  v24 — PlayerPrefs (a tela SELECIONE LOADOUT le dos prefs do jogo)
+    //  v24 — PlayerPrefs
     // =====================================================================
     typedef void* (*fn_dom_get)();
     typedef const void** (*fn_dom_asms)(void*, size_t*);
@@ -1087,6 +1397,67 @@ namespace Unlock {
         if (changed && g_ppSave) { void* a[1] = { nullptr }; InvokeRet(g_ppSave, nullptr, a); Log("[p] Save()"); }
     }
 
+    // =========================================================================
+    //  >>> v43 — prefs de dinheiro + tick da carteira
+    // =========================================================================
+    void MoneyWritePrefs() {
+        if (!ResolvePlayerPrefs()) return;
+        if (g_ppKN <= 0) CollectPrefsKeys(true);
+        if (g_ppKN <= 0 || !g_ppSetInt) return;
+        static const char* keys[] = { "gold", "money", "credit", "cash", "coin", "case", "caixa" };
+        int n = 0;
+        for (int i = 0; i < g_ppKN; ++i) {
+            char kl[96]; Lower(kl, sizeof(kl), g_ppK[i].key);
+            bool hit = false;
+            for (size_t q = 0; q < sizeof(keys) / sizeof(keys[0]) && !hit; ++q)
+                if (strstr(kl, keys[q])) hit = true;
+            if (!hit) continue;
+            int v = (int)MnyCfgValue();
+            void* a[2] = { g_ppK[i].str, &v };
+            InvokeRet(g_ppSetInt, nullptr, a);
+            ++n;
+        }
+        if (n && g_ppSave) { void* a[1] = { nullptr }; InvokeRet(g_ppSave, nullptr, a); }
+        Log("[mirror] prefs: %d chave(s) escritas", n);
+    }
+
+    static ULONGLONG g_mnyTickNext = 0;
+
+    static void MnyApplyLocks() {
+        const long long cred = MnyCfgValue();
+        const long long gold = (C.accGold > 0) ? (long long)C.accGold : cred;
+        const long long cases = (C.accCases > 0) ? (long long)C.accCases : 500LL;
+
+        for (int i = 0; i < g_mnyN; ++i) {
+            MnyMirror& m = g_mny[i];
+            if (!m.ok || !m.lock) continue;
+            long long v = cred;
+            if (strstr(m.cls, "CamoCase")) v = cases;
+            else if (m.kind == 0 && strstr(m.label, "gold")) v = gold;
+            MnyWriteOne(m, v);
+        }
+        if (!C.moneyOnlyWallet) {
+            MoneyLockByName("CamoCaseManager", "goldCases", cases);
+            MoneyLockByName("LoadoutAndShop", "goldAmount", gold);
+        }
+    }
+
+    void MoneyTick() {
+        if (C.moneyRescan) { C.moneyRescan = false; MoneyRefresh(); }
+        if (C.moneyApplyNow) {
+            C.moneyApplyNow = false;
+            ForceMirrors(MnyCfgValue(), 0);
+            if (C.moneyWritePrefs) MoneyWritePrefs();
+        }
+        if (!C.accAuto) return;
+        const ULONGLONG now = GetTickCount64();
+        if (now < g_mnyTickNext) return;
+        g_mnyTickNext = now + (ULONGLONG)((C.moneyIntervalMs > 0) ? C.moneyIntervalMs : 1000);
+        MnyApplyLocks();
+        if (C.moneyWritePrefs) MoneyWritePrefs();
+    }
+
+    // =========================================================================
     static int       g_selTarget = -2;
     static int       g_selStep = -1;
     static ULONGLONG g_selNext = 0;
@@ -1328,28 +1699,6 @@ namespace Unlock {
         Log("[dupe] camos: %d", n);
     }
 
-    static bool CharNameOf(void* inst, char* out, size_t n) {
-        out[0] = 0;
-        if (!LooksLikeObj(inst)) return false;
-        Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)inst);
-        static const char* keys[4] = { "name", "charName", "characterName", "displayName" };
-        for (int q = 0; q < 4; ++q) {
-            for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
-                FieldInfo* f = il2cpp_class_get_field_from_name(c, keys[q]);
-                if (!f || IsStatic(f)) continue;
-                const Il2CppType* t = il2cpp_field_get_type(f);
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-                if (!tn || !strstr(tn, "String")) continue;
-                uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
-                if (!off) continue;
-                char tmp[128]; tmp[0] = 0;
-                CStr(SafeRead<void*>((uintptr_t)inst + off, nullptr), tmp, sizeof(tmp));
-                if (tmp[0]) { strncpy_s(out, n, tmp, _TRUNCATE); return true; }
-            }
-        }
-        return false;
-    }
-
     static void CollectChars() {
         std::vector<Dupe::Item> tmp;
         CollectAllCamosDict("characterCamos", "Personagem", tmp);
@@ -1419,8 +1768,6 @@ namespace Unlock {
         return true;
     }
 
-    // >>> v25: retry no maximo 2x/s (fora de partida o Install falha sempre e
-    //     FindWeaponArray varre todos os campos do PlayerScript).
     static bool EnsureInstalled() {
         if (g_installed && g_arr && g_arrLen > 0) return true;
         const ULONGLONG now = GetTickCount64();
@@ -1435,10 +1782,16 @@ namespace Unlock {
     }
 
     void Tick() {
+        const bool anyMoney = C.accAuto || C.moneyApplyNow || C.moneyRescan || C.moneyWritePrefs;
         const bool any = C.unlockAll || C.unlockWeapons || C.unlockSkins || C.unlockAttachments ||
             C.unlockCurrency || C.unlockLevel || C.unlockChars || C.applySelection ||
-            C.skinChanger || C.applySlots || C.fillLoadoutSlots;
+            C.skinChanger || C.applySlots || C.fillLoadoutSlots || anyMoney;
         if (!any && !Dupe::Wants()) return;
+
+        // carteira: vale ate' no menu, nao depende do array de armas
+        __try { MoneyTick(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[unlock] AV contido no MoneyTick"); }
+
         if (!SDK::g_localPlayer) return;
 
         if (Dupe::Wants()) {
@@ -1513,6 +1866,33 @@ namespace Unlock {
         }
     }
 
+    void DumpMirrors() {
+        ResolveExtra();
+        Log("=== ESPELHOS DA CARTEIRA (%d) ===", g_mnyN);
+        MoneyRefresh();
+        for (int i = 0; i < g_mnyN; ++i) {
+            const MnyMirror& m = g_mny[i];
+            if (!m.ok) { Log("[mirror]   [%d] %s = NAO RESOLVIDO", i, m.label); continue; }
+            uintptr_t a = (uintptr_t)m.base + m.off;
+            const int key = SafeRead<int>(a + 0, 0);
+            const int hid = SafeRead<int>(a + 4, 0);
+            Log("[mirror]   [%d] %s %s::%s kind=%d base=%p off=0x%X | int=%d obscured=%d inited=%d",
+                i, m.label, m.cls, m.fld, m.kind, m.base, m.off,
+                key, hid ^ key, SafeRead<int>(a + 0xC, -1));
+        }
+        Log("=== FIM ESPELHOS ===");
+    }
+
+    void DumpShop() {
+        ResolveExtra();
+        static const char* cls[] = {
+            "CreditsManager", "AccountManager", "CamoCaseManager",
+            "LoadoutManager", "LoadoutAndShop", "Sidebar", "BF_AccountInfo"
+        };
+        for (size_t i = 0; i < sizeof(cls) / sizeof(cls[0]); ++i) DumpClassFields(cls[i]);
+        DumpMirrors();
+    }
+
     void Dump() {
         Log("=== DUMP UNLOCK %s ===", BFI_UNLOCK_VER);
         ResolveExtra();
@@ -1522,20 +1902,44 @@ namespace Unlock {
         ScanLoadoutContainers();
         ResolvePlayerPrefs();
         CollectPrefsKeys(false);
+        DumpMirrors();
         Log("=== FIM DUMP UNLOCK ===");
     }
 
+    // ================================================================= API
+    bool Ready() { return Dupe::WeaponCount() > 0; }
+    int  Generation() { return (int)Dupe::g_epoch.load(); }
+
     int WeaponCount() { return Dupe::WeaponCount(); }
     const char* const* WeaponList() { return Dupe::WeaponList(); }
+    const char* WeaponName(int idx) { return Dupe::WeaponName(idx); }
+
     int AttachSlotCount() { return 3; }
     const char* AttachSlotName(int slot) { return (slot >= 0 && slot < 3) ? kSlotNames[slot] : "?"; }
     int AttachCount(int slot) { return Dupe::AttachCount(slot); }
     const char* const* AttachList(int slot) { return Dupe::AttachList(slot); }
     int AttachValue(int slot, int idx) { return Dupe::AttachValue(slot, idx); }
+    const char* AttachName(int slot, int idx) {
+        const char* const* l = Dupe::AttachList(slot);
+        if (!l || idx < 0 || idx >= Dupe::AttachCount(slot)) return nullptr;
+        return l[idx];
+    }
+
     int CamoCount() { return Dupe::CamoCount(); }
     const char* const* CamoList() { return Dupe::CamoList(); }
+    const char* CamoName(int idx) {
+        const char* const* l = Dupe::CamoList();
+        if (!l || idx < 0 || idx >= Dupe::CamoCount()) return nullptr;
+        return l[idx];
+    }
+
     int CharCount() { return Dupe::CharCount(); }
     const char* const* CharList() { return Dupe::CharList(); }
+    const char* CharName(int idx) {
+        const char* const* l = Dupe::CharList();
+        if (!l || idx < 0 || idx >= Dupe::CharCount()) return nullptr;
+        return l[idx];
+    }
 
 } // namespace Unlock
 // ==== FIM unlock.cpp ====

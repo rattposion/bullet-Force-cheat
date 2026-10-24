@@ -2,29 +2,28 @@
 //  log.cpp
 //  Log unico do projeto. Thread-safe. LogInit() e idempotente.
 //
-//  >>> FIX FPS: o Log fazia fprintf + fflush POR LINHA, segurando o
-//      CriticalSection durante os DOIS syscalls. Com probeLog ligado isso e'
-//      syscall por chamada, e a chamada vem da thread do JOGO.
-//      Agora: fila + thread de escrita. O fflush passa a ser a cada 200 ms.
-//      Se a thread nao subir, cai no modo sincrono antigo (fallback).
+//  v2:
+//   - abre com _SH_DENYNO (compartilhamento liberado -> o menu pode ler)
+//   - mantem um RING BUFFER em memoria com as ultimas linhas, para o menu
+//     ler direto (imune a lock de arquivo)
 // ============================================================================
 
 #include <windows.h>
+#include <share.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
-#include <vector>
 #include <string>
+#include <vector>
 #include <mutex>
 #include <atomic>
 
 extern HMODULE g_hModule;
 
 void Log(const char* fmt, ...);
+void LogInit();
 
 static FILE* g_log = nullptr;
-static CRITICAL_SECTION g_cs;
-static bool             g_csReady = false;
 
 static std::vector<std::string> g_q;
 static std::mutex               g_qMx;
@@ -33,6 +32,48 @@ static HANDLE                   g_ev = nullptr;
 static HANDLE                   g_th = nullptr;
 
 static const size_t kMaxQueue = 8192;
+
+// ---------------------------------------------------------------------------
+//  RING BUFFER (o menu le daqui - sem tocar no arquivo)
+// ---------------------------------------------------------------------------
+static const size_t kRingMax = 1024;
+static std::mutex   g_ringMx;
+static std::string  g_ring[kRingMax];
+static size_t       g_ringHead = 0;
+static size_t       g_ringCount = 0;
+
+static void RingPush(const char* line)
+{
+    std::lock_guard<std::mutex> lk(g_ringMx);
+    g_ring[g_ringHead] = line;
+    g_ringHead = (g_ringHead + 1) % kRingMax;
+    if (g_ringCount < kRingMax) ++g_ringCount;
+}
+
+size_t LogSnapshot(char* dst, size_t cap)
+{
+    if (!dst || cap < 2) return 0;
+    std::lock_guard<std::mutex> lk(g_ringMx);
+
+    size_t n = 0;
+    const size_t start = (g_ringCount == kRingMax) ? g_ringHead : 0;
+    for (size_t i = 0; i < g_ringCount; ++i) {
+        const std::string& s = g_ring[(start + i) % kRingMax];
+        if (n + s.size() + 1 >= cap) break;
+        memcpy(dst + n, s.data(), s.size());
+        n += s.size();
+        dst[n++] = '\n';
+    }
+    dst[n] = 0;
+    return n;
+}
+
+void LogClearRing()
+{
+    std::lock_guard<std::mutex> lk(g_ringMx);
+    g_ringCount = 0;
+    g_ringHead = 0;
+}
 
 // ---------------------------------------------------------------------------
 static void BuildPath(char* path, size_t n) {
@@ -78,15 +119,13 @@ static DWORD WINAPI LogThread(LPVOID) {
 void LogInit() {
     if (g_log) return;                       // idempotente
 
-    if (!g_csReady) { InitializeCriticalSection(&g_cs); g_csReady = true; }
-
     char path[MAX_PATH] = { 0 };
     BuildPath(path, sizeof(path));
 
-    fopen_s(&g_log, path, "w");
+    // _SH_DENYNO: permite que OUTROS handles abram o arquivo (o tap do menu)
+    g_log = _fsopen(path, "w", _SH_DENYNO);
     if (!g_log) return;
 
-    // sobe a thread ANTES de logar, para o "log aberto" ja passar pela fila
     if (!g_ev) g_ev = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     if (g_ev && !g_th) {
         DWORD id = 0;
@@ -99,10 +138,8 @@ void LogInit() {
 // ---------------------------------------------------------------------------
 static void WriteSync(const char* line) {
     if (!g_log) return;
-    if (g_csReady) EnterCriticalSection(&g_cs);
     fputs(line, g_log);
     fflush(g_log);
-    if (g_csReady) LeaveCriticalSection(&g_cs);
 }
 
 void Log(const char* fmt, ...) {
@@ -121,7 +158,9 @@ void Log(const char* fmt, ...) {
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[%02d:%02d:%02d.%03d] %s\n",
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, body);
 
-    if (!g_th) { WriteSync(line); return; }   // fallback sincrono
+    RingPush(line);                            // <-- menu le daqui
+
+    if (!g_th) { WriteSync(line); return; }    // fallback sincrono
 
     {
         std::lock_guard<std::mutex> lk(g_qMx);

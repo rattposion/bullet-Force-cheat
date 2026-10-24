@@ -183,6 +183,41 @@ struct Config {
 
     bool  showAimTargetName = false;
     bool  showFpsGraph = false;
+
+    // ========================================================================
+    //  >>> v42 — campos referenciados pelo unlock.cpp (bloco de sync)
+    // ========================================================================
+    bool  aimVisOnly = true;
+    float espDist = 300.f;
+    float espFov = 90.f;
+    bool  fovCircle = false;
+    float fovCircleSize = 8.f;
+    bool  tracer = false;
+    float tracerColor[4] = { 0.f, 1.f, 0.f, 1.f };
+    float tracerWidth = 1.5f;
+    bool  radar = false;
+    float radarSize = 150.f;
+    int   trigKey = VK_MENU;
+    float trigDelay = 30.f;
+    float trigFov = 10.f;
+    int   trigBurst = 0;
+
+    // ========================================================================
+    //  >>> v42 — carteira / conta / janela de log (menu.cpp + config.cpp)
+    // ========================================================================
+    bool  moneyOnlyWallet = true;      // so mexe nos espelhos da carteira
+    bool  moneyWritePrefs = false;     // grava tambem nos PlayerPrefs
+    bool  moneyRescan = false;         // flag: pedir nova varredura
+    int   moneyMode = 0;               // 0 = travar, 1 = forcar 1x
+    int   moneyIntervalMs = 1000;      // reaplicar a cada N ms
+    bool  moneyApplyNow = false;       // flag: aplicar agora
+
+    int   accGold = 0;                 // gold a travar
+    int   accCases = 0;                // caixas a travar
+    bool  accAuto = true;              // reaplicar automatico
+
+    bool  logAutoScroll = true;
+    char  logFilter[64] = "";
 };
 
 extern Config  g_cfg;
