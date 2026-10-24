@@ -4,9 +4,9 @@
 
 #include <windows.h>
 
-// >>> v43.15: marcador de versao. O menu/unlock checam isto e dao #error
+// >>> v4322: marcador de versao. unlock.cpp/menu checam isto e dao #error
 //     se um config.h antigo estiver no include path.
-#define BFI_CONFIG_VER 4315
+#define BFI_CONFIG_VER 4322
 
 struct Config {
 
@@ -54,17 +54,23 @@ struct Config {
     // ---- AIMBOT ----
     bool  aimbot = false;
     int   aimKey = VK_RBUTTON;
-    float aimFov = 8.f;
-    float aimSmooth = 5.f;
-    int   aimBone = 0;
+    float aimFov = 8.f;              // GRAUS (mundo). Ver aimSelect.
+    float aimSmooth = 5.f;           // consumido pelo SDK::AimLock
+    int   aimBone = 0;               // 0=head; fallback automatico nos outros
     int   aimMode = 0;
     bool  aimVisible = true;
 
     bool  aimVisCheck = true;
     bool  aimStrictVis = true;
 
+    // >>> v4321 [H2]: fonte da mira. 0 = player (fresco, PADRAO) / 1 = camera.
+    //     Origem E direcao saem do MESMO objeto (GetAimFrame no aimbot.cpp v21).
+    //     O log mostrou o camPos ~1s atras do player: se a mira sair torta,
+    //     troque pra 1 e compare pelo log "[aim] DIVERGENCIA".
+    int   aimCamSrc = 0;
+
     bool  aimTeam = false;
-    bool  aimRotate = true;
+    bool  aimRotate = true;          // se false, so' o silent aim mexe
     bool  showFovCircle = false;
     float aimMaxDist = 250.f;
     float aimColor[4] = { 0.f, 1.f, 0.f, 1.f };
@@ -75,10 +81,21 @@ struct Config {
     // ---- ALIASES / CAMPOS NOVOS ----
     bool  aimEnabled = true;
     bool  aimTeamCheck = false;
-    int   aimSelect = 0;
+    int   aimSelect = 0;             // 0=angulo 1=dist 2=hibrido 3=tela
     bool  aimToggle = false;
     bool  aimAutoFire = false;
     int   aimFireDelayMs = 50;
+
+    // ========================================================================
+    //  >>> v4320 — mira forte (aimbot.cpp v20/v21)
+    // ========================================================================
+    bool  aimPredict = true;         // [G4] lead de movimento
+    float aimPredictAmt = 1.0f;      // 1.0 = tempo total de voo
+    float aimBulletSpeed = 400.f;    // m/s aproximado
+    float aimDeadzone = 0.12f;       // [G5] graus: nao re-mira se ja esta em cima
+    float aimInvisPenalty = 12.f;    // graus somados em alvo invisivel (nao-estrito)
+    int   aimVisTopN = 8;            // [G6] max de raycasts de LOS por frame
+    int   aimSwitchMs = 180;         // cooldown de troca de alvo (mira nao para)
 
     // ---- TRIGGERBOT ----
     bool  triggerbot = false;
@@ -138,6 +155,27 @@ struct Config {
     bool  blockedNoZone = false;
     bool  blockedUnlock = false;
     int   stage = 0;
+
+    // >>> v4322 — BISECT DO FREEZE (UnityPlayer+0x36FD30, alvo=0, fase=present).
+    //     Default = AC 100% INERTE (nenhuma escrita, nenhum hook). Ligue UM por
+    //     run e veja qual faz o freeze voltar.
+    //
+    //     acClear        : escreve (ClearList/statics). false = so' leitura.
+    //     acUpdHook      : hook em TimeCheatingDetector::Update (roda no meio do
+    //                      frame do jogo; no v10 ele escrevia mesmo com o
+    //                      anti-cheat desligado no menu).
+    //     acHookGetters  : neutraliza getters bool (MH_CreateHook).
+    //     acWritePlayer  : AC joga os offsets DELE na classe do player (chute).
+    //     acSameClassOnly: so' escreve se a classe do OBJETO == classe dos
+    //                      OFFSETS. O log v10 provou a incoerencia (objeto =
+    //                      PlayerAntiCheat @0xE08, offsets = TimeCheatingDetector).
+    //     acLogWrites    : loga as primeiras 60 escritas (offset, nome, antigo->0).
+    bool  acClear = false;
+    bool  acUpdHook = false;
+    bool  acHookGetters = false;
+    bool  acWritePlayer = false;
+    bool  acSameClassOnly = true;
+    bool  acLogWrites = true;
 
     // ---- UNLOCK ALL ----
     bool  unlockAll = true;

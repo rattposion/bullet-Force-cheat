@@ -1,23 +1,33 @@
 // ============================================================
 //  menu.cpp - bfi / Bullet Force (ImGui)
-//  v43.16: slots e anexos por NOME (WeaponCombo/AttachCombo) em vez
-//          de numero. Botao BUILD chama Unlock::BuildAllNow() direto.
-//  v43.15: botoes do log em 2 linhas. Sem Hooks::g_imguiGeneration
-//          nem AntiCheat::RiskLevel. #error se o config.h estiver velho.
+//  v43.19: [ARMA] cada secao roda em __try proprio -> uma secao que
+//          estoura nao mata mais a aba inteira (era isso que fazia os
+//          seletores de skin/personagem/loadout/anexos "sumirem").
+//          Tracer: g_sec marca a secao atual e o BFI_SAFE_TAB loga
+//          "[crash] Tab X secao=Y" (throttled -> sem inundar o log).
+//  v43.18: seletores sempre visiveis + botoes que aplicam. ComboList()
+//          checa (*idx >= 0 && *idx < n) antes de indexar.
+//  v43.17: <windows.h> PRIMEIRO; includes do projeto com "..\".
+//          LineHas() compara dentro do len; MoneyName() protegido.
+//          Cada aba em __try proprio (imgui.cpp:11200/11226).
+//  v43.16: slots e anexos por NOME. BUILD chama Unlock::BuildAllNow().
 // ============================================================
-#include "common.h"
-#include "config.h"
-#include "features.h"
-#include "unlock.h"
-#include "dupe.h"
 
+#include <windows.h>                 // >>> tem que ser o PRIMEIRO
+#include <shellapi.h>
 #include <cstdio>
 #include <cstring>
+#include <cstddef>
 #include <string>
 #include <vector>
-#include <imgui.h>
-#include <shellapi.h>
-#include <windows.h>
+
+#include "imgui.h"                   // esta' na mesma pasta (imgui\)
+
+#include "../common.h"               // >>> um nivel acima
+#include "../config.h"
+#include "../features.h"
+#include "../unlock.h"
+#include "../dupe.h"
 
 #pragma comment(lib, "shell32.lib")
 
@@ -52,6 +62,27 @@ namespace Unlock {
 namespace Menu {
 
     bool& g_open = C.menuOpen;
+
+    // ==========================================================
+    //  TRACER DE SECAO (usado pelo BFI_SAFE_TAB)
+    // ==========================================================
+    static const char* g_sec = "-";
+
+    static void SecFail(const char* n)
+    {
+        static char last[64] = "";
+        if (strcmp(last, n) != 0) {
+            strcpy_s(last, n);
+            Log("[arma] SECAO %s FALHOU - aba continua", n);
+        }
+    }
+
+#define ARMA_SEC(_name, _call)                          \
+        do { g_sec = _name;                             \
+             __try { _call(); }                         \
+             __except (EXCEPTION_EXECUTE_HANDLER) {     \
+                 SecFail(_name);                        \
+             } } while (0)
 
     // ==========================================================
     //  ESTILO
@@ -195,20 +226,31 @@ namespace Menu {
         return g_logPath;
     }
 
-    static bool TypeMatch(const char* line, int type)
+    // comparacao DENTRO do len da linha (a linha nao tem NUL)
+    static bool LineHas(const char* p, size_t len, const char* tag)
     {
-        if (C.logFilter[0] && !strstr(line, C.logFilter)) return false;
+        if (!p || !tag) return false;
+        const size_t tl = strlen(tag);
+        if (tl == 0 || len < tl) return false;
+        for (size_t i = 0; i + tl <= len; ++i)
+            if (memcmp(p + i, tag, tl) == 0) return true;
+        return false;
+    }
+
+    static bool TypeMatch(const char* p, size_t len, int type)
+    {
+        if (C.logFilter[0] && !LineHas(p, len, C.logFilter)) return false;
         if (type == 0) return true;
-        if (type == 5) return strstr(line, "[money]") != nullptr ||
-            strstr(line, "[mirror]") != nullptr ||
-            strstr(line, "[conta]") != nullptr ||
-            strstr(line, "[credit]") != nullptr;
-        if (type == 6) return strstr(line, "[shop]") != nullptr ||
-            strstr(line, "[loja]") != nullptr;
-        if (type == 1) return strstr(line, "[info]") != nullptr;
-        if (type == 2) return strstr(line, "[ok]") != nullptr;
-        if (type == 3) return strstr(line, "[warn]") != nullptr || strstr(line, "[w]") != nullptr;
-        if (type == 4) return strstr(line, "[err]") != nullptr || strstr(line, "[erro]") != nullptr;
+        if (type == 5) return LineHas(p, len, "[money]") ||
+            LineHas(p, len, "[mirror]") ||
+            LineHas(p, len, "[conta]") ||
+            LineHas(p, len, "[credit]");
+        if (type == 6) return LineHas(p, len, "[shop]") ||
+            LineHas(p, len, "[loja]");
+        if (type == 1) return LineHas(p, len, "[info]");
+        if (type == 2) return LineHas(p, len, "[ok]");
+        if (type == 3) return LineHas(p, len, "[warn]") || LineHas(p, len, "[w]");
+        if (type == 4) return LineHas(p, len, "[err]") || LineHas(p, len, "[erro]");
         return true;
     }
 
@@ -290,7 +332,7 @@ namespace Menu {
             const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
             const size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
 
-            if (len && (!onlyFiltered || TypeMatch(p, g_logType))) {
+            if (len && (!onlyFiltered || TypeMatch(p, len, g_logType))) {
                 out.append(p, len);
                 out.push_back('\r');
                 out.push_back('\n');
@@ -452,110 +494,125 @@ namespace Menu {
     }
 
     // ========================================================== ARMA
-    //  v43.16: combos por NOME (em vez de numero)
-    static bool WeaponCombo(const char* label, int* idx)
+    //  Helpers (nao mexer): todos checam antes de indexar.
+    static const char* RawName(const char* const* list, int idx)
     {
-        const int n = Dupe::WeaponCount();
-        const char* cur = (*idx >= 0 && *idx < n) ? Dupe::WeaponName(*idx) : "(nenhuma)";
+        if (!list || idx < 0) return "";
+        const char* s = list[idx];
+        if (!s) return "";
+        if (s[0] && s[1] && s[2] && s[3] == ' ' && s[4] == '-' && s[5] == ' ')
+            return s + 6;                       // tira o prefixo "NNN - "
+        return s;
+    }
+
+    static bool ComboList(const char* label, const char* const* list, int n, int* idx,
+        const char* noneTxt)
+    {
         bool changed = false;
-        if (ImGui::BeginCombo(label, cur ? cur : "(nenhuma)")) {
-            if (ImGui::Selectable("(nenhuma)", *idx < 0)) { *idx = -1; changed = true; }
+        const char* cur = (list && n > 0 && *idx >= 0 && *idx < n && list[*idx]) ? list[*idx] : noneTxt;
+        if (ImGui::BeginCombo(label, cur)) {
+            if (ImGui::Selectable(noneTxt, *idx < 0)) { *idx = -1; changed = true; }
             for (int i = 0; i < n; ++i) {
                 ImGui::PushID(i);
-                const char* nm = Dupe::WeaponName(i);
-                if (ImGui::Selectable(nm ? nm : "?", *idx == i)) { *idx = i; changed = true; }
+                const char* nm = (list && list[i]) ? list[i] : "?";
+                if (ImGui::Selectable(nm, *idx == i)) { *idx = i; changed = true; }
                 ImGui::PopID();
             }
             ImGui::EndCombo();
         }
         return changed;
+    }
+
+    static bool WeaponCombo(const char* label, int* idx)
+    {
+        return ComboList(label, Dupe::WeaponList(), Dupe::WeaponCount(), idx, "(nenhuma)");
     }
 
     static bool AttachCombo(const char* label, int slot, int* idx)
     {
-        const int n = Dupe::AttachCount(slot);
-        const char* const* list = Dupe::AttachList(slot);
-        const char* cur = (list && *idx >= 0 && *idx < n) ? list[*idx] : "(nenhum)";
-        bool changed = false;
-        if (ImGui::BeginCombo(label, cur ? cur : "(nenhum)")) {
-            if (ImGui::Selectable("(nenhum)", *idx < 0)) { *idx = -1; changed = true; }
-            for (int i = 0; i < n; ++i) {
-                ImGui::PushID(i);
-                const char* nm = (list && i < n) ? list[i] : nullptr;
-                if (ImGui::Selectable(nm ? nm : "?", *idx == i)) { *idx = i; changed = true; }
-                ImGui::PopID();
-            }
-            ImGui::EndCombo();
-        }
-        return changed;
+        return ComboList(label, Dupe::AttachList(slot), Dupe::AttachCount(slot), idx, "(nenhum)");
     }
 
-    static void TabWeapon()
+    static void SetName(char* dst, size_t n, const char* src)
     {
+        if (!dst || !n) return;
+        if (src && *src) { strncpy_s(dst, n, src, _TRUNCATE); C.forceNames = true; }
+        else dst[0] = 0;
+    }
+
+    static void LimparSelecao()
+    {
+        C.selWeapon = -1;
+        C.selCamo = -1;
+        C.selChar = -1;
+        C.selAttach[0] = C.selAttach[1] = C.selAttach[2] = -1;
+        C.slotWeapon[0] = C.slotWeapon[1] = C.slotWeapon[2] = -1;
+        C.weaponName[0] = C.skinName[0] = C.attachName[0] = C.charName[0] = 0;
+        Log("[menu] selecao limpa");
+    }
+
+    // ---------------------------------------------------------- secoes
+    static void SecBuild()
+    {
+        if (ImGui::Button("BUILD (coletar armas/skins/anexos)", ImVec2(300, 0)))
+            Unlock::BuildAllNow();
+        ImGui::SameLine();
+        if (Dupe::WeaponCount() > 0)
+            ImGui::TextColored(ImVec4(0.35f, 0.80f, 0.45f, 1.f), "OK: %d", Dupe::WeaponCount());
+        else
+            ImGui::TextColored(ImVec4(0.90f, 0.45f, 0.45f, 1.f), "vazio - aperte BUILD");
+    }
+
+    static void SecMods()
+    {
+        ImGui::Separator();
         ImGui::Checkbox("Sem recuo (no recoil)", &C.noRecoil);
         ImGui::SameLine(); ImGui::Checkbox("Sem dispersao", &C.noSpread);
         ImGui::Checkbox("Municao infinita", &C.infAmmo);
         ImGui::SameLine(); ImGui::Checkbox("Sem recarregar", &C.noReload);
         ImGui::Checkbox("Tiro rapido", &C.rapidFire);
+    }
 
+    static void SecSkin()
+    {
         ImGui::Separator();
+        ImGui::Text("Skin / camo");
         ImGui::Checkbox("Skin changer", &C.skinChanger);
-        ImGui::SameLine(); ImGui::SliderInt("Skin", &C.skinIndex, 0, 64);
-        ImGui::Checkbox("Aplicar selecao (a cada 4s)", &C.applySelection);
+        ImGui::SameLine(); ImGui::Checkbox("Aplicar selecao (a cada 4s)", &C.applySelection);
 
-        ImGui::Separator();
-        ImGui::Checkbox("Liberar customizacao", &C.gunCustomizeUnlock);
-        ImGui::SameLine(); ImGui::Checkbox("Todos os slots", &C.gunCustomizeAllSlots);
+        ComboList("Skin / camo", Dupe::CamoList(), Dupe::CamoCount(), &C.selCamo, "(nenhuma)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(160);
+        ImGui::SliderInt("Skin (indice)", &C.skinIndex, 0, 64);
+        if (Dupe::CamoCount() == 0) ImGui::TextDisabled("(sem camos - aperte BUILD)");
 
-        ImGui::Separator();
-        ImGui::Checkbox("Forcar nomes", &C.forceNames);
-        ImGui::InputText("Nome arma", C.weaponName, sizeof(C.weaponName));
-        ImGui::InputText("Nome skin", C.skinName, sizeof(C.skinName));
-        ImGui::InputText("Nome anexo", C.attachName, sizeof(C.attachName));
-
-        ImGui::Separator();
-        const int wc = Dupe::WeaponCount();
-        if (wc > 0) {
-            if (C.selWeapon >= wc) C.selWeapon = 0;
-            if (ImGui::BeginCombo("Arma", Dupe::WeaponName(C.selWeapon))) {
-                for (int i = 0; i < wc; ++i)
-                    if (ImGui::Selectable(Dupe::WeaponName(i), i == C.selWeapon))
-                        C.selWeapon = i;
-                ImGui::EndCombo();
-            }
+        if (ImGui::Button("Aplicar skin/camo agora", ImVec2(210, 0))) {
+            C.skinChanger = true;
+            C.applySelection = true;
+            SetName(C.skinName, sizeof(C.skinName), RawName(Dupe::CamoList(), C.selCamo));
+            Log("[menu] skin aplicar: camo=%d \"%s\"", C.selCamo, C.skinName);
         }
-        else {
-            ImGui::TextDisabled("(armas: aperte Build na aba Dupe)");
-        }
+    }
 
-        const int cc = Dupe::CamoCount();
-        const char* const* cams = Dupe::CamoList();
-        if (cc > 0 && cams) {
-            if (C.selCamo >= cc) C.selCamo = 0;
-            const char* cur = cams[C.selCamo] ? cams[C.selCamo] : "?";
-            if (ImGui::BeginCombo("Skin/pattern", cur)) {
-                for (int i = 0; i < cc; ++i)
-                    if (ImGui::Selectable(cams[i] ? cams[i] : "?", i == C.selCamo))
-                        C.selCamo = i;
-                ImGui::EndCombo();
-            }
-        }
-
-        const int hc = Dupe::CharCount();
-        const char* const* chrs = Dupe::CharList();
-        if (hc > 0 && chrs) {
-            if (C.selChar >= hc) C.selChar = 0;
-            const char* cur = chrs[C.selChar] ? chrs[C.selChar] : "?";
-            if (ImGui::BeginCombo("Personagem", cur)) {
-                for (int i = 0; i < hc; ++i)
-                    if (ImGui::Selectable(chrs[i] ? chrs[i] : "?", i == C.selChar))
-                        C.selChar = i;
-                ImGui::EndCombo();
-            }
-        }
-
+    static void SecPersonagem()
+    {
         ImGui::Separator();
-        ImGui::Text("Loadout (por nome)");
+        ImGui::Text("Personagem");
+        ComboList("Personagem", Dupe::CharList(), Dupe::CharCount(), &C.selChar, "(nenhum)");
+        ImGui::SameLine();
+        if (ImGui::Button("Aplicar personagem", ImVec2(180, 0))) {
+            C.unlockChars = true;
+            SetName(C.charName, sizeof(C.charName), RawName(Dupe::CharList(), C.selChar));
+            Log("[menu] personagem aplicar: idx=%d \"%s\"", C.selChar, C.charName);
+        }
+        if (Dupe::CharCount() == 0) ImGui::TextDisabled("(sem personagens - aperte BUILD)");
+    }
+
+    static void SecArmas()
+    {
+        ImGui::Separator();
+        ImGui::Text("Arma e anexos (por nome)");
+        WeaponCombo("Arma selecionada", &C.selWeapon);
 
         static const char* kSlotTxt[3] = { "1 - Primaria", "2 - Secundaria", "3 - Gadget" };
         if (C.loadoutSlot < 0 || C.loadoutSlot > 2) C.loadoutSlot = 0;
@@ -568,18 +625,63 @@ namespace Menu {
         WeaponCombo("Slot 1", &C.slotWeapon[0]);
         WeaponCombo("Slot 2", &C.slotWeapon[1]);
         WeaponCombo("Slot 3", &C.slotWeapon[2]);
+    }
 
-        ImGui::Separator();
-        ImGui::Text("Anexos (por nome)");
+    static void SecAnexos()
+    {
+        ImGui::TextDisabled("Anexos:");
         AttachCombo("Mira", 0, &C.selAttach[0]);
         AttachCombo("Acessorio", 1, &C.selAttach[1]);
         AttachCombo("Cano", 2, &C.selAttach[2]);
+    }
 
-        ImGui::Separator();
-        if (ImGui::Button("Aplicar loadout agora")) {
+    static void SecBotoes()
+    {
+        if (ImGui::Button("Aplicar loadout agora", ImVec2(210, 0))) {
             C.applySelection = true;
-            Log("[menu] loadout marcado para aplicar (lista=%d slot=%d)", C.selWeapon, C.loadoutSlot);
+            C.fillLoadoutSlots = true;
+            C.applySlots = true;
+            SetName(C.weaponName, sizeof(C.weaponName), Dupe::WeaponName(C.selWeapon));
+            SetName(C.attachName, sizeof(C.attachName), RawName(Dupe::AttachList(0), C.selAttach[0]));
+            Log("[menu] loadout aplicar: arma=%d slot=%d anexoMira=%d",
+                C.selWeapon, C.loadoutSlot, C.selAttach[0]);
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Aplicar tudo (3 slots + anexos)", ImVec2(230, 0))) {
+            C.applySelection = true;
+            C.fillLoadoutSlots = true;
+            C.applySlots = true;
+            C.unlockAll = true; C.unlockSkins = true; C.unlockAttachments = true;
+            Log("[menu] aplicar tudo");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Limpar selecao", ImVec2(130, 0))) LimparSelecao();
+    }
+
+    static void SecNomes()
+    {
+        ImGui::Separator();
+        ImGui::Checkbox("Liberar customizacao", &C.gunCustomizeUnlock);
+        ImGui::SameLine(); ImGui::Checkbox("Todos os slots", &C.gunCustomizeAllSlots);
+        ImGui::Checkbox("Forcar nomes", &C.forceNames);
+        ImGui::InputText("Nome arma", C.weaponName, sizeof(C.weaponName));
+        ImGui::InputText("Nome skin", C.skinName, sizeof(C.skinName));
+        ImGui::InputText("Nome anexo", C.attachName, sizeof(C.attachName));
+        ImGui::InputText("Nome personagem", C.charName, sizeof(C.charName));
+    }
+
+    // ---------------------------------------------------------- aba
+    static void TabWeapon()
+    {
+        ARMA_SEC("build", SecBuild);
+        ARMA_SEC("mods", SecMods);
+        ARMA_SEC("skin", SecSkin);
+        ARMA_SEC("personagem", SecPersonagem);
+        ARMA_SEC("arma", SecArmas);
+        ARMA_SEC("anexos", SecAnexos);
+        ARMA_SEC("botoes", SecBotoes);
+        ARMA_SEC("nomes", SecNomes);
+        g_sec = "-";
     }
 
     // ========================================================== DUPE / BUILD
@@ -590,7 +692,7 @@ namespace Menu {
         ImGui::Separator();
 
         if (ImGui::Button("BUILD (coletar agora)", ImVec2(230, 0))) {
-            Unlock::BuildAllNow();             // <<< v43.16: coleta tudo numa chamada
+            Unlock::BuildAllNow();
             Log("[menu] dupe: build pedida");
         }
         ImGui::SameLine();
@@ -776,7 +878,8 @@ namespace Menu {
             bool lk = Unlock::MoneyLocked(i);
             if (ImGui::Checkbox("##lk", &lk)) Unlock::MoneySetLock(i, lk);
             ImGui::SameLine();
-            ImGui::Text("%-38s", Unlock::MoneyName(i));
+            const char* mn = Unlock::MoneyName(i);
+            ImGui::Text("%-38s", mn ? mn : "?");
             ImGui::SameLine();
             long long v = Unlock::MoneyValue(i);
             ImGui::SetNextItemWidth(120);
@@ -870,13 +973,15 @@ namespace Menu {
         while (p < end) {
             const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
             const size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
-            if (len && TypeMatch(p, g_logType)) {
-                if (strstr(p, "[money]") || strstr(p, "[mirror]") || strstr(p, "[credit]") ||
-                    strstr(p, "[shop]") || strstr(p, "[loja]") || strstr(p, "[conta]"))
+            if (len && TypeMatch(p, len, g_logType)) {
+                if (LineHas(p, len, "[money]") || LineHas(p, len, "[mirror]") ||
+                    LineHas(p, len, "[credit]") || LineHas(p, len, "[shop]") ||
+                    LineHas(p, len, "[loja]") || LineHas(p, len, "[conta]"))
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.85f, 1.f, 1.f));
-                else if (strstr(p, "[err]") || strstr(p, "[erro]") || strstr(p, "!!!!"))
+                else if (LineHas(p, len, "[err]") || LineHas(p, len, "[erro]") ||
+                    LineHas(p, len, "!!!!"))
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.45f, 0.45f, 1.f));
-                else if (strstr(p, "[warn]"))
+                else if (LineHas(p, len, "[warn]"))
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.80f, 0.40f, 1.f));
                 else
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.85f, 0.88f, 1.f));
@@ -893,13 +998,33 @@ namespace Menu {
     }
 
     // ========================================================== DRAW
+    //  Cada aba em __try proprio; EndTabItem/EndTabBar/End SEMPRE rodam.
+    //  O log de crash e' THROTTLED (so quando muda) -> sem inundar o arquivo.
+#define BFI_SAFE_TAB(_label, _fn)                                   \
+        if (ImGui::BeginTabItem(_label)) {                          \
+            __try { g_sec = "-"; _fn(); }                           \
+            __except (EXCEPTION_EXECUTE_HANDLER) {                  \
+                static char _last[96] = "";                         \
+                char _t[96];                                        \
+                sprintf_s(_t, "%s|%s", _label, g_sec);              \
+                if (strcmp(_t, _last) != 0) {                       \
+                    strcpy_s(_last, _t);                            \
+                    Log("[crash] Tab %s secao=%s", _label, g_sec);  \
+                }                                                   \
+            }                                                       \
+            __try { ImGui::EndTabItem(); }                          \
+            __except (EXCEPTION_EXECUTE_HANDLER) {                  \
+                Log("[crash] EndTabItem %s", _label);               \
+            }                                                       \
+        }
+
     void Draw()
     {
         if (!g_open) return;
         ApplyStyleOnce();
 
-        ImGui::SetNextWindowSize(ImVec2(720, 700), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(780, 880), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);
 
         if (!ImGui::Begin("bfi - Bullet Force", &g_open)) {
             ImGui::End();
@@ -909,23 +1034,30 @@ namespace Menu {
         RiskBanner();
 
         if (ImGui::BeginTabBar("##tabs")) {
-            if (ImGui::BeginTabItem("Aimbot")) { TabAimbot();   ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Trigger")) { TabTrigger();  ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Visual")) { TabVisual();   ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Arma")) { TabWeapon();   ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Dupe")) { TabDupe();     ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Movimento")) { TabMovement(); ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Unlock")) { TabUnlock();   ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Conta")) { TabConta();    ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Misc")) { TabMisc();     ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Log")) { TabLog();      ImGui::EndTabItem(); }
-            ImGui::EndTabBar();
+            BFI_SAFE_TAB("Aimbot", TabAimbot);
+            BFI_SAFE_TAB("Trigger", TabTrigger);
+            BFI_SAFE_TAB("Visual", TabVisual);
+            BFI_SAFE_TAB("Arma", TabWeapon);
+            BFI_SAFE_TAB("Dupe", TabDupe);
+            BFI_SAFE_TAB("Movimento", TabMovement);
+            BFI_SAFE_TAB("Unlock", TabUnlock);
+            BFI_SAFE_TAB("Conta", TabConta);
+            BFI_SAFE_TAB("Misc", TabMisc);
+            BFI_SAFE_TAB("Log", TabLog);
+
+            __try { ImGui::EndTabBar(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] EndTabBar"); }
         }
 
         ImGui::Separator();
         ImGui::TextDisabled("Insert = menu | Delete = panico | F5 = salvar | F8 = descarregar");
-        ImGui::End();
+
+        __try { ImGui::End(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] End"); }
     }
+
+#undef BFI_SAFE_TAB
+#undef ARMA_SEC
 
 } // namespace Menu
 // ==== FIM menu.cpp ====

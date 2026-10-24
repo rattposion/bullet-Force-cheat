@@ -2,6 +2,8 @@
 // ============================================================================
 //  features.h — declaracoes publicas compartilhadas.
 //  Cada simbolo tem UM dono. Nada e' definido aqui (exceto inlines triviais).
+//  >>> FIX: Menu::CaptureStacks / Menu::HealImGuiStacks para fechar a pilha
+//           do ImGui quando o Draw estoura (evita "Missing End()").
 // ============================================================================
 #include <atomic>
 #include <cstdint>
@@ -31,6 +33,9 @@ namespace Menu {
     void ApplyStyle();
     void Draw();
     void Render();
+
+    void CaptureStacks();       // >>> FIX
+    void HealImGuiStacks();     // >>> FIX
 }
 
 // ============================================================================

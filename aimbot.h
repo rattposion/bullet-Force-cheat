@@ -1,15 +1,22 @@
 #pragma once
 // ============================================================================
-//  aimbot.h  —  v17
+//  aimbot.h  —  v19
 //
-//  FIXES:
-//   [H1] Declaracoes que matam os LNK2019 (Install/Tick/Best/AimPoint/Silent::Override).
-//   [H2] Silent::Override(Vec3 muzzle, Vec3& outDir)  <-- assinatura batendo com a
-//        chamada no hook do FireBullet (hooks.cpp). 2 argumentos, NAO 3.
+//  >>> v19 (MIRA FORTE)
+//   [G1] FOV e selecao por ANGULO em GRAUS (espaco de mundo), independente da
+//        projecao de tela.
+//   [G2] Histerese que NAO larga a mira durante o cooldown de troca.
+//   [G3] Fallback de bone (cabeca -> peito -> quadril) com vis por bone.
+//   [G4] Predicao de movimento (historico por frame, sem heap).
+//   [G5] Deadzone angular: nao reescreve a rotacao se ja esta em cima.
+//   [G6] Perf: muzzle/LOS fora do loop, cap de raycast por TopN.
+//
+//  >>> v17/v18 (mantidos)
+//   [H1] Declaracoes que matam os LNK2019.
+//   [H2] Silent::Override(Vec3 muzzle, Vec3& outDir) — 2 args, NAO 3.
 //   [H3] <cstdint> incluido.
-//   [H4] v16: declaradas as helpers de math (definidas em aimbot.cpp).
-//   [H5] v17 (PATCH A2): IsActive() — estado real (tecla segurada/toggle) usado
-//        pelo gate do silent aim no hooks.cpp.
+//   [H4] helpers de math declaradas.
+//   [H5]/[B1b] IsActive() para o gate do silent aim (hooks.cpp).
 // ============================================================================
 
 #include <cstdint>
@@ -34,12 +41,11 @@ namespace Aimbot {
     // -----------------------------------------------------------------------
     //  helpers usados por outros modulos
     // -----------------------------------------------------------------------
-    Il2CppObject* Best();                 // combat.cpp   -> melhor alvo (cache/frame)
-    Vec3          AimPoint(void* target); // triggerbot.cpp -> ponto de mira
+    Il2CppObject* Best();                 // combat.cpp -> melhor alvo (cache/frame, por angulo)
+    Vec3          AimPoint(void* target); // triggerbot.cpp -> ponto de mira (bone + predicao)
 
     // -----------------------------------------------------------------------
-    //  silencioso — chamado no hook do FireBullet (hooks.cpp)
-    //  Override(muzzle, outDir): muzzle = origem do cano, outDir = direcao (ref)
+    //  silencioso — hook do FireBullet (hooks.cpp). 2 args.
     // -----------------------------------------------------------------------
     namespace Silent {
         bool Override(Vec3 muzzle, Vec3& outDir);
@@ -56,6 +62,18 @@ namespace Aimbot {
     Vec3  LocalPos();
     Vec3  CamForward();
     float Dist3D(Vec3 a, Vec3 b);
+
+    // -----------------------------------------------------------------------
+    //  NOVO v19 — util pra HUD/debug e pro triggerbot
+    // -----------------------------------------------------------------------
+    float AngleTo(Vec3 world);              // graus entre o crosshair e um ponto
+    float AngleToTarget(void* target);      // idem, pelo ponto de mira do alvo
+    Vec3  Predict(Il2CppObject* e, Vec3 p); // lead pelo vetor de velocidade
+    bool  BonePos(Il2CppObject* e, int bone, Vec3& out);
+    int   CurrentBone();                    // bone em uso (-1 = nenhum)
+    float CurrentAngle();                   // erro angular atual (graus)
+    void  ClearTarget();
+    void  ForceReacquire();
 
     // -----------------------------------------------------------------------
     //  extras / debug

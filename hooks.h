@@ -1,11 +1,11 @@
 #pragma once
 // ============================================================================
-//  hooks.h — v4  (bfi / Bullet Force)
+//  hooks.h — v5  (bfi / Bullet Force)
 //  DONO das declaracoes de tudo o que hooks.cpp define.
 //
 //  >>> DIAGNOSTICO
 //    Se o build disser que 'Stage' ou 'Hooks' nao existem, procure no Output
-//    a linha:   >>> bfi: hooks.h v4 compilado
+//    a linha:   >>> bfi: hooks.h v5 compilado
 //    Se ela NAO aparecer em cada .cpp que inclui este header, o compilador
 //    esta lendo OUTRO arquivo (caminho/projeto errado) — nao e' problema de
 //    codigo.
@@ -14,12 +14,14 @@
 //    g_sdkReady  -> escrito APENAS por Combat::Tick.
 //    g_imguiReady / g_hooksLive -> escritos APENAS pelo SetStage (hooks.cpp).
 //    g_viewW / g_viewH -> DEFINIDOS em hooks.cpp (nao static: sdk.cpp le').
-//    g_phase -> DEFINIDO em UM .cpp (dllmain.cpp).
+//    g_phase  -> DEFINIDO em UM .cpp (sdk.cpp).
+//    g_unload -> DEFINIDO em UM .cpp (dllmain.cpp).   >>> v5: GLOBAL (era
+//                declarado dentro do namespace -> LNK2001 Hooks::g_unload).
 // ============================================================================
 #ifndef BFI_HOOKS_H
 #define BFI_HOOKS_H
 
-#pragma message(">>> bfi: hooks.h v4 compilado")
+#pragma message(">>> bfi: hooks.h v5 compilado")
 
 #include <atomic>
 #include <cstdint>
@@ -49,6 +51,7 @@ namespace Hooks {
     extern std::atomic<bool>     g_sdkReady;          // dono: Combat::Tick
     extern std::atomic<uint64_t> g_frameCounter;
     extern std::atomic<uint32_t> g_imguiGeneration;   // ++ a cada CreateContext
+    // OBS: g_unload NAO fica aqui — e' global (veja abaixo).
 
     // lidos pelo sdk.cpp — DEFINIDOS em hooks.cpp (nao static)
     extern std::atomic<int>      g_viewW;
@@ -148,9 +151,16 @@ using Stage = Hooks::Stage;
 using ViewSize = Hooks::ViewSize;
 
 // ---------------------------------------------------------------------------
-//  fase atual (VEH / log [crash]). DEFINIDA em UM .cpp (dllmain.cpp).
+//  fase atual (VEH / log [crash]). DEFINIDA em UM .cpp (sdk.cpp).
 // ---------------------------------------------------------------------------
 extern const char* g_phase;
+
+// ---------------------------------------------------------------------------
+//  >>> v5: g_unload GLOBAL (nao e' mais Hooks::g_unload). DEFINIDO em
+//  UM .cpp (dllmain.cpp). Assim o hooks.cpp (dentro do namespace) e o
+//  dllmain enxergam o MESMO simbolo.
+// ---------------------------------------------------------------------------
+extern std::atomic<bool> g_unload;
 
 // atribuicao pura: sem chamada de funcao, sem depender de nada do header
 #ifndef PHASE

@@ -6,6 +6,10 @@
 //   - abre com _SH_DENYNO (compartilhamento liberado -> o menu pode ler)
 //   - mantem um RING BUFFER em memoria com as ultimas linhas, para o menu
 //     ler direto (imune a lock de arquivo)
+//  >>> FIX v3: mutexes RECURSIVOS. Log() e' chamado de dentro dos __except;
+//      se o AV acontecer DENTRO do RingPush (com g_ringMx preso), o Log do
+//      handler tentava pegar o mesmo mutex nao-recursivo -> deadlock e o
+//      frame nunca fechava.
 // ============================================================================
 
 #include <windows.h>
@@ -26,10 +30,10 @@ void LogInit();
 static FILE* g_log = nullptr;
 
 static std::vector<std::string> g_q;
-static std::mutex               g_qMx;
-static std::atomic<bool>        g_stop{ false };
-static HANDLE                   g_ev = nullptr;
-static HANDLE                   g_th = nullptr;
+static std::recursive_mutex      g_qMx;      // >>> FIX
+static std::atomic<bool>         g_stop{ false };
+static HANDLE                    g_ev = nullptr;
+static HANDLE                    g_th = nullptr;
 
 static const size_t kMaxQueue = 8192;
 
@@ -37,14 +41,14 @@ static const size_t kMaxQueue = 8192;
 //  RING BUFFER (o menu le daqui - sem tocar no arquivo)
 // ---------------------------------------------------------------------------
 static const size_t kRingMax = 1024;
-static std::mutex   g_ringMx;
+static std::recursive_mutex g_ringMx;        // >>> FIX
 static std::string  g_ring[kRingMax];
 static size_t       g_ringHead = 0;
 static size_t       g_ringCount = 0;
 
 static void RingPush(const char* line)
 {
-    std::lock_guard<std::mutex> lk(g_ringMx);
+    std::lock_guard<std::recursive_mutex> lk(g_ringMx);
     g_ring[g_ringHead] = line;
     g_ringHead = (g_ringHead + 1) % kRingMax;
     if (g_ringCount < kRingMax) ++g_ringCount;
@@ -53,7 +57,7 @@ static void RingPush(const char* line)
 size_t LogSnapshot(char* dst, size_t cap)
 {
     if (!dst || cap < 2) return 0;
-    std::lock_guard<std::mutex> lk(g_ringMx);
+    std::lock_guard<std::recursive_mutex> lk(g_ringMx);
 
     size_t n = 0;
     const size_t start = (g_ringCount == kRingMax) ? g_ringHead : 0;
@@ -70,7 +74,7 @@ size_t LogSnapshot(char* dst, size_t cap)
 
 void LogClearRing()
 {
-    std::lock_guard<std::mutex> lk(g_ringMx);
+    std::lock_guard<std::recursive_mutex> lk(g_ringMx);
     g_ringCount = 0;
     g_ringHead = 0;
 }
@@ -95,7 +99,7 @@ static DWORD WINAPI LogThread(LPVOID) {
 
         local.clear();
         {
-            std::lock_guard<std::mutex> lk(g_qMx);
+            std::lock_guard<std::recursive_mutex> lk(g_qMx);
             local.swap(g_q);
         }
 
@@ -106,7 +110,7 @@ static DWORD WINAPI LogThread(LPVOID) {
 
         if (g_stop.load()) {
             bool more = false;
-            { std::lock_guard<std::mutex> lk(g_qMx); more = !g_q.empty(); }
+            { std::lock_guard<std::recursive_mutex> lk(g_qMx); more = !g_q.empty(); }
             if (!more) break;
         }
     }
@@ -163,7 +167,7 @@ void Log(const char* fmt, ...) {
     if (!g_th) { WriteSync(line); return; }    // fallback sincrono
 
     {
-        std::lock_guard<std::mutex> lk(g_qMx);
+        std::lock_guard<std::recursive_mutex> lk(g_qMx);
         if (g_q.size() < kMaxQueue) g_q.emplace_back(line);
     }
     SetEvent(g_ev);

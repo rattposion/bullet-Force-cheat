@@ -1,19 +1,38 @@
 // ============================================================================
-//  unlock.cpp — bfi (v43.16)
+//  unlock.cpp — bfi (v43.22)
 //
-//  >>> v43.16
-//    * BUILD: nova BuildAllNow() — faz install + CollectWeapons/Attachs/
-//      Camos/Chars + Save NUMA chamada so. O botao da aba Dupe chama ela
-//      direto, entao o build nao depende mais da maquina de estagios
-//      nem da ordem do Tick.
+//  >>> v43.22  (PERF DO FRAME + REVALIDACAO DO ARRAY + LIMPEZA)
+//    * PERF: ApplyAll() rodava TUDO a cada frame. ApplyAvailable() varria as
+//      ~65 armas (2 acessos com checagem de pagina por arma) todo frame, e
+//      ApplyAttachments/ApplyPlayerInts reescreviam os mesmos valores sem
+//      parar. Agora: available 1x/2s, anexos 1x/250ms, ints do player 1x/250ms.
+//      A passada e o Build forcam o available na hora (g_availNext = 0).
+//    * PERF: ApplyAvailable() le os elementos pelo ponteiro base do array em
+//      vez de ArrElem() (que refazia a validacao a cada elemento).
+//    * FIX: RevalidateArray() — o g_arr cacheado nunca era revalidado. Se o
+//      jogo realocasse o array, o cheat escrevia em memoria morta. Revalida a
+//      cada 5s contra o offset do player.
+//    * PERF/DIAG: perfil QPC por sub-fase do Tick, logado a cada 2s.
+//    * LIXO: removidos InvokeSafe() (morto desde o v43.21) e os offsets
+//      g_offCamoType/g_offTracerType/g_offGcs (resolvidos e nunca lidos).
 //
-//  >>> v43.14
-//    * FIX BUILD: 'case 0' no BuildStepInner (mantido).
-//    * CREDITOS: probes JBNJGEGJGAD @0x34 e FIOMIPONAAM @0xA4.
-//    * Readback em toda escrita. #error se o config.h estiver velho.
+//  >>> v43.21  (EQUIP ARG ERRADO + LOG DE EXCECAO + KILL SWITCHES)
+//    * TryEquipSmart: manda o TIPO da arma (ex. 61) em vez do INDICE do array
+//      (ex. 3) para SetGunAsPrimary/SetGunAsSecondary/SetAsGadget. Se lancar,
+//      repete com o indice. Evidencia: LoadoutManager::sel1 == currentGunType
+//      e GadgetSlotOptions/ONODAGDHALL guardam TIPOS, nao posicoes.
+//    * InvokeEquipLogged: le a excecao gerenciada pendente (il2cpp_runtime_invoke
+//      com o 4o parametro) e loga classe + mensagem + currentGunType/sel1
+//      antes->depois. O InvokeSafe antigo passava nullptr e nunca via o NRE.
+//    * Kill switches p/ bisect do freeze: offEquip / offIdx / offFv / offPrefs /
+//      offCand + SetOff*().
 //
-//  >>> v43.13 / v43.12 / v43.11 (mantidos)
-//    * kind do espelho pelo tipo real; JSON da conta; 3 saltos p/ bfAccountInfo.
+//  >>> v43.20
+//    * ApplySelection NAO reinicia mais a cada 4s (g_selSlot/g_selDone/
+//      g_selForce/g_selForceEquip + RequestApply()).
+//    * PlayerPrefs.Save() so quando ha mudanca real (g_prefsDirty + PrefsFlush).
+//    * PrefStrictKey(): nao escreve mais nome de arma em roomType /
+//      allowedweapons / isHoldingMinigun.
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -36,7 +55,7 @@
 #error "config.h desatualizado (BFI_CONFIG_VER < 4315). Substitua o config.h."
 #endif
 
-#define BFI_UNLOCK_VER "v43.16"
+#define BFI_UNLOCK_VER "v43.22"
 namespace Unlock {
 
     static void* StaticInstanceOf(Il2CppClass* k);
@@ -45,8 +64,7 @@ namespace Unlock {
     static int    g_arrLen = 0;
     static uint32_t g_offArr = 0;
 
-    static uint32_t g_offName = 0, g_offAvailable = 0, g_offCamoType = 0;
-    static uint32_t g_offTracerType = 0, g_offGcs = 0;
+    static uint32_t g_offName = 0, g_offAvailable = 0;
     static uint32_t g_offSights = 0, g_offAcc = 0, g_offBarrels = 0;
     static uint32_t g_offFpsGunView = 0;
 
@@ -73,6 +91,12 @@ namespace Unlock {
 
     static ULONGLONG g_nextInstallTry = 0;
     static bool      g_dupeEnsured = false;
+
+    // >>> v43.22: portoes de escrita per-frame
+    static ULONGLONG g_arrNext = 0;
+    static ULONGLONG g_availNext = 0;
+    static ULONGLONG g_attachNext = 0;
+    static ULONGLONG g_intsNext = 0;
 
     // ================================================================= helpers
     typedef Il2CppClass* (*fn_elem)(Il2CppClass*);
@@ -270,11 +294,6 @@ namespace Unlock {
         __try { p_fieldStaticSet(f, buf); }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
-    static void InvokeSafe(MethodInfo* m, void* obj, void** args) {
-        if (!m) return;
-        __try { il2cpp_runtime_invoke(m, obj, args, nullptr); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[unlock] AV no invoke"); }
-    }
 
     static Dupe::Item MkItem(int v, const std::string& n, int aux = 0) {
         Dupe::Item it; it.value = v; it.name = n; it.aux = aux; return it;
@@ -298,6 +317,34 @@ namespace Unlock {
             ++n;
         }
         return n;
+    }
+
+    // =========================================================================
+    //  >>> v43.22: perfil (QPC). Acha o custo real do Tick em vez de chutar.
+    // =========================================================================
+    static double QpcMs() {
+        static LARGE_INTEGER f = {};
+        if (!f.QuadPart) QueryPerformanceFrequency(&f);
+        LARGE_INTEGER c; QueryPerformanceCounter(&c);
+        return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+    }
+    static double g_pfTick = 0, g_pfMoney = 0, g_pfInner = 0;
+    static double g_pfAvail = 0, g_pfAtt = 0, g_pfInts = 0, g_pfSel = 0;
+    static int    g_pfN = 0;
+    static ULONGLONG g_pfNext = 0;
+
+    static void PfLog() {
+        const ULONGLONG now = GetTickCount64();
+        if (now < g_pfNext) return;
+        g_pfNext = now + 2000;
+        if (!g_pfN) return;
+        const double n = (double)g_pfN;
+        Log("[prof] tick medio: total=%.2fms money=%.2f inner=%.2f | avail=%.2f attach=%.2f ints=%.2f sel=%.2f | n=%d",
+            g_pfTick / n, g_pfMoney / n, g_pfInner / n,
+            g_pfAvail / n, g_pfAtt / n, g_pfInts / n, g_pfSel / n, g_pfN);
+        g_pfTick = g_pfMoney = g_pfInner = 0;
+        g_pfAvail = g_pfAtt = g_pfInts = g_pfSel = 0;
+        g_pfN = 0;
     }
 
     // =========================================================================
@@ -824,21 +871,30 @@ namespace Unlock {
         return true;
     }
 
+    // >>> v43.22: o array cacheado nunca era revalidado.
+    static void RevalidateArray() {
+        const ULONGLONG now = GetTickCount64();
+        if (now < g_arrNext) return;
+        g_arrNext = now + 5000;
+        if (!SDK::g_localPlayer || !g_offArr) return;
+        void* a = SafeRead<void*>((uintptr_t)SDK::g_localPlayer + g_offArr, nullptr);
+        if (!LooksLikeObj(a) || a == g_arr) return;
+        int len = ArrLen((Il2CppArray*)a);
+        if (len < 8 || len > 512) return;
+        Log("[unlock] array de armas MUDOU %p -> %p (len %d -> %d)", g_arr, a, g_arrLen, len);
+        g_arr = a; g_arrLen = len;
+        g_availNext = 0;
+    }
+
     static void ResolveOffsets() {
         if (!SDK::kGunStats) return;
         g_offName = FieldOffNamed(SDK::kGunStats, "weaponName");
         g_offAvailable = FieldOffNamed(SDK::kGunStats, "available");
-        g_offCamoType = FieldOffNamed(SDK::kGunStats, "camoType");
-        g_offTracerType = FieldOffNamed(SDK::kGunStats, "tracerType");
-        g_offGcs = FieldOffNamed(SDK::kGunStats, "gunCustomizeScript");
         g_offSights = FieldOffNamed(SDK::kGunStats, "possibleSights");
         g_offAcc = FieldOffNamed(SDK::kGunStats, "possibleAccessories");
         g_offBarrels = FieldOffNamed(SDK::kGunStats, "possibleBarrels");
         if (!g_offName)       g_offName = 0x278;
         if (!g_offAvailable)  g_offAvailable = 0x270;
-        if (!g_offCamoType)   g_offCamoType = 0x2C0;
-        if (!g_offTracerType) g_offTracerType = 0x2C4;
-        if (!g_offGcs)        g_offGcs = 0x2B0;
         if (!g_offSights)     g_offSights = 0x118;
         if (!g_offAcc)        g_offAcc = 0x120;
         if (!g_offBarrels)    g_offBarrels = 0x128;
@@ -1271,13 +1327,24 @@ namespace Unlock {
     }
 
     // ================================================================ aplicar
+    // >>> v43.22: le os elementos pelo base do array (sem ArrElem por item) e
+    //     so roda quando o portao deixa. Era o que varria as ~65 armas por frame.
     static void ApplyAvailable() {
         if (!g_arr || g_arrLen <= 0 || !g_offAvailable) return;
+        if (!LooksLikeObj(g_arr)) return;
+        const uintptr_t items = (uintptr_t)g_arr + 0x20;
+        int n = 0;
         for (int i = 0; i < g_arrLen; ++i) {
-            void* gun = ArrElem((Il2CppArray*)g_arr, i);
+            void* gun = *(void**)(items + (size_t)i * 8);
             if (!gun) continue;
-            if (SafeRead<int>((uintptr_t)gun + g_offAvailable, 0) != 1)
+            if (SafeRead<int>((uintptr_t)gun + g_offAvailable, 0) != 1) {
                 SafeWrite<int>((uintptr_t)gun + g_offAvailable, 1);
+                ++n;
+            }
+        }
+        if (n) {
+            static int lastN = -1;
+            if (n != lastN) { lastN = n; Log("[unlock] available=1 em %d arma(s)", n); }
         }
     }
 
@@ -1358,6 +1425,20 @@ namespace Unlock {
     static const char* kEquipForceName = "";
     static const int   kEquipForceArgc = -1;
 
+    typedef void* (*fn_invoke_ex)(MethodInfo*, void*, void**, void**);
+    static fn_invoke_ex p_invokeEx = nullptr;
+
+    static bool g_equipUseType = true;   // manda o TIPO primeiro, nao o indice
+    static bool g_offEquip = false, g_offIdx = false, g_offFv = false;
+    static bool g_offPrefs = false, g_offCand = false;
+
+    void SetOffEquip(bool b) { g_offEquip = b; Log("[dbg] offEquip=%d", b); }
+    void SetOffIdx(bool b) { g_offIdx = b;   Log("[dbg] offIdx=%d", b); }
+    void SetOffFv(bool b) { g_offFv = b;    Log("[dbg] offFv=%d", b); }
+    void SetOffPrefs(bool b) { g_offPrefs = b; Log("[dbg] offPrefs=%d", b); }
+    void SetOffCand(bool b) { g_offCand = b;  Log("[dbg] offCand=%d", b); }
+    void SetEquipUseType(bool b) { g_equipUseType = b; Log("[dbg] equipUseType=%d", b); }
+
     typedef uint32_t(*fn_epParamCount)(const MethodInfo*);
     typedef const Il2CppType* (*fn_epParam)(const MethodInfo*, uint32_t);
     typedef MethodInfo* (*fn_class_get_methods)(Il2CppClass*, void**);
@@ -1380,6 +1461,7 @@ namespace Unlock {
         p_classGetMethods = (fn_class_get_methods)GetProcAddress(ga, "il2cpp_class_get_methods");
         p_methodGetName = (fn_method_get_name)GetProcAddress(ga, "il2cpp_method_get_name");
         p_methodGetFlags = (fn_method_get_flags)GetProcAddress(ga, "il2cpp_method_get_flags");
+        p_invokeEx = (fn_invoke_ex)GetProcAddress(ga, "il2cpp_runtime_invoke");
     }
 
     static bool MethodIsStatic(MethodInfo* m) {
@@ -1768,28 +1850,86 @@ namespace Unlock {
         if (!g_mEquip) Log("[unlock] equip: nenhuma assinatura valida encontrada");
     }
 
-    static void InvokeEquipOn(MethodInfo* m, void* obj, int slot, int weaponIdx, int weaponType) {
-        if (!m) return;
-        const uint32_t np = p_epParamCount ? p_epParamCount(m) : 1;
-        if (np == 0 || np > 8) return;
-
-        int   ibuf[8] = {};
-        void* refbuf[8] = {};
-        void* args[8] = {};
-
+    static void EquipArgFill(MethodInfo* m, void** args, int* ibuf, void** refbuf,
+        int slot, int value, int wtype) {
+        const uint32_t np = p_epParamCount ? p_epParamCount(m) : 0;
         for (uint32_t i = 0; i < np; ++i) {
             const Il2CppType* t = p_epParam ? p_epParam(m, i) : nullptr;
             const char* tn = TN(t);
-            if (tn && strstr(tn, "Boolean")) { ibuf[i] = 1; args[i] = &ibuf[i]; }
-            else if (EquipIsEnumParam(t)) { ibuf[i] = weaponType; args[i] = &ibuf[i]; }
+            if (tn && strstr(tn, "Boolean")) { ibuf[i] = 1;     args[i] = &ibuf[i]; }
+            else if (EquipIsEnumParam(t)) { ibuf[i] = wtype; args[i] = &ibuf[i]; }
             else if (tn && (strstr(tn, "Int32") || strstr(tn, "Byte") || strstr(tn, "Int16") ||
                 strstr(tn, "UInt16") || strstr(tn, "UInt32") || strstr(tn, "SByte"))) {
-                ibuf[i] = (i == 0) ? weaponIdx : slot;
+                ibuf[i] = (i == 0) ? value : slot;
                 args[i] = &ibuf[i];
             }
             else { refbuf[i] = nullptr; args[i] = &refbuf[i]; }
         }
-        InvokeSafe(m, obj, args);
+    }
+
+    static bool InvokeEquipLogged(MethodInfo* m, void* obj, int slot, int value, int wtype,
+        const char* tag, const char* kind) {
+        if (!m) return true;
+        const uint32_t np = p_epParamCount ? p_epParamCount(m) : 1;
+        if (np == 0 || np > 8) return true;
+
+        int   ibuf[8] = {};
+        void* refbuf[8] = {};
+        void* args[8] = {};
+        EquipArgFill(m, args, ibuf, refbuf, slot, value, wtype);
+
+        void* lm = LoadoutMgr();
+        const int gb = lm ? SafeRead<int>((uintptr_t)lm + kLmCurType, -1) : -1;
+        const int sb = lm ? SafeRead<int>((uintptr_t)lm + kLmSel1, -1) : -1;
+
+        void* exc = nullptr;
+        __try {
+            if (p_invokeEx) p_invokeEx(m, obj, args, &exc);
+            else            il2cpp_runtime_invoke(m, obj, args, nullptr);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[unlock] equip %s: AV NATIVO (SEH) arg=%s(%d)", tag, kind, value);
+            return false;
+        }
+        const int ga2 = lm ? SafeRead<int>((uintptr_t)lm + kLmCurType, -1) : -1;
+        const int sa2 = lm ? SafeRead<int>((uintptr_t)lm + kLmSel1, -1) : -1;
+
+        if (exc) {
+            Il2CppClass* ec = nullptr;
+            __try { ec = il2cpp_object_get_class((Il2CppObject*)exc); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            char msg[160]; msg[0] = 0;
+            if (ec) {
+                MethodInfo* gm = il2cpp_class_get_method_from_name(ec, "get_Message", 0);
+                if (gm && p_invokeEx) {
+                    void* r = nullptr;
+                    __try { r = p_invokeEx(gm, exc, nullptr, nullptr); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    if (r) CStr(r, msg, sizeof(msg));
+                }
+            }
+            Log("[unlock] equip %s: EXCECAO %s \"%s\" arg=%s(%d) | currentGunType %d->%d sel1 %d->%d",
+                tag, ec ? il2cpp_class_get_name(ec) : "?", msg, kind, value, gb, ga2, sb, sa2);
+            return false;
+        }
+        Log("[unlock] equip %s OK arg=%s(%d) | currentGunType %d->%d sel1 %d->%d",
+            tag, kind, value, gb, ga2, sb, sa2);
+        return true;
+    }
+
+    static bool TryEquipSmart(MethodInfo* m, void* obj, int slot, int live, int wtype,
+        const char* tag) {
+        if (g_equipUseType) {
+            if (InvokeEquipLogged(m, obj, slot, wtype, wtype, tag, "tipo")) return true;
+            Log("[unlock] equip %s: repetindo com INDICE", tag);
+            if (InvokeEquipLogged(m, obj, slot, live, wtype, tag, "idx")) return true;
+        }
+        else {
+            if (InvokeEquipLogged(m, obj, slot, live, wtype, tag, "idx")) return true;
+            Log("[unlock] equip %s: repetindo com TIPO", tag);
+            if (InvokeEquipLogged(m, obj, slot, wtype, wtype, tag, "tipo")) return true;
+        }
+        return false;
     }
 
     static void CallEquip(int slot, int weaponIdx, int weaponType) {
@@ -1797,8 +1937,13 @@ namespace Unlock {
         if (slot < 0) slot = 0;
         if (slot > 2) slot = 2;
 
+        if (g_offEquip) {
+            Log("[unlock] equip PULADO (off) slot=%d idx=%d tipo=%d", slot, weaponIdx, weaponType);
+            return;
+        }
+
         if (g_mEquipForce) {
-            InvokeEquipOn(g_mEquipForce, g_equipForceObj, slot, weaponIdx, weaponType);
+            TryEquipSmart(g_mEquipForce, g_equipForceObj, slot, weaponIdx, weaponType, "FORCADO");
             Log("[unlock] equip FORCADO slot=%d idx=%d tipo=%d obj=%p",
                 slot, weaponIdx, weaponType, g_equipForceObj);
             return;
@@ -1809,11 +1954,10 @@ namespace Unlock {
             const bool st = MethodIsStatic(m);
             void* obj = st ? nullptr : LoadoutMgr();
             if (st || obj) {
-                InvokeEquipOn(m, obj, slot, weaponIdx, weaponType);
-                Log("[unlock] equip POR SLOT: slot=%d metodo=%s argc=%u %s idx=%d tipo=%d obj=%p",
+                Log("[unlock] equip POR SLOT: slot=%d metodo=%s argc=%u %s obj=%p",
                     slot, p_methodGetName ? p_methodGetName(m) : "?",
-                    p_epParamCount ? p_epParamCount(m) : 0,
-                    st ? "[static]" : "[inst]", weaponIdx, weaponType, obj);
+                    p_epParamCount ? p_epParamCount(m) : 0, st ? "[static]" : "[inst]", obj);
+                TryEquipSmart(m, obj, slot, weaponIdx, weaponType, "slot");
                 return;
             }
             if (!g_equipSlotWarned) {
@@ -1827,7 +1971,7 @@ namespace Unlock {
             const bool st = MethodIsStatic(g_mEquip);
             void* o2 = nullptr;
             if (!st) { o2 = LoadoutMgr(); if (!o2) o2 = SDK::g_localPlayer; }
-            InvokeEquipOn(g_mEquip, o2, slot, weaponIdx, weaponType);
+            TryEquipSmart(g_mEquip, o2, slot, weaponIdx, weaponType, "fallback");
             Log("[unlock] equip FALLBACK: %s argc=%u slot=%d idx=%d tipo=%d obj=%p%s",
                 p_methodGetName ? p_methodGetName(g_mEquip) : "?",
                 p_epParamCount ? p_epParamCount(g_mEquip) : 0, slot, weaponIdx, weaponType,
@@ -1863,6 +2007,7 @@ namespace Unlock {
     static bool         g_ppOk = false;
     static bool         g_ppProbed = false;
     static int          g_ppRetry = 0;
+    static bool         g_prefsDirty = false;
 
     static Il2CppClass* g_strCls = nullptr;
 
@@ -1937,6 +2082,18 @@ namespace Unlock {
             strstr(low, "primary") || strstr(low, "secondary") || strstr(low, "gadget") ||
             strstr(low, "gun") || strstr(low, "index") || strstr(low, "camo") ||
             strstr(low, "skin") || strstr(low, "class") || strstr(low, "type");
+    }
+
+    static bool PrefStrictKey(const char* low) {
+        if (!low) return false;
+        if (strstr(low, "allowed")) return false;
+        if (strstr(low, "holding")) return false;
+        if (strstr(low, "minigun")) return false;
+        if (strstr(low, "room"))    return false;
+        if (strstr(low, "type") && !strstr(low, "weapon") && !strstr(low, "gun")) return false;
+        return strstr(low, "weapon") || strstr(low, "gun") || strstr(low, "loadout") ||
+            strstr(low, "slot") || strstr(low, "primary") || strstr(low, "secondary") ||
+            strstr(low, "gadget") || strstr(low, "class");
     }
 
     static bool PrefIsPrefix(const char* k) {
@@ -2058,7 +2215,14 @@ namespace Unlock {
             g_ppKN, GetTickCount64() - t0, clsKept, clsSeen, fldSeen, strSeen);
     }
 
+    static void PrefsFlush() {
+        if (!g_prefsDirty) return;
+        if (g_ppSave) { void* a[1] = { nullptr }; InvokeRet(g_ppSave, nullptr, a); Log("[p] Save()"); }
+        g_prefsDirty = false;
+    }
+
     static void PrefsApply(int weaponType, void* nameStr) {
+        if (g_offPrefs) return;
         if (!ResolvePlayerPrefs()) return;
         if (g_ppKN <= 0 && g_ppRetry < 3) { ++g_ppRetry; CollectPrefsKeys(true); }
         if (g_ppKN <= 0) return;
@@ -2083,6 +2247,7 @@ namespace Unlock {
 
             char kl[96]; Lower(kl, sizeof(kl), kk);
             if (!PrefWord(kl)) continue;
+            if (!PrefStrictKey(kl)) continue;
 
             int before = -777777;
             if (g_ppGetInt) { void* a[2] = { g_ppK[i].str, &before }; InvokeRet(g_ppGetInt, nullptr, a); }
@@ -2113,7 +2278,7 @@ namespace Unlock {
                 }
             }
         }
-        if (changed && g_ppSave) { void* a[1] = { nullptr }; InvokeRet(g_ppSave, nullptr, a); Log("[p] Save()"); }
+        if (changed) { g_prefsDirty = true; PrefsFlush(); }
     }
 
     static int g_mnyPrefLastN = -1;
@@ -2136,7 +2301,7 @@ namespace Unlock {
             InvokeRet(g_ppSetInt, nullptr, a);
             ++n;
         }
-        if (n && g_ppSave) { void* a[1] = { nullptr }; InvokeRet(g_ppSave, nullptr, a); }
+        if (n) { g_prefsDirty = true; PrefsFlush(); }
         if (n != g_mnyPrefLastN) {
             g_mnyPrefLastN = n;
             Log("[mirror] prefs: %d chave(s) escritas", n);
@@ -2182,9 +2347,26 @@ namespace Unlock {
     }
 
     // =========================================================================
+    //  >>> v43.20: ApplySelection roda UMA vez por selecao, sem timer de 4s
+    // =========================================================================
     static int       g_selTarget = -2;
+    static int       g_selSlot = -2;
     static int       g_selStep = -1;
+    static bool      g_selDone = true;
+    static bool      g_selForce = false;
+    static bool      g_selForceEquip = false;
     static ULONGLONG g_selNext = 0;
+
+    void RequestApply() {
+        g_selForce = true;
+        g_selForceEquip = true;
+        g_selDone = false;
+        g_selStep = -1;
+    }
+    void RequestApplySlot(int slot) {
+        C.loadoutSlot = slot;
+        RequestApply();
+    }
 
     static void LogLoadoutReadback() {
         if (!SDK::g_localPlayer) return;
@@ -2218,7 +2400,8 @@ namespace Unlock {
     }
 
     static void ApplySelection() {
-        if (!C.applySelection || !SDK::g_localPlayer) return;
+        if (!C.applySelection && !g_selForce) return;
+        if (!SDK::g_localPlayer) return;
         if (!g_arr || g_arrLen <= 0) return;
         if (!g_dupeEnsured) { Dupe::EnsureLoaded(); g_dupeEnsured = true; }
 
@@ -2241,15 +2424,25 @@ namespace Unlock {
 
         const int total = g_loCN + 2;
         const ULONGLONG now = GetTickCount64();
-        if (listIdx != g_selTarget || now >= g_selNext) {
-            if (listIdx != g_selTarget)
+
+        const bool mudou = (listIdx != g_selTarget || slot != g_selSlot);
+        if (mudou || g_selForce) {
+            if (g_selForce && !mudou && now < g_selNext) return;
+            g_selNext = now + 150;
+            if (mudou)
                 Log("[unlock] INICIO: lista=%d nome=\"%s\" slot=%d passos=%d",
                     listIdx, Dupe::WeaponName(listIdx), slot, total);
+            else
+                Log("[unlock] FORCADO: lista=%d nome=\"%s\" slot=%d passos=%d",
+                    listIdx, Dupe::WeaponName(listIdx), slot, total);
             g_selTarget = listIdx;
+            g_selSlot = slot;
             g_selStep = 0;
-            g_selNext = now + 4000;
+            g_selDone = false;
+            if (!mudou) g_selForceEquip = true;
+            g_selForce = false;
         }
-        if (g_selStep < 0) return;
+        if (g_selDone || g_selStep < 0) return;
 
         const int live = LiveWeaponIndex(listIdx);
         const int wtype = WeaponTypeOfList(listIdx);
@@ -2263,17 +2456,19 @@ namespace Unlock {
             const LoCand& c = g_loC[g_selStep];
             Log("[w] passo %d/%d: %s::%s (kind=%d type=%d useType=%d slot=%d off=0x%X)",
                 g_selStep, total, c.cls, c.name, c.kind, c.type, c.useType, c.slot, c.off);
-            LoWriteCand(c, slot, live, wtype, nameStr);
+            if (!g_offCand) LoWriteCand(c, slot, live, wtype, nameStr);
             ++g_selStep;
             return;
         }
 
         if (g_selStep == g_loCN) {
             Log("[w] passo %d/%d: PlayerScript offsets 0x144/0x145/0x10A4", g_selStep, total);
-            uintptr_t b = (uintptr_t)SDK::g_localPlayer;
-            if (slot == 0)      SafeWrite<unsigned char>(b + kLoPrim, (unsigned char)(live & 0xFF));
-            else if (slot == 1) SafeWrite<unsigned char>(b + kLoSec, (unsigned char)(live & 0xFF));
-            else                SafeWrite<int>(b + kLoGad, live);
+            if (!g_offIdx) {
+                uintptr_t b = (uintptr_t)SDK::g_localPlayer;
+                if (slot == 0)      SafeWrite<unsigned char>(b + kLoPrim, (unsigned char)(live & 0xFF));
+                else if (slot == 1) SafeWrite<unsigned char>(b + kLoSec, (unsigned char)(live & 0xFF));
+                else                SafeWrite<int>(b + kLoGad, live);
+            }
             ++g_selStep;
             return;
         }
@@ -2281,7 +2476,7 @@ namespace Unlock {
         if (g_selStep == g_loCN + 1) {
             Log("[w] passo %d/%d: fpsGunView+0x38=gun +0x48=%d", g_selStep, total, slot);
             void* fv = FpsGunView();
-            if (fv && LooksLikeObj(gun)) {
+            if (!g_offFv && fv && LooksLikeObj(gun)) {
                 SafeWrite<void*>((uintptr_t)fv + kFvHeld, gun);
                 SafeWrite<int>((uintptr_t)fv + kFvSlot, slot);
             }
@@ -2290,14 +2485,21 @@ namespace Unlock {
         }
 
         Log("[w] passo %d/%d: equip+prefs (fim)", g_selStep, total);
-        if (g_lastEquip != live || g_lastEquipSlot != slot) {
+        if (g_selForceEquip || g_lastEquip != live || g_lastEquipSlot != slot) {
+            g_selForceEquip = false;
             g_lastEquip = live;
             g_lastEquipSlot = slot;
             CallEquip(slot, live, wtype);
         }
+        else {
+            Log("[w] equip PULADO (mesma arma/slot idx=%d slot=%d)", live, slot);
+        }
         PrefsApply(wtype, nameStr);
         LogLoadoutReadback();
+        g_availNext = 0;                       // >>> v43.22: reaplica available ja'
         g_selStep = -1;
+        g_selDone = true;
+        Log("[unlock] FIM passada (sem restart em 4s)");
     }
 
     static void ApplyLoadout() {
@@ -2311,13 +2513,42 @@ namespace Unlock {
         }
     }
 
+    // >>> v43.22: cada escritor tem portao. ApplyAvailable() varria ~65 armas
+    //     POR FRAME; agora 1x/2s. Anexos e ints do player: 1x/250ms.
     static void ApplyAll() {
         if (!g_arr || g_arrLen <= 0) return;
-        if (C.unlockAll || C.unlockWeapons) ApplyAvailable();
-        if (C.unlockAll || C.unlockSkins || C.unlockAttachments || C.skinChanger) ApplyAttachments();
-        if (C.unlockAll || C.unlockCurrency || C.unlockLevel) ApplyPlayerInts();
+        const ULONGLONG now = GetTickCount64();
+
+        if (now >= g_availNext) {
+            g_availNext = now + 2000;
+            if (C.unlockAll || C.unlockWeapons) {
+                const double t = QpcMs();
+                ApplyAvailable();
+                g_pfAvail += QpcMs() - t;
+            }
+        }
+        if (now >= g_attachNext) {
+            g_attachNext = now + 250;
+            if (C.unlockAll || C.unlockSkins || C.unlockAttachments || C.skinChanger) {
+                const double t = QpcMs();
+                ApplyAttachments();
+                g_pfAtt += QpcMs() - t;
+            }
+        }
+        if (now >= g_intsNext) {
+            g_intsNext = now + 250;
+            if (C.unlockAll || C.unlockCurrency || C.unlockLevel) {
+                const double t = QpcMs();
+                ApplyPlayerInts();
+                g_pfInts += QpcMs() - t;
+            }
+        }
         ApplyLoadout();
-        if (C.applySelection) ApplySelection();
+        if (C.applySelection || g_selForce) {
+            const double t = QpcMs();
+            ApplySelection();
+            g_pfSel += QpcMs() - t;
+        }
     }
 
     // ================================================================ coleta
@@ -2507,14 +2738,13 @@ namespace Unlock {
         Dupe::EnsureLoaded();
         g_dupeEnsured = true;
         g_installed = true;
+        g_availNext = 0;
         Log("[unlock] install %s: arr@0x%X len=%d | armas=%d camos=%d chars=%d",
             BFI_UNLOCK_VER, g_offArr, g_arrLen,
             (int)Dupe::g_weapons.size(), (int)Dupe::g_camos.size(), (int)Dupe::g_chars.size());
         return true;
     }
 
-    // >>> v43.16: BUILD numa chamada so (o botao da aba Dupe chama isto).
-    //     Nao depende da maquina de estagios nem da ordem do Tick.
     void BuildAllNow() {
         ResolveExtra();
         Dupe::g_wantBuild.store(false);
@@ -2551,6 +2781,7 @@ namespace Unlock {
             Dupe::SetStatus("erro na build direta");
             Log("[dupe] build direta: EXCECAO");
         }
+        g_availNext = 0;
     }
 
     static bool EnsureInstalled() {
@@ -2563,20 +2794,26 @@ namespace Unlock {
 
     static void TickInner() {
         if (!EnsureInstalled()) return;
+        RevalidateArray();
         ApplyAll();
     }
 
-    void Tick() {
+    // >>> v43.22: Tick separado em TickBody para o perfil medir o total real.
+    static void TickBody() {
         SyncCfg();
 
         const bool anyMoney = C.accAuto || C.moneyApplyNow || C.moneyRescan || C.moneyWritePrefs;
         const bool any = C.unlockAll || C.unlockWeapons || C.unlockSkins || C.unlockAttachments ||
             C.unlockCurrency || C.unlockLevel || C.unlockChars || C.applySelection ||
-            C.skinChanger || C.applySlots || C.fillLoadoutSlots || anyMoney;
+            C.skinChanger || C.applySlots || C.fillLoadoutSlots || anyMoney || g_selForce;
         if (!any && !Dupe::Wants()) return;
 
-        __try { MoneyTick(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[unlock] AV contido no MoneyTick"); }
+        {
+            const double t = QpcMs();
+            __try { MoneyTick(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { Log("[unlock] AV contido no MoneyTick"); }
+            g_pfMoney += QpcMs() - t;
+        }
 
         if (!SDK::g_localPlayer) return;
 
@@ -2585,11 +2822,21 @@ namespace Unlock {
             BuildStep();
             return;
         }
+        const double t = QpcMs();
         __try { TickInner(); }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             static int n = 0;
             if (n++ < 10) Log("[unlock] AV contido no Tick");
         }
+        g_pfInner += QpcMs() - t;
+    }
+
+    void Tick() {
+        const double t0 = QpcMs();
+        TickBody();
+        g_pfTick += QpcMs() - t0;
+        ++g_pfN;
+        PfLog();
     }
 
     // =================================================================== dump
